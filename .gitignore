@@ -21,3 +21,10 @@ outputs/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# Local packaging/build output
+build/
+dist/
+dist_installer/
+installer_smoke/
+tools/

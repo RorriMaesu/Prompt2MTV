@@ -9,6 +9,7 @@ import time
 import random
 import threading
 import os
+import sys
 import subprocess
 import shutil
 from datetime import datetime
@@ -17,15 +18,27 @@ import ttkbootstrap as tb
 
 # Try to get ffmpeg from imageio_ffmpeg, fallback to 'ffmpeg'
 try:
-    imageio_ffmpeg = __import__('imageio_ffmpeg')
+    import imageio_ffmpeg
     FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 except ImportError:
     FFMPEG_PATH = shutil.which('ffmpeg') or 'ffmpeg'
 
 DEFAULT_VIDEO_PROFILE = "ltx_2_3_t2v"
-DEFAULT_MODEL_SEARCH_ROOTS = [
-    r"D:\ComfyUI\ComfyUI\models",
-    r"D:\ComfyUI\models"
+APP_NAME = "Prompt2MTV"
+APP_VERSION = "0.2.0"
+APP_PUBLISHER = "Prompt2MTV"
+APP_TAGLINE = "Local AI Music Video Studio"
+ENV_COMFYUI_ROOT_KEYS = ("PROMPT2MTV_COMFYUI_ROOT", "COMFYUI_ROOT")
+ENV_COMFYUI_LAUNCHER_KEY = "PROMPT2MTV_COMFYUI_LAUNCHER"
+ENV_MODEL_ROOTS_KEY = "PROMPT2MTV_MODEL_ROOTS"
+DEFAULT_COMFYUI_ROOT_CANDIDATES = [
+    r"D:\ComfyUI",
+    r"D:\ComfyUI\ComfyUI"
+]
+DEFAULT_COMFYUI_LAUNCHER_NAMES = [
+    "run_ltx2_queue_manager.bat",
+    "run_nvidia_gpu.bat",
+    "run_cpu.bat"
 ]
 MODEL_SUBDIRECTORIES = {
     "checkpoint_name": "checkpoints",
@@ -96,7 +109,7 @@ VIDEO_WORKFLOW_PROFILES = {
 class LTXQueueManager:
     def __init__(self, root):
         self.root = root
-        self.root.title("LTX-2.3 Video Queue Manager")
+        self.root.title(f"{APP_NAME} {APP_VERSION}")
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
         default_width = min(1320, max(1080, int(screen_width * 0.9)))
@@ -106,6 +119,10 @@ class LTXQueueManager:
         self.root.after(0, self._maximize_window)
         self.colors = dict(UI_COLORS)
         self.fonts = dict(UI_FONTS)
+        self.app_root_dir = self._get_app_root_dir()
+        self.resource_root_dir = self._get_resource_root_dir()
+        self.user_data_dir = self._get_user_data_dir()
+        os.makedirs(self.user_data_dir, exist_ok=True)
         self._configure_theme_system()
         
         self.api_json_path = VIDEO_WORKFLOW_PROFILES[DEFAULT_VIDEO_PROFILE]["workflow_path"]
@@ -114,7 +131,9 @@ class LTXQueueManager:
         self.music_workflow = None
         self.prompts = []
         self.comfyui_process = None
-        self.global_settings_file = "app_settings.json"
+        self.global_settings_file = os.path.join(self.user_data_dir, "app_settings.json")
+        self.legacy_global_settings_file = os.path.join(self.app_root_dir, "app_settings.json")
+        self.is_first_launch = False
         self.selected_videos = set()
         self.video_checkbox_vars = []
         self.selected_video_for_music = None
@@ -122,14 +141,16 @@ class LTXQueueManager:
         self.current_project_dir = None
         self.debug_lock = threading.Lock()
         self.debug_log_file = None
-        self.model_search_roots = list(DEFAULT_MODEL_SEARCH_ROOTS)
+        self.comfyui_root = None
+        self.comfyui_launcher_path = None
+        self.model_search_roots = []
         self.video_model_choices = {field_name: [] for field_name in MODEL_SUBDIRECTORIES}
         self.collapsible_sections = {}
         self.collapsible_section_groups = {}
         self.responsive_layout_mode = None
         
         # Setup base output directory
-        self.base_output_dir = "outputs"
+        self.base_output_dir = self._get_default_output_dir()
         os.makedirs(self.base_output_dir, exist_ok=True)
         
         self.thumbnail_images = []
@@ -137,7 +158,471 @@ class LTXQueueManager:
         self.setup_ui()
         self.load_global_settings() # Load global settings first to get the last project
         self.load_default_json()
+        self.run_startup_preflight(interactive=True)
         self.launch_comfyui()
+
+    def _get_app_root_dir(self):
+        if getattr(sys, "frozen", False):
+            return os.path.dirname(os.path.abspath(sys.executable))
+        return os.path.dirname(os.path.abspath(__file__))
+
+    def _get_resource_root_dir(self):
+        return getattr(sys, "_MEIPASS", self.app_root_dir)
+
+    def _get_user_data_dir(self):
+        local_app_data = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+        if not local_app_data:
+            return self.app_root_dir
+        return os.path.join(local_app_data, APP_NAME)
+
+    def _normalize_path(self, path_value):
+        if not path_value:
+            return None
+        expanded = os.path.expandvars(os.path.expanduser(str(path_value).strip()))
+        if not expanded:
+            return None
+        return os.path.normpath(expanded)
+
+    def _append_unique_path(self, collection, path_value):
+        normalized_path = self._normalize_path(path_value)
+        if not normalized_path:
+            return
+        normalized_key = os.path.normcase(normalized_path)
+        if normalized_key not in {os.path.normcase(existing) for existing in collection}:
+            collection.append(normalized_path)
+
+    def _get_default_output_dir(self):
+        legacy_output_dir = os.path.join(self.app_root_dir, "outputs")
+        if not getattr(sys, "frozen", False) and os.path.isdir(legacy_output_dir):
+            return legacy_output_dir
+        return os.path.join(self.user_data_dir, "outputs")
+
+    def _get_env_value(self, keys):
+        for key in keys:
+            value = self._normalize_path(os.environ.get(key))
+            if value:
+                return value
+        return None
+
+    def _get_candidate_comfyui_roots(self, preferred_root=None):
+        candidates = []
+        self._append_unique_path(candidates, preferred_root)
+        self._append_unique_path(candidates, self._get_env_value(ENV_COMFYUI_ROOT_KEYS))
+
+        launcher_env = self._normalize_path(os.environ.get(ENV_COMFYUI_LAUNCHER_KEY))
+        if launcher_env:
+            self._append_unique_path(candidates, os.path.dirname(launcher_env))
+
+        for default_root in DEFAULT_COMFYUI_ROOT_CANDIDATES:
+            self._append_unique_path(candidates, default_root)
+
+        return [candidate for candidate in candidates if os.path.isdir(candidate)]
+
+    def _discover_comfyui_root(self, preferred_root=None):
+        candidates = self._get_candidate_comfyui_roots(preferred_root)
+        return candidates[0] if candidates else None
+
+    def _discover_comfyui_launcher(self, preferred_path=None, comfyui_root=None):
+        candidates = []
+        self._append_unique_path(candidates, preferred_path)
+        self._append_unique_path(candidates, os.environ.get(ENV_COMFYUI_LAUNCHER_KEY))
+
+        for root in self._get_candidate_comfyui_roots(comfyui_root):
+            for launcher_name in DEFAULT_COMFYUI_LAUNCHER_NAMES:
+                self._append_unique_path(candidates, os.path.join(root, launcher_name))
+                self._append_unique_path(candidates, os.path.join(os.path.dirname(root), launcher_name))
+
+        for candidate in candidates:
+            if os.path.isfile(candidate):
+                return candidate
+        return None
+
+    def _resolve_model_search_roots(self, saved_roots=None, comfyui_root=None):
+        configured_roots = []
+        if isinstance(saved_roots, list):
+            for saved_root in saved_roots:
+                self._append_unique_path(configured_roots, saved_root)
+
+        env_model_roots = os.environ.get(ENV_MODEL_ROOTS_KEY)
+        if env_model_roots:
+            for env_root in env_model_roots.split(os.pathsep):
+                self._append_unique_path(configured_roots, env_root)
+
+        for root in self._get_candidate_comfyui_roots(comfyui_root):
+            self._append_unique_path(configured_roots, os.path.join(root, "models"))
+            if os.path.basename(root).lower() != "comfyui":
+                self._append_unique_path(configured_roots, os.path.join(root, "ComfyUI", "models"))
+
+        return configured_roots
+
+    def _read_global_settings_payload(self):
+        for settings_path in [self.global_settings_file, self.legacy_global_settings_file]:
+            if not os.path.exists(settings_path):
+                continue
+            with open(settings_path, 'r', encoding='utf-8') as file_handle:
+                return json.load(file_handle), settings_path
+        return {}, None
+
+    def _is_ffmpeg_available(self):
+        if not FFMPEG_PATH:
+            return False
+        if os.path.isabs(FFMPEG_PATH):
+            return os.path.exists(FFMPEG_PATH)
+        return shutil.which(FFMPEG_PATH) is not None
+
+    def _is_comfyui_running(self):
+        try:
+            req = urllib.request.Request("http://127.0.0.1:8188/system_stats")
+            urllib.request.urlopen(req, timeout=1)
+            return True
+        except Exception:
+            return False
+
+    def _sync_runtime_paths(self, settings):
+        self.base_output_dir = self._normalize_path(settings.get("output_root")) or self.base_output_dir or self._get_default_output_dir()
+        os.makedirs(self.base_output_dir, exist_ok=True)
+        self.comfyui_root = self._discover_comfyui_root(settings.get("comfyui_root"))
+        self.comfyui_launcher_path = self._discover_comfyui_launcher(settings.get("comfyui_launcher_path"), self.comfyui_root)
+        self.model_search_roots = self._resolve_model_search_roots(settings.get("model_search_roots"), self.comfyui_root)
+
+    def _prompt_for_comfyui_root(self):
+        selected_dir = filedialog.askdirectory(
+            title="Select ComfyUI Folder",
+            initialdir=self.comfyui_root or self.app_root_dir
+        )
+        if selected_dir:
+            self.comfyui_root = self._normalize_path(selected_dir)
+            self.comfyui_launcher_path = self._discover_comfyui_launcher(self.comfyui_launcher_path, self.comfyui_root)
+            self.model_search_roots = self._resolve_model_search_roots(self.model_search_roots, self.comfyui_root)
+            self.save_global_settings()
+            return True
+        return False
+
+    def _prompt_for_comfyui_launcher(self):
+        filepath = filedialog.askopenfilename(
+            title="Select ComfyUI Launcher Batch File",
+            initialdir=self.comfyui_root or self.app_root_dir,
+            filetypes=(("Batch files", "*.bat"), ("All files", "*.*"))
+        )
+        if filepath:
+            self.comfyui_launcher_path = self._normalize_path(filepath)
+            self.save_global_settings()
+            return True
+        return False
+
+    def _paths_to_multiline_text(self, paths):
+        return "\n".join(paths or [])
+
+    def _parse_multiline_paths(self, text_value):
+        parsed_paths = []
+        for raw_line in str(text_value).splitlines():
+            self._append_unique_path(parsed_paths, raw_line)
+        return parsed_paths
+
+    def _browse_directory_into_var(self, tk_var, title, fallback_dir=None):
+        initialdir = self._normalize_path(tk_var.get()) or fallback_dir or self.app_root_dir
+        selected_dir = filedialog.askdirectory(title=title, initialdir=initialdir)
+        if selected_dir:
+            tk_var.set(self._normalize_path(selected_dir) or "")
+
+    def _browse_file_into_var(self, tk_var, title, filetypes, fallback_dir=None):
+        initialdir = fallback_dir or self.app_root_dir
+        current_value = self._normalize_path(tk_var.get())
+        if current_value:
+            initialdir = os.path.dirname(current_value) if os.path.isfile(current_value) else current_value
+        selected_path = filedialog.askopenfilename(title=title, initialdir=initialdir, filetypes=filetypes)
+        if selected_path:
+            tk_var.set(self._normalize_path(selected_path) or "")
+
+    def _apply_runtime_path_settings(self, comfyui_root, launcher_path, output_root, model_roots):
+        resolved_root = self._normalize_path(comfyui_root)
+        resolved_output_root = self._normalize_path(output_root) or self._get_default_output_dir()
+        resolved_model_roots = self._resolve_model_search_roots(model_roots, resolved_root)
+
+        self.base_output_dir = resolved_output_root
+        os.makedirs(self.base_output_dir, exist_ok=True)
+        self.comfyui_root = self._discover_comfyui_root(resolved_root) or resolved_root
+        self.comfyui_launcher_path = self._discover_comfyui_launcher(launcher_path, self.comfyui_root)
+        self.model_search_roots = resolved_model_roots
+
+        self.save_global_settings()
+        self.refresh_video_model_choices()
+        self.run_startup_preflight(interactive=False)
+
+    def configure_runtime_paths(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Runtime Paths")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.geometry("760x620")
+        dialog.minsize(700, 560)
+        self._style_panel(dialog, self.colors["bg"])
+
+        shell = tk.Frame(dialog, padx=18, pady=18)
+        shell.pack(fill=tk.BOTH, expand=True)
+        self._style_panel(shell, self.colors["bg"])
+
+        header = tk.Label(shell, text="Runtime Paths")
+        header.pack(anchor="w")
+        self._style_label(header, "title", self.colors["bg"])
+
+        subheader = tk.Label(
+            shell,
+            text="Configure the local ComfyUI installation, launcher batch file, writable output folder, and optional model search roots."
+        )
+        subheader.pack(anchor="w", pady=(6, 14))
+        self._style_label(subheader, "muted", self.colors["bg"])
+
+        form = tk.Frame(shell, padx=14, pady=14)
+        form.pack(fill=tk.BOTH, expand=True)
+        self._style_panel(form, self.colors["surface"], border=True)
+        form.grid_columnconfigure(0, weight=0)
+        form.grid_columnconfigure(1, weight=1)
+        form.grid_columnconfigure(2, weight=0)
+
+        comfyui_root_var = tk.StringVar(value=self.comfyui_root or "")
+        launcher_var = tk.StringVar(value=self.comfyui_launcher_path or "")
+        output_root_var = tk.StringVar(value=self.base_output_dir or self._get_default_output_dir())
+
+        row_index = 0
+
+        def add_path_row(label_text, variable, browse_command):
+            nonlocal row_index
+            label = tk.Label(form, text=label_text)
+            label.grid(row=row_index, column=0, sticky="nw", padx=(0, 12), pady=(0, 10))
+            self._style_label(label, "body_strong", self.colors["surface"])
+
+            entry = tk.Entry(form, textvariable=variable)
+            entry.grid(row=row_index, column=1, sticky="ew", pady=(0, 10))
+            self._style_text_input(entry)
+
+            browse_btn = tk.Button(form, text="Browse", command=browse_command)
+            browse_btn.grid(row=row_index, column=2, sticky="e", padx=(8, 0), pady=(0, 10))
+            self._style_button(browse_btn, "secondary", compact=True)
+            row_index += 1
+
+        add_path_row(
+            "ComfyUI folder",
+            comfyui_root_var,
+            lambda: self._browse_directory_into_var(comfyui_root_var, "Select ComfyUI Folder", self.comfyui_root or self.app_root_dir)
+        )
+        add_path_row(
+            "Launcher batch file",
+            launcher_var,
+            lambda: self._browse_file_into_var(
+                launcher_var,
+                "Select ComfyUI Launcher Batch File",
+                (("Batch files", "*.bat"), ("All files", "*.*")),
+                comfyui_root_var.get() or self.app_root_dir
+            )
+        )
+        add_path_row(
+            "Output folder",
+            output_root_var,
+            lambda: self._browse_directory_into_var(output_root_var, "Select Prompt2MTV Output Folder", self.base_output_dir or self.app_root_dir)
+        )
+
+        model_roots_label = tk.Label(form, text="Model search roots")
+        model_roots_label.grid(row=row_index, column=0, sticky="nw", padx=(0, 12), pady=(2, 6))
+        self._style_label(model_roots_label, "body_strong", self.colors["surface"])
+
+        model_roots_frame = tk.Frame(form)
+        model_roots_frame.grid(row=row_index, column=1, columnspan=2, sticky="nsew", pady=(0, 8))
+        form.grid_rowconfigure(row_index, weight=1)
+        self._style_panel(model_roots_frame, self.colors["surface"])
+
+        model_roots_help = tk.Label(
+            model_roots_frame,
+            text="One path per line. Leave blank to rely on auto-detected ComfyUI model folders."
+        )
+        model_roots_help.pack(anchor="w", pady=(0, 6))
+        self._style_label(model_roots_help, "muted", self.colors["surface"])
+
+        model_roots_text = tk.Text(model_roots_frame, height=8, wrap="word")
+        model_roots_text.pack(fill=tk.BOTH, expand=True)
+        self._style_text_input(model_roots_text, multiline=True)
+        model_roots_text.insert("1.0", self._paths_to_multiline_text(self.model_search_roots))
+        row_index += 1
+
+        footer = tk.Frame(shell)
+        footer.pack(fill=tk.X, pady=(14, 0))
+        self._style_panel(footer, self.colors["bg"])
+
+        status_var = tk.StringVar(value=f"Settings are saved to {self.global_settings_file}")
+        status_label = tk.Label(footer, textvariable=status_var, anchor="w", justify=tk.LEFT)
+        status_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 12))
+        self._style_label(status_label, "muted", self.colors["bg"])
+
+        def fill_detected_defaults():
+            detected_root = self._discover_comfyui_root(comfyui_root_var.get()) or comfyui_root_var.get()
+            detected_launcher = self._discover_comfyui_launcher(launcher_var.get(), detected_root) or launcher_var.get()
+            detected_model_roots = self._resolve_model_search_roots([], detected_root)
+
+            comfyui_root_var.set(detected_root or "")
+            launcher_var.set(detected_launcher or "")
+            if detected_model_roots:
+                model_roots_text.delete("1.0", tk.END)
+                model_roots_text.insert("1.0", self._paths_to_multiline_text(detected_model_roots))
+            status_var.set("Detected runtime defaults have been loaded into the form.")
+
+        def save_runtime_settings():
+            try:
+                parsed_model_roots = self._parse_multiline_paths(model_roots_text.get("1.0", tk.END))
+                self._apply_runtime_path_settings(
+                    comfyui_root_var.get(),
+                    launcher_var.get(),
+                    output_root_var.get(),
+                    parsed_model_roots
+                )
+            except Exception as exc:
+                messagebox.showerror("Runtime Paths", f"Failed to save runtime paths:\n{exc}", parent=dialog)
+                return
+
+            status_var.set("Runtime paths saved.")
+            self.update_status("Runtime paths updated.", "green")
+            dialog.destroy()
+
+        detect_btn = tk.Button(footer, text="Auto-Detect", command=fill_detected_defaults)
+        detect_btn.pack(side=tk.RIGHT, padx=(8, 0))
+        self._style_button(detect_btn, "ghost", compact=True)
+
+        save_btn = tk.Button(footer, text="Save", command=save_runtime_settings)
+        save_btn.pack(side=tk.RIGHT, padx=(8, 0))
+        self._style_button(save_btn, "primary", compact=True)
+
+        cancel_btn = tk.Button(footer, text="Cancel", command=dialog.destroy)
+        cancel_btn.pack(side=tk.RIGHT)
+        self._style_button(cancel_btn, "secondary", compact=True)
+
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        dialog.bind("<Control-s>", lambda _event: save_runtime_settings())
+        dialog.wait_visibility()
+        dialog.focus_set()
+
+    def show_about_dialog(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"About {APP_NAME}")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.geometry("520x340")
+        dialog.minsize(480, 300)
+        self._style_panel(dialog, self.colors["bg"])
+
+        shell = tk.Frame(dialog, padx=22, pady=20)
+        shell.pack(fill=tk.BOTH, expand=True)
+        self._style_panel(shell, self.colors["bg"])
+
+        title_label = tk.Label(shell, text=f"{APP_NAME} {APP_VERSION}")
+        title_label.pack(anchor="w")
+        self._style_label(title_label, "title", self.colors["bg"])
+
+        tagline_label = tk.Label(shell, text=APP_TAGLINE)
+        tagline_label.pack(anchor="w", pady=(4, 14))
+        self._style_label(tagline_label, "muted", self.colors["bg"])
+
+        details_card = tk.Frame(shell, padx=16, pady=14)
+        details_card.pack(fill=tk.BOTH, expand=True)
+        self._style_panel(details_card, self.colors["surface"], border=True)
+
+        details_lines = [
+            f"Publisher: {APP_PUBLISHER}",
+            f"Settings: {self.global_settings_file}",
+            f"Outputs: {self.base_output_dir}",
+            f"ComfyUI root: {self.comfyui_root or 'Not configured'}",
+            f"Launcher: {self.comfyui_launcher_path or 'Not configured'}",
+            "",
+            "Prompt2MTV is a local desktop workflow for ComfyUI-based video generation, music generation, review, stitching, and final soundtrack merges.",
+            "Use Project > Configure Runtime Paths on a new machine if ComfyUI, model folders, or outputs live outside the defaults."
+        ]
+        details_label = tk.Label(details_card, text="\n".join(details_lines), justify=tk.LEFT, anchor="nw", wraplength=440)
+        details_label.pack(fill=tk.BOTH, expand=True)
+        self._style_label(details_label, "body", self.colors["surface"])
+
+        footer = tk.Frame(shell)
+        footer.pack(fill=tk.X, pady=(14, 0))
+        self._style_panel(footer, self.colors["bg"])
+
+        close_btn = tk.Button(footer, text="Close", command=dialog.destroy)
+        close_btn.pack(side=tk.RIGHT)
+        self._style_button(close_btn, "primary", compact=True)
+
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        dialog.wait_visibility()
+        dialog.focus_set()
+
+    def run_startup_preflight(self, interactive=False):
+        issues = []
+        warnings = []
+
+        self.model_search_roots = self._resolve_model_search_roots(self.model_search_roots, self.comfyui_root)
+
+        if not os.path.exists(self.api_json_path):
+            issues.append(f"Video workflow JSON not found: {self.api_json_path}")
+        if not os.path.exists(self.music_json_path):
+            issues.append(f"Music workflow JSON not found: {self.music_json_path}")
+
+        available_model_roots = self._get_available_model_search_roots()
+        if not available_model_roots:
+            warnings.append(
+                "ComfyUI model folders were not found. Open Project > Configure Runtime Paths and point the app at your ComfyUI installation or add model search roots manually."
+            )
+
+        if not self._is_ffmpeg_available():
+            warnings.append(
+                "FFmpeg is not available. Thumbnail generation, stitching, and final merge actions need FFmpeg. If you launched an installed build, rerun the latest Prompt2MTV setup. If you are running from source, install imageio-ffmpeg or add ffmpeg to PATH."
+            )
+
+        if not self._is_comfyui_running() and not self.comfyui_launcher_path:
+            warnings.append(
+                "No ComfyUI launcher batch file is configured. Prompt2MTV can still connect to an already-running ComfyUI server at http://127.0.0.1:8188, or you can configure a launcher in Project > Configure Runtime Paths."
+            )
+
+        preflight_text = self._compose_startup_preflight_text(issues, warnings)
+
+        if issues:
+            self._set_video_preflight_summary(preflight_text, "Setup required", "red")
+            if interactive:
+                dialog_title = "First Launch Setup" if self.is_first_launch else "Startup Preflight"
+                messagebox.showerror(dialog_title, preflight_text)
+            return False
+
+        if warnings:
+            self._set_video_preflight_summary(preflight_text, "Warnings", "orange")
+            if interactive:
+                dialog_title = "First Launch Guidance" if self.is_first_launch else "Startup Preflight"
+                messagebox.showwarning(dialog_title, preflight_text)
+        else:
+            ready_text = self._compose_startup_preflight_text([], [])
+            self._set_video_preflight_summary(ready_text, "Ready", "green")
+
+        return True
+
+    def _compose_startup_preflight_text(self, issues, warnings):
+        lines = [f"{APP_NAME} {APP_VERSION} | {APP_TAGLINE}"]
+
+        if self.is_first_launch:
+            lines.extend([
+                "",
+                "First launch checks are running against your local ComfyUI and media tools.",
+                "Use Project > Configure Runtime Paths if this machine keeps ComfyUI, model folders, or outputs in a custom location."
+            ])
+
+        if issues:
+            lines.extend(["", "Required setup items:"])
+            lines.extend([f"- {issue}" for issue in issues])
+
+        if warnings:
+            lines.extend(["", "Recommended fixes:"])
+            lines.extend([f"- {warning}" for warning in warnings])
+
+        if not issues and not warnings:
+            lines.extend([
+                "",
+                "Runtime checks passed.",
+                "ComfyUI paths, workflow files, and FFmpeg access look ready for normal use."
+            ])
+
+        return "\n".join(lines)
 
     def _configure_theme_system(self):
         self.style = tb.Style(theme=THEME_NAME)
@@ -658,6 +1143,7 @@ class LTXQueueManager:
         self.root.configure(bg=self.colors["bg"])
         self.menubar.configure(bg=self.colors["surface"], fg=self.colors["text"], activebackground=self.colors["surface_soft"], activeforeground=self.colors["text"], bd=0)
         self.project_menu.configure(bg=self.colors["surface"], fg=self.colors["text"], activebackground=self.colors["surface_soft"], activeforeground=self.colors["text"], bd=0)
+        self.help_menu.configure(bg=self.colors["surface"], fg=self.colors["text"], activebackground=self.colors["surface_soft"], activeforeground=self.colors["text"], bd=0)
 
         for widget in [
             self.status_frame,
@@ -759,6 +1245,8 @@ class LTXQueueManager:
         self._style_label(self.prompt_section_copy_label, "muted", self.prompt_header_frame.cget("bg"))
         self._style_label(self.debug_prompt_label, "muted", self.video_debug_section["body"].cget("bg"))
         self._style_label(self.status_label, "muted", self.bottom_frame.cget("bg"))
+        self._style_label(self.version_label, "muted", self.status_frame.cget("bg"))
+        self.version_label.configure(font=self.fonts["small"])
         self._style_label(self.music_header_eyebrow_label, "muted", self.music_header_frame.cget("bg"))
         self.music_header_eyebrow_label.configure(font=self.fonts["micro"])
         self._style_label(self.music_header_title_label, "title", self.music_header_frame.cget("bg"))
@@ -858,7 +1346,7 @@ class LTXQueueManager:
         if self.current_project_dir:
             self.save_project_state()
             
-        self.current_project_dir = project_dir
+        self.current_project_dir = self._normalize_path(project_dir)
         
         # Setup project subdirectories
         self.scenes_dir = os.path.join(self.current_project_dir, "generated_scenes")
@@ -941,17 +1429,12 @@ class LTXQueueManager:
                 messagebox.showerror("Error", f"Failed to rename project:\n{e}")
 
     def launch_comfyui(self):
-        # Ping port 8188 first
-        try:
-            req = urllib.request.Request("http://127.0.0.1:8188/system_stats")
-            urllib.request.urlopen(req, timeout=1)
+        if self._is_comfyui_running():
             self.update_status("ComfyUI already running on port 8188.", "blue")
-            return  # Skip launch
-        except:
-            pass  # Server not found, proceed to launch
+            return
 
-        bat_path = r"D:\ComfyUI\run_ltx2_queue_manager.bat"
-        if os.path.exists(bat_path):
+        bat_path = self.comfyui_launcher_path
+        if bat_path and os.path.exists(bat_path):
             self.update_status("Launching ComfyUI...", "blue")
             try:
                 # Launch in a new console window so it doesn't block our UI
@@ -965,7 +1448,7 @@ class LTXQueueManager:
             except Exception as e:
                 self.update_status(f"Error launching ComfyUI: {e}", "red")
         else:
-            self.update_status("ComfyUI bat file not found.", "red")
+            self.update_status("ComfyUI launcher not configured. Use Project > Configure Runtime Paths.", "red")
 
     def setup_ui(self):
         # Top Menu Bar
@@ -977,8 +1460,13 @@ class LTXQueueManager:
         self.project_menu.add_command(label="New Project", command=self.create_new_project)
         self.project_menu.add_command(label="Open Project", command=self.open_project)
         self.project_menu.add_command(label="Rename Current Project", command=self.rename_current_project)
+        self.project_menu.add_command(label="Configure Runtime Paths", command=self.configure_runtime_paths)
         self.project_menu.add_separator()
         self.project_menu.add_command(label="Exit", command=self.on_closing)
+
+        self.help_menu = tk.Menu(self.menubar, tearoff=0)
+        self.menubar.add_cascade(label="Help", menu=self.help_menu)
+        self.help_menu.add_command(label=f"About {APP_NAME}", command=self.show_about_dialog)
         
         # Project Status Bar
         self.status_frame = tk.Frame(self.root, pady=8)
@@ -986,6 +1474,8 @@ class LTXQueueManager:
         self.status_frame.grid_columnconfigure(0, weight=1)
         self.project_label = tk.Label(self.status_frame, text="Current Project: None")
         self.project_label.pack(side=tk.LEFT, padx=10, fill=tk.X, expand=True)
+        self.version_label = tk.Label(self.status_frame, text=f"{APP_NAME} {APP_VERSION}")
+        self.version_label.pack(side=tk.RIGHT, padx=10)
         
         # Create Notebook (Tabs)
         self.notebook = ttk.Notebook(self.root)
@@ -1664,8 +2154,14 @@ class LTXQueueManager:
         if not workflow_path:
             return workflow_path
         if os.path.isabs(workflow_path):
-            return workflow_path
-        return os.path.join(os.path.dirname(os.path.abspath(__file__)), workflow_path)
+            return self._normalize_path(workflow_path)
+
+        for base_dir in [self.resource_root_dir, self.app_root_dir]:
+            candidate = os.path.join(base_dir, workflow_path)
+            if os.path.exists(candidate):
+                return self._normalize_path(candidate)
+
+        return self._normalize_path(os.path.join(self.resource_root_dir, workflow_path))
 
     def _resolve_video_workflow_path(self, preferred_path=None, profile_key=None):
         if preferred_path:
@@ -2131,6 +2627,7 @@ class LTXQueueManager:
 
     def load_default_json(self):
         self._load_video_workflow_template(force_video_settings=False)
+        self.music_json_path = self._make_workflow_path_absolute(self.music_json_path)
             
         if os.path.exists(self.music_json_path):
             try:
@@ -2320,38 +2817,44 @@ class LTXQueueManager:
             "api_json_path": self.api_json_path,
             "video_profile": self._get_selected_video_profile_key(),
             "video_settings": self._get_video_settings_snapshot(),
-            "last_project_dir": self.current_project_dir
+            "last_project_dir": self.current_project_dir,
+            "output_root": self.base_output_dir,
+            "comfyui_root": self.comfyui_root,
+            "comfyui_launcher_path": self.comfyui_launcher_path,
+            "model_search_roots": self.model_search_roots
         }
         try:
+            os.makedirs(os.path.dirname(self.global_settings_file), exist_ok=True)
             with open(self.global_settings_file, 'w', encoding='utf-8') as f:
                 json.dump(settings, f, indent=4)
         except Exception as e:
             print(f"Error saving global settings: {e}")
 
     def load_global_settings(self):
-        if os.path.exists(self.global_settings_file):
-            try:
-                with open(self.global_settings_file, 'r', encoding='utf-8') as f:
-                    settings = json.load(f)
-                
-                self._load_video_profile_state(
-                    settings.get("video_profile", DEFAULT_VIDEO_PROFILE),
-                    settings.get("api_json_path"),
-                    settings.get("video_settings", {})
-                )
-                
-                last_project = settings.get("last_project_dir")
-                if last_project and os.path.exists(last_project):
-                    self.set_project(last_project)
-                else:
-                    # Create a default project if none exists
-                    default_project = os.path.join(self.base_output_dir, f"Project_{int(time.time())}")
-                    self.set_project(default_project)
-            except Exception as e:
-                print(f"Error loading global settings: {e}")
+        try:
+            settings, loaded_from = self._read_global_settings_payload()
+            self.is_first_launch = loaded_from is None
+            self._sync_runtime_paths(settings)
+
+            self._load_video_profile_state(
+                settings.get("video_profile", DEFAULT_VIDEO_PROFILE),
+                settings.get("api_json_path"),
+                settings.get("video_settings", {})
+            )
+
+            last_project = self._normalize_path(settings.get("last_project_dir"))
+            if last_project and os.path.exists(last_project):
+                self.set_project(last_project)
+            else:
                 default_project = os.path.join(self.base_output_dir, f"Project_{int(time.time())}")
                 self.set_project(default_project)
-        else:
+
+            if loaded_from == self.legacy_global_settings_file and not os.path.exists(self.global_settings_file):
+                self.save_global_settings()
+        except Exception as e:
+            print(f"Error loading global settings: {e}")
+            self.is_first_launch = True
+            self._sync_runtime_paths({})
             default_project = os.path.join(self.base_output_dir, f"Project_{int(time.time())}")
             self.set_project(default_project)
 
