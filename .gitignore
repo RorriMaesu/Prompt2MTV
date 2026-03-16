@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+
+# Local runtime and editor state
+app_settings.json
+app_state.json
+*.log
+Thumbs.db
+.DS_Store
+
+# Generated media and project outputs
+outputs/
+
+# Temporary and cache artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
