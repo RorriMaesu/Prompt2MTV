@@ -12,10 +12,20 @@ import os
 import sys
 import subprocess
 import shutil
+import ctypes
 from datetime import datetime
 from PIL import Image, ImageTk
 import ttkbootstrap as tb
 from model_downloader import DownloadCancelledError, calculate_sha256, download_file, probe_download_size
+
+try:
+    from tkinterdnd2 import COPY, DND_FILES, TkinterDnD
+    DND_AVAILABLE = True
+except ImportError:
+    COPY = "copy"
+    DND_FILES = "DND_Files"
+    TkinterDnD = None
+    DND_AVAILABLE = False
 
 # Try to get ffmpeg from imageio_ffmpeg, fallback to 'ffmpeg'
 try:
@@ -25,6 +35,85 @@ except ImportError:
     FFMPEG_PATH = shutil.which('ffmpeg') or 'ffmpeg'
 
 DEFAULT_VIDEO_PROFILE = "ltx_2_3_t2v"
+ACE_STEP_15_MIN_P_DEFAULT = 0.0
+SUPPORTED_VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v")
+SUPPORTED_AUDIO_EXTENSIONS = (".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg")
+MUSIC_SAMPLER_OPTIONS = [
+    "euler",
+    "euler_ancestral",
+    "heun",
+    "heunpp2",
+    "dpm_2",
+    "dpm_2_ancestral",
+    "lms",
+    "dpm_fast",
+    "dpm_adaptive",
+    "dpmpp_2s_ancestral",
+    "dpmpp_sde",
+    "dpmpp_sde_gpu",
+    "dpmpp_2m",
+    "dpmpp_2m_sde",
+    "dpmpp_2m_sde_gpu",
+    "dpmpp_3m_sde",
+    "dpmpp_3m_sde_gpu",
+    "ddpm",
+    "lcm",
+    "ipndm",
+    "ipndm_v",
+    "deis",
+    "uni_pc",
+    "uni_pc_bh2"
+]
+MUSIC_SCHEDULER_OPTIONS = [
+    "normal",
+    "karras",
+    "exponential",
+    "sgm_uniform",
+    "simple",
+    "ddim_uniform",
+    "beta",
+    "linear_quadratic",
+    "kl_optimal"
+]
+MUSIC_LANGUAGE_OPTIONS = [
+    "en",
+    "ja",
+    "zh",
+    "es",
+    "de",
+    "fr",
+    "pt",
+    "ru",
+    "it",
+    "nl",
+    "pl",
+    "tr",
+    "vi",
+    "cs",
+    "fa",
+    "id",
+    "ko",
+    "uk",
+    "hu",
+    "ar",
+    "sv",
+    "ro",
+    "el"
+]
+MUSIC_TIME_SIGNATURE_OPTIONS = ["2", "3", "4", "6"]
+MUSIC_MP3_QUALITY_OPTIONS = [f"V{i}" for i in range(10)]
+PERSISTED_MUSIC_SECTION_KEYS = [
+    "music_prompt",
+    "music_lyrics",
+    "music_playback",
+    "music_generation",
+    "music_advanced",
+    "music_actions",
+    "music_media_state",
+    "music_preview"
+]
+WINDOWS_HIDE = 0
+WINDOWS_SHOW = 5
 APP_NAME = "Prompt2MTV"
 APP_VERSION = "0.2.0"
 APP_PUBLISHER = "Prompt2MTV"
@@ -113,6 +202,15 @@ VIDEO_WORKFLOW_PROFILES = {
     }
 }
 
+if DND_AVAILABLE:
+    class Prompt2MTVWindow(tb.Window, TkinterDnD.DnDWrapper):
+        def __init__(self, *args, **kwargs):
+            tb.Window.__init__(self, *args, **kwargs)
+            self.TkdndVersion = TkinterDnD._require(self)
+else:
+    class Prompt2MTVWindow(tb.Window):
+        pass
+
 class LTXQueueManager:
     def __init__(self, root):
         self.root = root
@@ -145,7 +243,10 @@ class LTXQueueManager:
         self.video_checkbox_vars = []
         self.selected_video_for_music = None
         self.current_generated_audio = None
+        self.current_audio_source = None
         self.current_project_dir = None
+        self.comfyui_console_hwnd = None
+        self.comfyui_console_visible = False
         self.debug_lock = threading.Lock()
         self.debug_log_file = None
         self.comfyui_root = None
@@ -158,6 +259,11 @@ class LTXQueueManager:
         self.collapsible_sections = {}
         self.collapsible_section_groups = {}
         self.responsive_layout_mode = None
+        self.drag_drop_enabled = DND_AVAILABLE
+        self.imported_video_dir = None
+        self.imported_audio_dir = None
+        self.project_state_restore_in_progress = False
+        self.project_state_save_after_id = None
         
         # Setup base output directory
         self.base_output_dir = self._get_default_output_dir()
@@ -167,8 +273,9 @@ class LTXQueueManager:
         self.thumbnail_images = []
         
         self.setup_ui()
-        self.load_global_settings() # Load global settings first to get the last project
+        self._enable_drag_and_drop()
         self.load_default_json()
+        self.load_global_settings() # Load global settings after workflows are available so project state restoration wins
         self.run_startup_preflight(interactive=True)
         self.launch_comfyui()
 
@@ -207,6 +314,232 @@ class LTXQueueManager:
         if not getattr(sys, "frozen", False) and os.path.isdir(legacy_output_dir):
             return legacy_output_dir
         return os.path.join(self.user_data_dir, "outputs")
+
+    def _has_supported_extension(self, path_value, supported_extensions):
+        return os.path.splitext(str(path_value or ""))[1].lower() in supported_extensions
+
+    def _is_supported_video_file(self, path_value):
+        return self._has_supported_extension(path_value, SUPPORTED_VIDEO_EXTENSIONS)
+
+    def _is_supported_audio_file(self, path_value):
+        return self._has_supported_extension(path_value, SUPPORTED_AUDIO_EXTENSIONS)
+
+    def _build_unique_media_copy_path(self, destination_dir, source_path):
+        filename = os.path.basename(source_path)
+        name_root, extension = os.path.splitext(filename)
+        candidate_path = os.path.join(destination_dir, filename)
+        source_normalized = self._normalize_path(source_path)
+
+        if os.path.exists(candidate_path):
+            try:
+                if source_normalized and os.path.samefile(source_normalized, candidate_path):
+                    return candidate_path
+            except OSError:
+                pass
+
+        suffix = 1
+        while os.path.exists(candidate_path):
+            candidate_path = os.path.join(destination_dir, f"{name_root}_{suffix}{extension}")
+            suffix += 1
+        return candidate_path
+
+    def _copy_media_file_to_project(self, source_path, destination_dir):
+        normalized_source = self._normalize_path(source_path)
+        if not normalized_source or not os.path.isfile(normalized_source):
+            raise FileNotFoundError(f"File not found: {source_path}")
+
+        os.makedirs(destination_dir, exist_ok=True)
+        destination_path = self._build_unique_media_copy_path(destination_dir, normalized_source)
+        if os.path.normcase(normalized_source) != os.path.normcase(destination_path):
+            shutil.copy2(normalized_source, destination_path)
+        return destination_path
+
+    def _infer_audio_source(self, audio_path):
+        normalized_audio_path = self._normalize_path(audio_path)
+        if not normalized_audio_path:
+            return None
+
+        normalized_imported_audio_dir = self._normalize_path(self.imported_audio_dir)
+        normalized_generated_audio_dir = self._normalize_path(self.audio_dir)
+
+        if normalized_imported_audio_dir and os.path.normcase(os.path.dirname(normalized_audio_path)) == os.path.normcase(normalized_imported_audio_dir):
+            return "imported"
+        if normalized_generated_audio_dir and os.path.normcase(os.path.dirname(normalized_audio_path)) == os.path.normcase(normalized_generated_audio_dir):
+            return "generated"
+        return "linked"
+
+    def _format_audio_state(self):
+        if not self.current_generated_audio or not os.path.exists(self.current_generated_audio):
+            return "No audio linked"
+
+        audio_source = self.current_audio_source or self._infer_audio_source(self.current_generated_audio)
+        source_label = {
+            "generated": "Generated",
+            "imported": "Imported",
+            "linked": "Linked"
+        }.get(audio_source, "Linked")
+        return f"{source_label}: {os.path.basename(self.current_generated_audio)}"
+
+    def _parse_drop_file_list(self, raw_drop_data):
+        if not raw_drop_data:
+            return []
+
+        try:
+            candidates = self.root.tk.splitlist(raw_drop_data)
+        except tk.TclError:
+            candidates = [raw_drop_data]
+
+        parsed_paths = []
+        for candidate in candidates:
+            normalized_candidate = self._normalize_path(candidate)
+            if normalized_candidate:
+                parsed_paths.append(normalized_candidate)
+        return parsed_paths
+
+    def _register_drop_target(self, widget, handler):
+        if not self.drag_drop_enabled:
+            return
+
+        try:
+            widget.drop_target_register(DND_FILES)
+            widget.dnd_bind("<<DropEnter>>", lambda _event: COPY)
+            widget.dnd_bind("<<DropPosition>>", lambda _event: COPY)
+            widget.dnd_bind("<<Drop>>", handler)
+        except Exception as exc:
+            self.drag_drop_enabled = False
+            self.log_debug("DRAG_DROP_DISABLED", reason=str(exc))
+
+    def _enable_drag_and_drop(self):
+        if not self.drag_drop_enabled:
+            return
+
+        gallery_targets = [
+            self.gallery_header_frame,
+            self.gallery_shell_frame,
+            self.gallery_canvas,
+            self.gallery_inner_frame
+        ]
+        music_targets = [
+            self.music_actions_section["container"],
+            self.music_actions_card,
+            self.music_action_frame,
+            self.music_primary_actions_frame,
+            self.music_right_frame
+        ]
+
+        for widget in gallery_targets:
+            self._register_drop_target(widget, self._handle_gallery_drop)
+        for widget in music_targets:
+            self._register_drop_target(widget, self._handle_audio_drop)
+
+    def _handle_gallery_drop(self, event):
+        imported_paths = self.import_video_files(self._parse_drop_file_list(getattr(event, "data", "")), from_drop=True)
+        return COPY if imported_paths else ""
+
+    def _handle_audio_drop(self, event):
+        imported_path = self.import_audio_files(self._parse_drop_file_list(getattr(event, "data", "")), from_drop=True)
+        return COPY if imported_path else ""
+
+    def import_videos_dialog(self):
+        selected_paths = filedialog.askopenfilenames(
+            title="Import Video Clips",
+            initialdir=self.current_project_dir or self.base_output_dir,
+            filetypes=[
+                ("Video files", "*.mp4 *.mov *.mkv *.avi *.webm *.m4v"),
+                ("All files", "*.*")
+            ]
+        )
+        self.import_video_files(selected_paths)
+
+    def import_audio_dialog(self):
+        selected_path = filedialog.askopenfilename(
+            title="Import Music / Audio",
+            initialdir=self.current_project_dir or self.base_output_dir,
+            filetypes=[
+                ("Audio files", "*.mp3 *.wav *.flac *.m4a *.aac *.ogg"),
+                ("All files", "*.*")
+            ]
+        )
+        if selected_path:
+            self.import_audio_files([selected_path])
+
+    def import_video_files(self, file_paths, from_drop=False):
+        if not self.current_project_dir or not self.imported_video_dir:
+            messagebox.showwarning("Warning", "Open or create a project before importing videos.")
+            return []
+
+        imported_paths = []
+        skipped_paths = []
+        failed_imports = []
+
+        for source_path in file_paths or []:
+            if not self._is_supported_video_file(source_path):
+                skipped_paths.append(source_path)
+                continue
+            try:
+                imported_paths.append(self._copy_media_file_to_project(source_path, self.imported_video_dir))
+            except Exception as exc:
+                failed_imports.append(f"{os.path.basename(str(source_path))}: {exc}")
+
+        if imported_paths:
+            self.refresh_gallery()
+            self.save_project_state()
+            self.update_status(f"Imported {len(imported_paths)} video clip{'s' if len(imported_paths) != 1 else ''}.", "green")
+
+        if failed_imports:
+            messagebox.showerror("Video Import Error", "\n".join(failed_imports[:5]))
+        elif skipped_paths and not from_drop:
+            messagebox.showwarning(
+                "Unsupported Files",
+                "Only common video formats are supported for import.\n\nSkipped:\n" + "\n".join(os.path.basename(str(path)) for path in skipped_paths[:5])
+            )
+        elif skipped_paths:
+            self.update_status("Ignored dropped files that were not recognized as video clips.", "orange")
+
+        return imported_paths
+
+    def import_audio_files(self, file_paths, from_drop=False):
+        if not self.current_project_dir or not self.imported_audio_dir:
+            messagebox.showwarning("Warning", "Open or create a project before importing audio.")
+            return None
+
+        imported_audio_path = None
+        skipped_paths = []
+        failed_imports = []
+
+        for source_path in file_paths or []:
+            if not self._is_supported_audio_file(source_path):
+                skipped_paths.append(source_path)
+                continue
+            try:
+                imported_audio_path = self._copy_media_file_to_project(source_path, self.imported_audio_dir)
+                break
+            except Exception as exc:
+                failed_imports.append(f"{os.path.basename(str(source_path))}: {exc}")
+
+        if imported_audio_path:
+            self.current_generated_audio = imported_audio_path
+            self.current_audio_source = "imported"
+            self.preview_music_btn.config(state=tk.NORMAL)
+            if self.selected_video_for_music:
+                self.merge_music_btn.config(state=tk.NORMAL)
+            self._refresh_music_sidebar_state()
+            self.save_project_state()
+            self.update_music_status(f"Imported audio ready: {os.path.basename(imported_audio_path)}", "green")
+
+            if len(file_paths or []) > 1 and from_drop:
+                self.update_music_status(f"Imported audio ready: {os.path.basename(imported_audio_path)} (first supported file used)", "green")
+        elif failed_imports:
+            messagebox.showerror("Audio Import Error", "\n".join(failed_imports[:5]))
+        elif skipped_paths and not from_drop:
+            messagebox.showwarning(
+                "Unsupported Files",
+                "Only common audio formats are supported for import.\n\nSkipped:\n" + "\n".join(os.path.basename(str(path)) for path in skipped_paths[:5])
+            )
+        elif skipped_paths:
+            self.update_music_status("Ignored dropped files that were not recognized as audio.", "orange")
+
+        return imported_audio_path
 
     def _get_env_value(self, keys):
         for key in keys:
@@ -247,6 +580,79 @@ class LTXQueueManager:
             if os.path.isfile(candidate):
                 return candidate
         return None
+
+    def _find_window_handle_for_pid(self, process_id):
+        if sys.platform != "win32" or not process_id:
+            return None
+
+        handles = []
+        user32 = ctypes.windll.user32
+        callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+        def enum_callback(hwnd, _lparam):
+            pid = ctypes.c_ulong()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value == process_id and user32.IsWindow(hwnd):
+                handles.append(hwnd)
+                return False
+            return True
+
+        user32.EnumWindows(callback_type(enum_callback), 0)
+        return handles[0] if handles else None
+
+    def _resolve_comfyui_console_window(self):
+        if sys.platform != "win32":
+            return None
+
+        if self.comfyui_console_hwnd:
+            try:
+                if ctypes.windll.user32.IsWindow(self.comfyui_console_hwnd):
+                    return self.comfyui_console_hwnd
+            except Exception:
+                pass
+
+        if self.comfyui_process and self.comfyui_process.poll() is None:
+            self.comfyui_console_hwnd = self._find_window_handle_for_pid(self.comfyui_process.pid)
+        else:
+            self.comfyui_console_hwnd = None
+        return self.comfyui_console_hwnd
+
+    def _set_comfyui_terminal_visibility(self, visible):
+        if sys.platform != "win32":
+            return False
+
+        hwnd = self._resolve_comfyui_console_window()
+        if not hwnd:
+            return False
+
+        try:
+            ctypes.windll.user32.ShowWindow(hwnd, WINDOWS_SHOW if visible else WINDOWS_HIDE)
+            self.comfyui_console_visible = bool(visible)
+            self._refresh_comfyui_terminal_button()
+            return True
+        except Exception:
+            return False
+
+    def _refresh_comfyui_terminal_button(self):
+        if not hasattr(self, "toggle_comfyui_terminal_btn"):
+            return
+
+        process_running = bool(self.comfyui_process and self.comfyui_process.poll() is None)
+        if not process_running:
+            self.comfyui_console_hwnd = None
+            self.comfyui_console_visible = False
+        button_state = tk.NORMAL if process_running and sys.platform == "win32" else tk.DISABLED
+        button_text = "Hide ComfyUI Terminal" if self.comfyui_console_visible else "Show ComfyUI Terminal"
+        self.toggle_comfyui_terminal_btn.config(text=button_text, state=button_state)
+
+    def toggle_comfyui_terminal(self):
+        target_visibility = not self.comfyui_console_visible
+        if not self._set_comfyui_terminal_visibility(target_visibility):
+            self.update_status("ComfyUI terminal window is not available to toggle.", "orange")
+            self._refresh_comfyui_terminal_button()
+            return
+
+        self.update_status("ComfyUI terminal shown." if target_visibility else "ComfyUI terminal hidden.", "blue")
 
     def _resolve_model_search_roots(self, saved_roots=None, comfyui_root=None):
         configured_roots = []
@@ -1533,7 +1939,10 @@ class LTXQueueManager:
             return
         self._set_collapsible_section_open(key, not section["open"])
         self._update_video_workspace_balance()
+        self._update_music_workspace_balance()
         self._refresh_responsive_copy()
+        if key in PERSISTED_MUSIC_SECTION_KEYS:
+            self._schedule_project_state_save()
 
     def _update_collapsible_section_meta(self, key, meta_text):
         section = self.collapsible_sections.get(key)
@@ -1552,15 +1961,15 @@ class LTXQueueManager:
         )
         self.gallery_eyebrow_label.config(text="" if is_compact else "MEDIA BROWSER")
         self.gallery_copy_label.config(
-            text="Scenes, stitched renders, and finals." if is_compact else "Review generated scenes, stitched renders, and finished music videos without leaving the queue manager."
+            text="Scenes, imports, stitched renders, and finals." if is_compact else "Review generated scenes, imported clips, stitched renders, and finished music videos without leaving the queue manager."
         )
         self.music_header_eyebrow_label.config(text="" if is_compact else "MUSIC STUDIO")
         self.music_header_copy_label.config(
-            text="Score the selected cut." if is_compact else "Use tags for direction, lyrics for narrative, and then lock timing with duration, BPM, and key before generating audio and approving the final merge."
+            text="Score the selected cut." if is_compact else "Generate audio from tags and lyrics or import your own track, then approve the final merge."
         )
         self.music_sidebar_eyebrow_label.config(text="" if is_compact else "LINKED MEDIA")
         self.music_sidebar_copy_label.config(
-            text="Clip, audio, and final state." if is_compact else "This panel tracks the source clip, generated audio, and final export state for the current music pass."
+            text="Clip, audio, and final state." if is_compact else "This panel tracks the source clip, active audio, and final export state for the current music pass."
         )
         self.music_tags_hint_label.config(
             text="Genre, texture, emotion, instrumentation." if is_compact else "Describe genre, texture, emotion, and instrumentation."
@@ -1588,12 +1997,19 @@ class LTXQueueManager:
             "video_preflight": False,
             "video_debug": False,
             "gallery_browser": not is_compact,
+            "music_prompt": False,
             "music_lyrics": False,
-            "music_preview": not is_compact
+            "music_playback": False,
+            "music_generation": False,
+            "music_advanced": False,
+            "music_actions": False,
+            "music_media_state": False,
+            "music_preview": False
         }
         for key, is_open in target_states.items():
             self._set_collapsible_section_open(key, is_open)
         self._update_video_workspace_balance()
+        self._update_music_workspace_balance()
 
     def _protect_primary_workspaces(self):
         prompt_canvas_height = self._safe_widget_height(getattr(self, "canvas", None)) or 0
@@ -1603,7 +2019,7 @@ class LTXQueueManager:
 
         music_main_height = self._safe_widget_height(getattr(self, "music_main_frame", None)) or 0
         if music_main_height and music_main_height < 420:
-            for key in ["music_preview", "music_lyrics"]:
+            for key in ["music_preview", "music_media_state", "music_advanced", "music_generation", "music_playback", "music_lyrics", "music_prompt"]:
                 self._set_collapsible_section_open(key, False)
 
     def _update_video_workspace_balance(self):
@@ -1640,6 +2056,37 @@ class LTXQueueManager:
 
             if hasattr(self, "settings_canvas") and int(self.settings_canvas.winfo_exists()) == 1:
                 self.settings_canvas.configure(height=320 if active_support == "video_settings" else 240)
+        except tk.TclError:
+            return
+
+    def _update_music_workspace_balance(self):
+        section_layouts = [
+            ("music_prompt", {"fill": tk.X, "pady": (18, 12)}),
+            ("music_lyrics", {"fill": tk.X, "pady": (0, 12)}),
+            ("music_playback", {"fill": tk.X, "pady": (0, 12)}),
+            ("music_generation", {"fill": tk.X, "pady": (0, 12)}),
+            ("music_advanced", {"fill": tk.X, "pady": (0, 12)}),
+            ("music_actions", {"fill": tk.X})
+        ]
+        right_layouts = [
+            ("music_media_state", {"fill": tk.X}),
+            ("music_preview", {"fill": tk.BOTH, "expand": self.collapsible_sections.get("music_preview", {}).get("open", False), "pady": (16, 0)})
+        ]
+
+        try:
+            for key, pack_options in section_layouts:
+                section = self.collapsible_sections.get(key)
+                if not section or int(section["container"].winfo_exists()) != 1:
+                    continue
+                section["container"].pack_forget()
+                section["container"].pack(**pack_options)
+
+            for key, pack_options in right_layouts:
+                section = self.collapsible_sections.get(key)
+                if not section or int(section["container"].winfo_exists()) != 1:
+                    continue
+                section["container"].pack_forget()
+                section["container"].pack(**pack_options)
         except tk.TclError:
             return
 
@@ -1708,6 +2155,14 @@ class LTXQueueManager:
         if music_lyrics_width:
             self._set_wraplength(self.music_lyrics_hint_label, music_lyrics_width, padding=40, minimum=260)
 
+        music_advanced_width = self._safe_widget_width(getattr(self, "music_advanced_card", None))
+        if music_advanced_width and hasattr(self, "music_advanced_tuning_hint_label"):
+            self._set_wraplength(self.music_advanced_tuning_hint_label, music_advanced_width, padding=40, minimum=260)
+
+        music_actions_width = self._safe_widget_width(getattr(self, "music_actions_card", None))
+        if music_actions_width and hasattr(self, "music_drop_hint_label"):
+            self._set_wraplength(self.music_drop_hint_label, music_actions_width, padding=40, minimum=260)
+
         music_sidebar_width = self._safe_widget_width(getattr(self, "music_right_frame", None))
         if music_sidebar_width:
             self._set_wraplength(self.music_sidebar_copy_label, music_sidebar_width, padding=28, minimum=220)
@@ -1752,7 +2207,12 @@ class LTXQueueManager:
             self.gallery_stitched_count_label.config(text=str(stitched_count))
         if hasattr(self, "gallery_scene_count_label"):
             self.gallery_scene_count_label.config(text=str(scenes_count))
-        self._update_collapsible_section_meta("gallery_browser", f"{scenes_count} scenes • {stitched_count} stitched • {final_count} finals")
+        if hasattr(self, "gallery_imported_count_label"):
+            imported_count = len(self._get_gallery_video_files(self.imported_video_dir)) if self.imported_video_dir else 0
+            self.gallery_imported_count_label.config(text=str(imported_count))
+        else:
+            imported_count = len(self._get_gallery_video_files(self.imported_video_dir)) if self.imported_video_dir else 0
+        self._update_collapsible_section_meta("gallery_browser", f"{scenes_count} scenes • {imported_count} imports • {stitched_count} stitched • {final_count} finals")
 
     def _update_music_config_summary(self, *_args):
         if hasattr(self, "music_duration_value_label"):
@@ -1761,18 +2221,29 @@ class LTXQueueManager:
             self.music_bpm_value_label.config(text=str(self.music_bpm_var.get()))
         if hasattr(self, "music_key_value_label"):
             self.music_key_value_label.config(text=self.music_key_var.get().strip() or "Unset")
+        if hasattr(self, "music_sampling_value_label"):
+            sampler_name = self.music_sampler_var.get().strip() or "unset"
+            self.music_sampling_value_label.config(text=f"{self.music_steps_var.get()} st | cfg {self.music_cfg_var.get():g} | {sampler_name}")
+        self._update_collapsible_section_meta(
+            "music_prompt",
+            "Has tags" if getattr(self, "music_tags_text", None) and self.music_tags_text.get("1.0", tk.END).strip() else "Needs direction"
+        )
         self._update_collapsible_section_meta("music_lyrics", "Optional" if not getattr(self, "music_lyrics_text", None) or not self.music_lyrics_text.get("1.0", tk.END).strip() else "Has content")
+        self._update_collapsible_section_meta("music_playback", f"{self.music_duration_var.get()}s • {self.music_bpm_var.get()} BPM")
+        self._update_collapsible_section_meta("music_generation", f"{self.music_steps_var.get()} st • {self.music_sampler_var.get().strip() or 'sampler'}")
+        self._update_collapsible_section_meta("music_advanced", f"Top P {self.music_top_p_var.get():g} • Min P {self.music_min_p_var.get():g}")
 
     def _refresh_music_sidebar_state(self):
         if hasattr(self, "music_selected_clip_value_label"):
             selected_name = os.path.basename(self.selected_video_for_music) if self.selected_video_for_music else "No clip linked"
             self.music_selected_clip_value_label.config(text=selected_name)
         if hasattr(self, "music_audio_state_value_label"):
-            audio_state = os.path.basename(self.current_generated_audio) if self.current_generated_audio and os.path.exists(self.current_generated_audio) else "No audio generated"
-            self.music_audio_state_value_label.config(text=audio_state)
+            self.music_audio_state_value_label.config(text=self._format_audio_state())
         if hasattr(self, "music_final_state_value_label"):
             final_state = os.path.basename(self.current_final_video) if getattr(self, "current_final_video", None) and os.path.exists(self.current_final_video) else "No final render"
             self.music_final_state_value_label.config(text=final_state)
+        media_meta = os.path.basename(self.selected_video_for_music) if self.selected_video_for_music else "No clip linked"
+        self._update_collapsible_section_meta("music_media_state", media_meta)
         preview_meta = os.path.basename(self.selected_video_for_music) if self.selected_video_for_music else "Reference clip"
         self._update_collapsible_section_meta("music_preview", preview_meta)
 
@@ -1781,7 +2252,7 @@ class LTXQueueManager:
         self.selected_video_thumb.config(image="")
         self.selected_video_thumb.image = None
         if hasattr(self, "selected_video_meta_label"):
-            self.selected_video_meta_label.config(text="Select a stitched render from the gallery to lock music direction to a specific cut.")
+            self.selected_video_meta_label.config(text="Select a stitched or imported clip from the gallery to lock music direction to a specific cut.")
         self._refresh_music_sidebar_state()
 
     def _set_selected_video_preview(self, video_path, thumb_path=None):
@@ -1835,19 +2306,36 @@ class LTXQueueManager:
             self.bottom_frame,
             self.post_process_frame,
             self.gallery_header_frame,
+            self.gallery_actions_frame,
             self.gallery_section["container"],
             self.gallery_section["header"],
             self.gallery_shell_frame,
             self.gallery_inner_frame,
             self.music_left_frame,
+            self.music_scroll_shell,
             self.music_main_frame,
             self.music_header_frame,
+            self.music_prompt_section["container"],
+            self.music_prompt_section["header"],
             self.music_prompt_card,
             self.music_lyrics_section["container"],
             self.music_lyrics_section["header"],
             self.music_lyrics_card,
-            self.music_controls_card,
+            self.music_playback_section["container"],
+            self.music_playback_section["header"],
+            self.music_playback_card,
+            self.music_generation_section["container"],
+            self.music_generation_section["header"],
+            self.music_generation_card,
+            self.music_advanced_section["container"],
+            self.music_advanced_section["header"],
+            self.music_advanced_card,
+            self.music_actions_section["container"],
+            self.music_actions_section["header"],
+            self.music_actions_card,
             self.music_action_frame,
+            self.music_media_state_section["container"],
+            self.music_media_state_section["header"],
             self.music_preview_section["container"],
             self.music_preview_section["header"],
             self.music_sidebar_card,
@@ -1864,7 +2352,11 @@ class LTXQueueManager:
         self._style_panel(self.settings_canvas, self.colors["surface"])
         self._style_panel(self.gallery_canvas, self.colors["surface_alt"])
         self._style_panel(self.gallery_inner_frame, self.colors["surface_alt"])
+        self._style_panel(self.music_scroll_shell, self.colors["bg"])
+        self._style_panel(self.music_canvas, self.colors["bg"])
         self._style_panel(self.music_right_frame, self.colors["surface_alt"], border=True)
+        self._style_panel(self.music_sidebar_card, self.colors["surface_alt"], border=True)
+        self._style_panel(self.music_media_state_card, self.colors["surface_alt"], border=True)
         self._style_panel(self.music_sidebar_card, self.colors["surface_alt"], border=True)
         self._style_panel(self.music_preview_card, self.colors["surface"], border=True)
         self._style_panel(self.settings_frame, self.colors["surface"])
@@ -1873,9 +2365,9 @@ class LTXQueueManager:
         self._style_panel(self.prompt_section_frame, self.colors["surface"])
         self._style_panel(self.gallery_shell_frame, self.colors["surface_alt"], border=True)
 
-        for key in ["video_prompt_queue", "video_settings", "video_preflight", "video_debug", "gallery_browser", "music_lyrics", "music_preview"]:
+        for key in ["video_prompt_queue", "video_settings", "video_preflight", "video_debug", "gallery_browser", "music_prompt", "music_lyrics", "music_playback", "music_generation", "music_advanced", "music_actions", "music_media_state", "music_preview"]:
             section = self.collapsible_sections[key]
-            section_bg = self.colors["surface_alt"] if key in ["gallery_browser", "music_preview"] else self.colors["surface"]
+            section_bg = self.colors["surface_alt"] if key in ["gallery_browser", "music_media_state", "music_preview"] else self.colors["surface"]
             self._style_panel(section["container"], section_bg, border=True)
             self._style_panel(section["header"], section_bg)
             self._style_panel(section["body"], section_bg)
@@ -1920,10 +2412,8 @@ class LTXQueueManager:
         self._style_label(self.music_tags_hint_label, "muted", self.music_prompt_card.cget("bg"))
         self._style_label(self.music_lyrics_label, "section", self.music_lyrics_card.cget("bg"))
         self._style_label(self.music_lyrics_hint_label, "muted", self.music_lyrics_card.cget("bg"))
-        self._style_label(self.music_controls_eyebrow_label, "muted", self.music_controls_card.cget("bg"))
-        self.music_controls_eyebrow_label.configure(font=self.fonts["micro"])
-        self._style_label(self.music_controls_title_label, "section", self.music_controls_card.cget("bg"))
-        self._style_label(self.music_status_label, "muted", self.music_left_frame.cget("bg"))
+        self._style_label(self.music_advanced_tuning_hint_label, "muted", self.music_advanced_card.cget("bg"))
+        self._style_label(self.music_status_label, "muted", self.music_actions_card.cget("bg"))
         self._style_label(self.music_sidebar_eyebrow_label, "muted", self.music_right_frame.cget("bg"))
         self.music_sidebar_eyebrow_label.configure(font=self.fonts["micro"])
         self._style_label(self.music_sidebar_title_label, "title", self.music_right_frame.cget("bg"))
@@ -1932,6 +2422,10 @@ class LTXQueueManager:
         self._style_label(self.gallery_eyebrow_label, "muted", self.gallery_header_frame.cget("bg"))
         self.gallery_eyebrow_label.configure(font=self.fonts["micro"])
         self._style_label(self.gallery_copy_label, "muted", self.gallery_header_frame.cget("bg"))
+        if hasattr(self, "gallery_drop_hint_label"):
+            self._style_label(self.gallery_drop_hint_label, "muted", self.gallery_header_frame.cget("bg"))
+        if hasattr(self, "music_drop_hint_label"):
+            self._style_label(self.music_drop_hint_label, "muted", self.music_actions_card.cget("bg"))
         self._style_label(self.selected_video_header_label, "section", self.music_right_frame.cget("bg"))
         self._style_label(self.selected_video_lbl, "muted", self.music_right_frame.cget("bg"))
         self._style_label(self.selected_video_meta_label, "muted", self.music_right_frame.cget("bg"))
@@ -1939,6 +2433,7 @@ class LTXQueueManager:
         for button, variant in [
             (self.load_btn, "secondary"),
             (self.open_debug_btn, "ghost"),
+            (self.toggle_comfyui_terminal_btn, "ghost"),
             (self.reset_video_profile_btn, "ghost"),
             (self.validate_video_btn, "primary"),
             (self.refresh_model_lists_btn, "secondary"),
@@ -1947,7 +2442,9 @@ class LTXQueueManager:
             (self.stitch_btn, "primary"),
             (self.clear_sel_btn, "ghost"),
             (self.select_all_btn, "secondary"),
+            (self.gallery_import_btn, "secondary"),
             (self.gen_music_btn, "accent"),
+            (self.import_audio_btn, "secondary"),
             (self.preview_music_btn, "secondary"),
             (self.preview_final_btn, "secondary"),
             (self.merge_music_btn, "primary")
@@ -1957,6 +2454,7 @@ class LTXQueueManager:
         for compact_button, variant in [
             (self.load_btn, "secondary"),
             (self.open_debug_btn, "ghost"),
+            (self.toggle_comfyui_terminal_btn, "ghost"),
             (self.reset_video_profile_btn, "ghost"),
             (self.validate_video_btn, "primary"),
             (self.refresh_model_lists_btn, "secondary"),
@@ -1964,11 +2462,13 @@ class LTXQueueManager:
             (self.run_queue_btn, "accent"),
             (self.stitch_btn, "primary"),
             (self.clear_sel_btn, "ghost"),
-            (self.select_all_btn, "secondary")
+            (self.select_all_btn, "secondary"),
+            (self.gallery_import_btn, "secondary"),
+            (self.import_audio_btn, "secondary")
         ]:
             self._style_button(compact_button, variant, compact=True)
 
-        for checkbutton in [self.strip_audio_cb, self.video_output_include_project_cb]:
+        for checkbutton in [self.strip_audio_cb, self.video_output_include_project_cb, self.music_randomize_seed_cb, self.music_generate_codes_cb]:
             self._style_checkbutton(checkbutton)
 
         for entry_widget in [
@@ -1978,7 +2478,18 @@ class LTXQueueManager:
         ]:
             self._style_text_input(entry_widget, multiline=True)
 
-        for combobox in [self.video_profile_combo, self.video_checkpoint_combo, self.video_text_encoder_combo, self.video_lora_combo, self.video_upscaler_combo]:
+        for combobox in [
+            self.video_profile_combo,
+            self.video_checkpoint_combo,
+            self.video_text_encoder_combo,
+            self.video_lora_combo,
+            self.video_upscaler_combo,
+            self.music_timesignature_combo,
+            self.music_language_combo,
+            self.music_sampler_combo,
+            self.music_scheduler_combo,
+            self.music_quality_combo
+        ]:
             combobox.configure(style="TCombobox")
 
         self._theme_existing_entries(self.left_frame)
@@ -2018,10 +2529,12 @@ class LTXQueueManager:
         self.stitched_dir = os.path.join(self.current_project_dir, "stitched_videos")
         self.thumbs_dir = os.path.join(self.current_project_dir, "thumbnails")
         self.audio_dir = os.path.join(self.current_project_dir, "generated_audio")
+        self.imported_audio_dir = os.path.join(self.current_project_dir, "imported_audio")
         self.final_mv_dir = os.path.join(self.current_project_dir, "final_music_videos")
+        self.imported_video_dir = os.path.join(self.current_project_dir, "imported_videos")
         self.debug_dir = os.path.join(self.current_project_dir, "debug")
         
-        for d in [self.scenes_dir, self.stitched_dir, self.thumbs_dir, self.audio_dir, self.final_mv_dir, self.debug_dir]:
+        for d in [self.scenes_dir, self.stitched_dir, self.thumbs_dir, self.audio_dir, self.imported_audio_dir, self.final_mv_dir, self.imported_video_dir, self.debug_dir]:
             os.makedirs(d, exist_ok=True)
 
         self.debug_log_file = os.path.join(self.debug_dir, "wrapper_debug.log")
@@ -2096,22 +2609,41 @@ class LTXQueueManager:
     def launch_comfyui(self):
         if self._is_comfyui_running():
             self.update_status("ComfyUI already running on port 8188.", "blue")
+            self.comfyui_process = None
+            self.comfyui_console_hwnd = None
+            self.comfyui_console_visible = False
+            self._refresh_comfyui_terminal_button()
             return
 
         bat_path = self.comfyui_launcher_path
         if bat_path and os.path.exists(bat_path):
             self.update_status("Launching ComfyUI...", "blue")
             try:
-                # Launch in a new console window so it doesn't block our UI
+                launcher_command = [os.environ.get("COMSPEC", "cmd.exe"), "/c", bat_path]
+                startupinfo = None
+                if sys.platform == "win32":
+                    startupinfo = subprocess.STARTUPINFO()
+                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    startupinfo.wShowWindow = WINDOWS_HIDE
+
                 self.comfyui_process = subprocess.Popen(
-                    bat_path, 
+                    launcher_command,
                     creationflags=subprocess.CREATE_NEW_CONSOLE,
-                    cwd=os.path.dirname(bat_path)
+                    cwd=os.path.dirname(bat_path),
+                    startupinfo=startupinfo
                 )
+                self.comfyui_console_hwnd = None
+                self.comfyui_console_visible = False
+                self.root.after(1200, lambda: self._set_comfyui_terminal_visibility(False))
+                self._refresh_comfyui_terminal_button()
                 # Give it some time to start up
                 self.root.after(5000, lambda: self.update_status("ComfyUI Launched. Waiting for connection...", "blue"))
             except Exception as e:
                 self.update_status(f"Error launching ComfyUI: {e}", "red")
+                self.comfyui_process = None
+                self.comfyui_console_hwnd = None
+                self.comfyui_console_visible = False
+                self._refresh_comfyui_terminal_button()
         else:
             self.update_status("ComfyUI launcher not configured. Use Project > Configure Runtime Paths.", "red")
 
@@ -2195,13 +2727,16 @@ class LTXQueueManager:
 
         self.top_frame = tk.Frame(self.workflow_toolbar_card)
         self.top_frame.pack(side=tk.TOP, fill=tk.X)
-        self.top_frame.grid_columnconfigure(2, weight=1)
+        self.top_frame.grid_columnconfigure(3, weight=1)
         
         self.load_btn = tk.Button(self.top_frame, text="Load Workflow JSON", command=self.load_json_dialog)
         self.load_btn.grid(row=0, column=0, sticky="w")
 
         self.open_debug_btn = tk.Button(self.top_frame, text="Open Debug Log", command=self.open_debug_log)
         self.open_debug_btn.grid(row=0, column=1, sticky="w", padx=(8, 0))
+
+        self.toggle_comfyui_terminal_btn = tk.Button(self.top_frame, text="Show ComfyUI Terminal", command=self.toggle_comfyui_terminal, state=tk.DISABLED)
+        self.toggle_comfyui_terminal_btn.grid(row=0, column=2, sticky="w", padx=(8, 0))
         
         self.json_label = tk.Label(self.workflow_toolbar_card, text="No JSON loaded", anchor="w", justify=tk.LEFT)
         self.json_label.pack(side=tk.TOP, fill=tk.X, expand=True, pady=(6, 0))
@@ -2539,7 +3074,7 @@ class LTXQueueManager:
         self.gallery_title_label.pack(in_=self.gallery_header_frame, anchor="w", pady=(4, 0))
         self.gallery_copy_label = tk.Label(
             self.gallery_header_frame,
-            text="Review generated scenes, stitched renders, and finished music videos without leaving the queue manager.",
+            text="Review generated scenes, imported clips, stitched renders, and finished music videos without leaving the queue manager.",
             anchor="w",
             justify=tk.LEFT,
             wraplength=340
@@ -2550,10 +3085,20 @@ class LTXQueueManager:
         self.gallery_stats_frame.pack(fill=tk.X)
         _, self.gallery_scene_count_label = self._create_metric_chip(self.gallery_stats_frame, "Scenes", "0")
         self.gallery_scene_count_label.master.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        _, self.gallery_imported_count_label = self._create_metric_chip(self.gallery_stats_frame, "Imports", "0")
+        self.gallery_imported_count_label.master.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
         _, self.gallery_stitched_count_label = self._create_metric_chip(self.gallery_stats_frame, "Stitched", "0")
         self.gallery_stitched_count_label.master.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
         _, self.gallery_final_count_label = self._create_metric_chip(self.gallery_stats_frame, "Finals", "0")
         self.gallery_final_count_label.master.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        self.gallery_actions_frame = tk.Frame(self.gallery_header_frame)
+        self.gallery_actions_frame.pack(fill=tk.X, pady=(12, 0))
+        self.gallery_import_btn = tk.Button(self.gallery_actions_frame, text="Import Video", command=self.import_videos_dialog)
+        self.gallery_import_btn.pack(side=tk.LEFT)
+        gallery_drop_text = "Drag video files here too." if self.drag_drop_enabled else "Import video clips into a project-owned gallery section."
+        self.gallery_drop_hint_label = tk.Label(self.gallery_actions_frame, text=gallery_drop_text, anchor="w", justify=tk.LEFT)
+        self.gallery_drop_hint_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 0))
         
         self.gallery_section = self._create_collapsible_section(
             self.right_frame,
@@ -2632,14 +3177,32 @@ class LTXQueueManager:
         # Left side: Controls
         self.music_left_frame = tk.Frame(self.music_tab, padx=0, pady=0)
         self.music_left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(18, 10), pady=18)
+
+        self.music_scroll_shell = tk.Frame(self.music_left_frame, padx=0, pady=0)
+        self.music_scroll_shell.pack(fill=tk.BOTH, expand=True)
+
+        self.music_canvas = tk.Canvas(self.music_scroll_shell, bd=0, highlightthickness=0)
+        self.music_scrollbar = tk.Scrollbar(self.music_scroll_shell, orient="vertical", command=self.music_canvas.yview)
+        self.music_main_frame = tk.Frame(self.music_canvas, padx=18, pady=14)
+        self.music_canvas_window_id = self.music_canvas.create_window((0, 0), window=self.music_main_frame, anchor="nw")
+        self.music_canvas.configure(yscrollcommand=self.music_scrollbar.set)
+
+        self.music_main_frame.bind(
+            "<Configure>",
+            lambda _event: self.music_canvas.configure(scrollregion=self.music_canvas.bbox("all"))
+        )
+        self.music_canvas.bind(
+            "<Configure>",
+            lambda event: self.music_canvas.itemconfig(self.music_canvas_window_id, width=event.width)
+        )
+
+        self.music_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.music_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
         # Right side: Selected Video Preview
         self.music_right_frame = tk.Frame(self.music_tab, padx=0, pady=0, width=360)
         self.music_right_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 18), pady=18)
         self.music_right_frame.pack_propagate(False)
-
-        self.music_main_frame = tk.Frame(self.music_left_frame, padx=18, pady=14)
-        self.music_main_frame.pack(fill=tk.BOTH, expand=True)
 
         self.music_header_frame = tk.Frame(self.music_main_frame)
         self.music_header_frame.pack(fill=tk.X)
@@ -2659,10 +3222,22 @@ class LTXQueueManager:
         _, self.music_bpm_value_label = self._create_metric_chip(self.music_header_stats_frame, "BPM", "120")
         self.music_bpm_value_label.master.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
         _, self.music_key_value_label = self._create_metric_chip(self.music_header_stats_frame, "Key", "C major")
-        self.music_key_value_label.master.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.music_key_value_label.master.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        _, self.music_sampling_value_label = self._create_metric_chip(self.music_header_stats_frame, "Sampling", "8 st | cfg 1 | euler")
+        self.music_sampling_value_label.master.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        self.music_prompt_card = tk.Frame(self.music_main_frame, padx=16, pady=16)
-        self.music_prompt_card.pack(fill=tk.X, pady=(18, 12))
+        self.music_prompt_section = self._create_collapsible_section(
+            self.music_main_frame,
+            "music_prompt",
+            "Style Direction",
+            meta_text="Needs direction",
+            is_open=False,
+            body_expand=True
+        )
+        self.music_prompt_section["container"].pack(fill=tk.X, pady=(18, 12))
+
+        self.music_prompt_card = tk.Frame(self.music_prompt_section["body"], padx=16, pady=16)
+        self.music_prompt_card.pack(fill=tk.BOTH, expand=True)
 
         self.music_tags_label = tk.Label(self.music_prompt_card, text="Style Direction")
         self.music_tags_label.pack(anchor="w")
@@ -2670,6 +3245,7 @@ class LTXQueueManager:
         self.music_tags_hint_label.pack(anchor="w", pady=(4, 10), fill=tk.X)
         self.music_tags_text = tk.Text(self.music_prompt_card, height=5, width=60)
         self.music_tags_text.pack(fill=tk.X)
+        self.music_tags_text.bind("<KeyRelease>", self._on_music_text_changed)
         
         self.music_lyrics_section = self._create_collapsible_section(
             self.music_main_frame,
@@ -2690,26 +3266,56 @@ class LTXQueueManager:
         self.music_lyrics_hint_label.pack(anchor="w", pady=(4, 10), fill=tk.X)
         self.music_lyrics_text = tk.Text(self.music_lyrics_card, height=12, width=60)
         self.music_lyrics_text.pack(fill=tk.BOTH, expand=True)
-        self.music_lyrics_text.bind("<KeyRelease>", lambda _event: self._update_collapsible_section_meta("music_lyrics", "Has content" if self.music_lyrics_text.get("1.0", tk.END).strip() else "Optional"))
+        self.music_lyrics_text.bind("<KeyRelease>", self._on_music_text_changed)
         
-        self.music_controls_card = tk.Frame(self.music_main_frame, padx=16, pady=16)
-        self.music_controls_card.pack(fill=tk.X)
-        self.music_controls_eyebrow_label = tk.Label(self.music_controls_card, text="Playback Parameters")
-        self.music_controls_eyebrow_label.pack(anchor="w")
-        self.music_controls_title_label = tk.Label(self.music_controls_card, text="Time, pulse, and delivery")
-        self.music_controls_title_label.pack(anchor="w", pady=(4, 14))
-        
-        # Settings Frame
-        self.music_settings_frame = tk.Frame(self.music_controls_card)
+        self.music_duration_var = tk.IntVar(value=120)
+        self.music_duration_var.trace_add("write", self._update_music_config_summary)
+        self.music_bpm_var = tk.IntVar(value=120)
+        self.music_bpm_var.trace_add("write", self._update_music_config_summary)
+        self.music_key_var = tk.StringVar(value="C major")
+        self.music_key_var.trace_add("write", self._update_music_config_summary)
+        self.music_steps_var = tk.IntVar(value=8)
+        self.music_steps_var.trace_add("write", self._update_music_config_summary)
+        self.music_cfg_var = tk.DoubleVar(value=1.0)
+        self.music_cfg_var.trace_add("write", self._update_music_config_summary)
+        self.music_sampler_var = tk.StringVar(value="euler")
+        self.music_sampler_var.trace_add("write", self._update_music_config_summary)
+        self.music_scheduler_var = tk.StringVar(value="simple")
+        self.music_denoise_var = tk.DoubleVar(value=1.0)
+        self.music_seed_var = tk.IntVar(value=1)
+        self.music_randomize_seed_var = tk.BooleanVar(value=True)
+        self.music_randomize_seed_var.trace_add("write", self._update_music_seed_entry_state)
+        self.music_timesignature_var = tk.StringVar(value="4")
+        self.music_language_var = tk.StringVar(value="en")
+        self.music_generate_audio_codes_var = tk.BooleanVar(value=True)
+        self.music_cfg_scale_var = tk.DoubleVar(value=2.0)
+        self.music_temperature_var = tk.DoubleVar(value=0.85)
+        self.music_top_p_var = tk.DoubleVar(value=0.9)
+        self.music_top_k_var = tk.IntVar(value=0)
+        self.music_min_p_var = tk.DoubleVar(value=ACE_STEP_15_MIN_P_DEFAULT)
+        self.music_quality_var = tk.StringVar(value="V0")
+
+        self.music_playback_section = self._create_collapsible_section(
+            self.music_main_frame,
+            "music_playback",
+            "Playback Parameters",
+            meta_text="120s • 120 BPM",
+            is_open=False,
+            body_expand=True
+        )
+        self.music_playback_section["container"].pack(fill=tk.X, pady=(0, 12))
+
+        self.music_playback_card = tk.Frame(self.music_playback_section["body"], padx=16, pady=16)
+        self.music_playback_card.pack(fill=tk.BOTH, expand=True)
+
+        self.music_settings_frame = tk.Frame(self.music_playback_card)
         self.music_settings_frame.pack(fill=tk.X)
-        self.music_settings_frame.grid_columnconfigure((0, 1, 2), weight=1)
+        self.music_settings_frame.grid_columnconfigure((0, 1, 2, 3), weight=1)
         
         duration_frame = tk.Frame(self.music_settings_frame)
         duration_frame.grid(row=0, column=0, sticky="ew", padx=(0, 8))
         duration_label = tk.Label(duration_frame, text="Duration (s)")
         duration_label.pack(anchor="w")
-        self.music_duration_var = tk.IntVar(value=120)
-        self.music_duration_var.trace_add("write", self._update_music_config_summary)
         self.music_duration_entry = tk.Entry(duration_frame, textvariable=self.music_duration_var, width=8)
         self.music_duration_entry.pack(fill=tk.X, pady=(6, 0))
         
@@ -2717,8 +3323,6 @@ class LTXQueueManager:
         bpm_frame.grid(row=0, column=1, sticky="ew", padx=8)
         bpm_label = tk.Label(bpm_frame, text="BPM")
         bpm_label.pack(anchor="w")
-        self.music_bpm_var = tk.IntVar(value=120)
-        self.music_bpm_var.trace_add("write", self._update_music_config_summary)
         self.music_bpm_entry = tk.Entry(bpm_frame, textvariable=self.music_bpm_var, width=8)
         self.music_bpm_entry.pack(fill=tk.X, pady=(6, 0))
         
@@ -2726,13 +3330,165 @@ class LTXQueueManager:
         key_frame.grid(row=0, column=2, sticky="ew", padx=(8, 0))
         key_label = tk.Label(key_frame, text="Key / Scale")
         key_label.pack(anchor="w")
-        self.music_key_var = tk.StringVar(value="C major")
-        self.music_key_var.trace_add("write", self._update_music_config_summary)
         self.music_key_entry = tk.Entry(key_frame, textvariable=self.music_key_var, width=15)
         self.music_key_entry.pack(fill=tk.X, pady=(6, 0))
+
+        steps_frame = tk.Frame(self.music_settings_frame)
+        steps_frame.grid(row=0, column=3, sticky="ew", padx=(8, 0))
+        steps_label = tk.Label(steps_frame, text="Steps")
+        steps_label.pack(anchor="w")
+        self.music_steps_entry = tk.Entry(steps_frame, textvariable=self.music_steps_var, width=8)
+        self.music_steps_entry.pack(fill=tk.X, pady=(6, 0))
+
+        self.music_generation_section = self._create_collapsible_section(
+            self.music_main_frame,
+            "music_generation",
+            "Generation Tuning",
+            meta_text="8 st • euler",
+            is_open=False,
+            body_expand=True
+        )
+        self.music_generation_section["container"].pack(fill=tk.X, pady=(0, 12))
+
+        self.music_generation_card = tk.Frame(self.music_generation_section["body"], padx=16, pady=16)
+        self.music_generation_card.pack(fill=tk.BOTH, expand=True)
+
+        self.music_generation_frame = tk.Frame(self.music_generation_card)
+        self.music_generation_frame.pack(fill=tk.X, pady=(14, 0))
+        self.music_generation_frame.grid_columnconfigure((0, 1, 2, 3), weight=1)
+
+        cfg_frame = tk.Frame(self.music_generation_frame)
+        cfg_frame.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        cfg_label = tk.Label(cfg_frame, text="Sampler CFG")
+        cfg_label.pack(anchor="w")
+        self.music_cfg_entry = tk.Entry(cfg_frame, textvariable=self.music_cfg_var, width=8)
+        self.music_cfg_entry.pack(fill=tk.X, pady=(6, 0))
+
+        denoise_frame = tk.Frame(self.music_generation_frame)
+        denoise_frame.grid(row=0, column=1, sticky="ew", padx=8)
+        denoise_label = tk.Label(denoise_frame, text="Denoise")
+        denoise_label.pack(anchor="w")
+        self.music_denoise_entry = tk.Entry(denoise_frame, textvariable=self.music_denoise_var, width=8)
+        self.music_denoise_entry.pack(fill=tk.X, pady=(6, 0))
+
+        timesig_frame = tk.Frame(self.music_generation_frame)
+        timesig_frame.grid(row=0, column=2, sticky="ew", padx=8)
+        timesig_label = tk.Label(timesig_frame, text="Time Signature")
+        timesig_label.pack(anchor="w")
+        self.music_timesignature_combo = ttk.Combobox(timesig_frame, textvariable=self.music_timesignature_var, values=MUSIC_TIME_SIGNATURE_OPTIONS, state="readonly")
+        self.music_timesignature_combo.pack(fill=tk.X, pady=(6, 0))
+
+        language_frame = tk.Frame(self.music_generation_frame)
+        language_frame.grid(row=0, column=3, sticky="ew", padx=(8, 0))
+        language_label = tk.Label(language_frame, text="Language")
+        language_label.pack(anchor="w")
+        self.music_language_combo = ttk.Combobox(language_frame, textvariable=self.music_language_var, values=MUSIC_LANGUAGE_OPTIONS, state="readonly")
+        self.music_language_combo.pack(fill=tk.X, pady=(6, 0))
+
+        sampler_frame = tk.Frame(self.music_generation_frame)
+        sampler_frame.grid(row=1, column=0, sticky="ew", padx=(0, 8), pady=(12, 0))
+        sampler_label = tk.Label(sampler_frame, text="Sampler")
+        sampler_label.pack(anchor="w")
+        self.music_sampler_combo = ttk.Combobox(sampler_frame, textvariable=self.music_sampler_var, values=MUSIC_SAMPLER_OPTIONS, state="readonly")
+        self.music_sampler_combo.pack(fill=tk.X, pady=(6, 0))
+
+        scheduler_frame = tk.Frame(self.music_generation_frame)
+        scheduler_frame.grid(row=1, column=1, sticky="ew", padx=8, pady=(12, 0))
+        scheduler_label = tk.Label(scheduler_frame, text="Scheduler")
+        scheduler_label.pack(anchor="w")
+        self.music_scheduler_combo = ttk.Combobox(scheduler_frame, textvariable=self.music_scheduler_var, values=MUSIC_SCHEDULER_OPTIONS, state="readonly")
+        self.music_scheduler_combo.pack(fill=tk.X, pady=(6, 0))
+
+        seed_frame = tk.Frame(self.music_generation_frame)
+        seed_frame.grid(row=1, column=2, sticky="ew", padx=8, pady=(12, 0))
+        seed_label = tk.Label(seed_frame, text="Seed")
+        seed_label.pack(anchor="w")
+        self.music_seed_entry = tk.Entry(seed_frame, textvariable=self.music_seed_var, width=12)
+        self.music_seed_entry.pack(fill=tk.X, pady=(6, 0))
+
+        quality_frame = tk.Frame(self.music_generation_frame)
+        quality_frame.grid(row=1, column=3, sticky="ew", padx=(8, 0), pady=(12, 0))
+        quality_label = tk.Label(quality_frame, text="MP3 Quality")
+        quality_label.pack(anchor="w")
+        self.music_quality_combo = ttk.Combobox(quality_frame, textvariable=self.music_quality_var, values=MUSIC_MP3_QUALITY_OPTIONS, state="readonly")
+        self.music_quality_combo.pack(fill=tk.X, pady=(6, 0))
+
+        self.music_toggle_frame = tk.Frame(self.music_generation_card)
+        self.music_toggle_frame.pack(fill=tk.X, pady=(14, 0))
+        self.music_randomize_seed_cb = tk.Checkbutton(self.music_toggle_frame, text="Randomize Seed Each Run", variable=self.music_randomize_seed_var)
+        self.music_randomize_seed_cb.pack(side=tk.LEFT)
+        self.music_generate_codes_cb = tk.Checkbutton(self.music_toggle_frame, text="Generate Audio Codes", variable=self.music_generate_audio_codes_var)
+        self.music_generate_codes_cb.pack(side=tk.LEFT, padx=(16, 0))
+
+        self.music_advanced_section = self._create_collapsible_section(
+            self.music_main_frame,
+            "music_advanced",
+            "Advanced Sampling",
+            meta_text="Top P 0.9 • Min P 0",
+            is_open=False,
+            body_expand=True
+        )
+        self.music_advanced_section["container"].pack(fill=tk.X, pady=(0, 12))
+
+        self.music_advanced_card = tk.Frame(self.music_advanced_section["body"], padx=16, pady=16)
+        self.music_advanced_card.pack(fill=tk.BOTH, expand=True)
+
+        self.music_advanced_tuning_hint_label = tk.Label(self.music_advanced_card, text="Refine language-model guidance, token sampling, and probability cutoffs.", anchor="w", justify=tk.LEFT)
+        self.music_advanced_tuning_hint_label.pack(anchor="w", pady=(4, 0), fill=tk.X)
+
+        self.music_advanced_frame = tk.Frame(self.music_advanced_card)
+        self.music_advanced_frame.pack(fill=tk.X, pady=(12, 0))
+        self.music_advanced_frame.grid_columnconfigure((0, 1, 2, 3, 4), weight=1)
+
+        cfg_scale_frame = tk.Frame(self.music_advanced_frame)
+        cfg_scale_frame.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        cfg_scale_label = tk.Label(cfg_scale_frame, text="Code CFG")
+        cfg_scale_label.pack(anchor="w")
+        self.music_cfg_scale_entry = tk.Entry(cfg_scale_frame, textvariable=self.music_cfg_scale_var, width=8)
+        self.music_cfg_scale_entry.pack(fill=tk.X, pady=(6, 0))
+
+        temperature_frame = tk.Frame(self.music_advanced_frame)
+        temperature_frame.grid(row=0, column=1, sticky="ew", padx=8)
+        temperature_label = tk.Label(temperature_frame, text="Temperature")
+        temperature_label.pack(anchor="w")
+        self.music_temperature_entry = tk.Entry(temperature_frame, textvariable=self.music_temperature_var, width=8)
+        self.music_temperature_entry.pack(fill=tk.X, pady=(6, 0))
+
+        top_p_frame = tk.Frame(self.music_advanced_frame)
+        top_p_frame.grid(row=0, column=2, sticky="ew", padx=8)
+        top_p_label = tk.Label(top_p_frame, text="Top P")
+        top_p_label.pack(anchor="w")
+        self.music_top_p_entry = tk.Entry(top_p_frame, textvariable=self.music_top_p_var, width=8)
+        self.music_top_p_entry.pack(fill=tk.X, pady=(6, 0))
+
+        top_k_frame = tk.Frame(self.music_advanced_frame)
+        top_k_frame.grid(row=0, column=3, sticky="ew", padx=8)
+        top_k_label = tk.Label(top_k_frame, text="Top K")
+        top_k_label.pack(anchor="w")
+        self.music_top_k_entry = tk.Entry(top_k_frame, textvariable=self.music_top_k_var, width=8)
+        self.music_top_k_entry.pack(fill=tk.X, pady=(6, 0))
+
+        min_p_frame = tk.Frame(self.music_advanced_frame)
+        min_p_frame.grid(row=0, column=4, sticky="ew", padx=(8, 0))
+        min_p_label = tk.Label(min_p_frame, text="Min P")
+        min_p_label.pack(anchor="w")
+        self.music_min_p_entry = tk.Entry(min_p_frame, textvariable=self.music_min_p_var, width=8)
+        self.music_min_p_entry.pack(fill=tk.X, pady=(6, 0))
         
-        # Action Buttons
-        self.music_action_frame = tk.Frame(self.music_controls_card)
+        self.music_actions_section = self._create_collapsible_section(
+            self.music_main_frame,
+            "music_actions",
+            "Run and Review",
+            meta_text="Idle",
+            is_open=False,
+            body_expand=True
+        )
+        self.music_actions_section["container"].pack(fill=tk.X)
+
+        self.music_actions_card = tk.Frame(self.music_actions_section["body"], padx=16, pady=16)
+        self.music_actions_card.pack(fill=tk.BOTH, expand=True)
+
+        self.music_action_frame = tk.Frame(self.music_actions_card)
         self.music_action_frame.pack(fill=tk.X, pady=(16, 0))
         self.music_action_frame.grid_columnconfigure((0, 1), weight=1)
         self.music_primary_actions_frame = tk.Frame(self.music_action_frame)
@@ -2742,9 +3498,16 @@ class LTXQueueManager:
         
         self.gen_music_btn = tk.Button(self.music_primary_actions_frame, text="Generate Music", command=self.generate_music)
         self.gen_music_btn.pack(side=tk.LEFT)
+
+        self.import_audio_btn = tk.Button(self.music_primary_actions_frame, text="Import Audio", command=self.import_audio_dialog)
+        self.import_audio_btn.pack(side=tk.LEFT, padx=(8, 0))
         
         self.preview_music_btn = tk.Button(self.music_primary_actions_frame, text="Preview Audio", command=self.preview_audio, state=tk.DISABLED)
         self.preview_music_btn.pack(side=tk.LEFT, padx=(8, 0))
+
+        music_drop_text = "Drag an audio file here to link it instantly." if self.drag_drop_enabled else "Import your own audio if you want to skip generation."
+        self.music_drop_hint_label = tk.Label(self.music_actions_card, text=music_drop_text, anchor="w", justify=tk.LEFT, wraplength=420)
+        self.music_drop_hint_label.pack(anchor="w", pady=(10, 0), fill=tk.X)
         
         self.preview_final_btn = tk.Button(self.music_secondary_actions_frame, text="Preview Final Video", command=self.preview_final_video, state=tk.DISABLED)
         self.preview_final_btn.pack(side=tk.RIGHT)
@@ -2752,28 +3515,42 @@ class LTXQueueManager:
         self.merge_music_btn = tk.Button(self.music_secondary_actions_frame, text="Approve & Merge with Video", command=self.merge_audio_video, state=tk.DISABLED)
         self.merge_music_btn.pack(side=tk.RIGHT, padx=(0, 8))
         
-        self.music_status_label = tk.Label(self.music_controls_card, text="Status: Idle", fg="blue")
+        self.music_status_label = tk.Label(self.music_actions_card, text="Status: Idle", fg="blue")
         self.music_status_label.pack(anchor="w", pady=(14, 0))
         
         # --- Selected Video Info ---
-        self.music_sidebar_eyebrow_label = tk.Label(self.music_right_frame, text="Linked Media")
+        self.music_media_state_section = self._create_collapsible_section(
+            self.music_right_frame,
+            "music_media_state",
+            "Linked Media",
+            meta_text="No clip linked",
+            is_open=False,
+            body_expand=True,
+            body_background=self.colors["surface_alt"]
+        )
+        self.music_media_state_section["container"].pack(fill=tk.X)
+
+        self.music_media_state_card = tk.Frame(self.music_media_state_section["body"], padx=16, pady=16)
+        self.music_media_state_card.pack(fill=tk.BOTH, expand=True)
+
+        self.music_sidebar_eyebrow_label = tk.Label(self.music_media_state_card, text="Linked Media")
         self.music_sidebar_eyebrow_label.pack(anchor="w")
-        self.music_sidebar_title_label = tk.Label(self.music_right_frame, text="Selected Video")
+        self.music_sidebar_title_label = tk.Label(self.music_media_state_card, text="Selected Video")
         self.music_sidebar_title_label.pack(anchor="w", pady=(4, 0))
         self.music_sidebar_copy_label = tk.Label(
-            self.music_right_frame,
-            text="This panel tracks the source clip, generated audio, and final export state for the current music pass.",
+            self.music_media_state_card,
+            text="This panel tracks the source clip, active audio, and final export state for the current music pass.",
             anchor="w",
             justify=tk.LEFT,
             wraplength=320
         )
         self.music_sidebar_copy_label.pack(anchor="w", pady=(6, 14), fill=tk.X)
 
-        self.music_sidebar_summary_frame = tk.Frame(self.music_right_frame)
+        self.music_sidebar_summary_frame = tk.Frame(self.music_media_state_card)
         self.music_sidebar_summary_frame.pack(fill=tk.X)
         _, self.music_selected_clip_value_label = self._create_metric_chip(self.music_sidebar_summary_frame, "Clip", "No clip linked")
         self.music_selected_clip_value_label.master.pack(fill=tk.X)
-        _, self.music_audio_state_value_label = self._create_metric_chip(self.music_sidebar_summary_frame, "Audio", "No audio generated")
+        _, self.music_audio_state_value_label = self._create_metric_chip(self.music_sidebar_summary_frame, "Audio", "No audio linked")
         self.music_audio_state_value_label.master.pack(fill=tk.X, pady=(8, 0))
         _, self.music_final_state_value_label = self._create_metric_chip(self.music_sidebar_summary_frame, "Final", "No final render")
         self.music_final_state_value_label.master.pack(fill=tk.X, pady=(8, 0))
@@ -2801,7 +3578,7 @@ class LTXQueueManager:
         self.selected_video_lbl.pack(anchor="w", pady=(10, 6), fill=tk.X)
         self.selected_video_meta_label = tk.Label(
             self.music_preview_card,
-            text="Select a stitched render from the gallery to lock music direction to a specific cut.",
+            text="Select a stitched or imported clip from the gallery to lock music direction to a specific cut.",
             wraplength=280,
             justify=tk.LEFT,
             anchor="w"
@@ -2819,6 +3596,9 @@ class LTXQueueManager:
         self.music_preview_status_frame = tk.Frame(self.music_preview_card)
         self.music_preview_status_frame.pack(fill=tk.X, pady=(10, 0))
 
+        self._register_music_persistence_hooks()
+        self._update_music_workspace_balance()
+        self._reset_music_settings_to_loaded_workflow()
         self._update_music_config_summary()
         self._refresh_music_sidebar_state()
 
@@ -2901,6 +3681,226 @@ class LTXQueueManager:
             node_inputs[role_ref["input"]] = value
             updated_count += 1
         return updated_count
+
+    def _normalize_music_workflow(self, workflow):
+        if not isinstance(workflow, dict):
+            return []
+
+        normalized_node_ids = []
+        for node_id, node_data in workflow.items():
+            if not isinstance(node_data, dict):
+                continue
+            if node_data.get("class_type") != "TextEncodeAceStepAudio1.5":
+                continue
+
+            node_inputs = node_data.setdefault("inputs", {})
+            if "min_p" in node_inputs:
+                continue
+
+            node_inputs["min_p"] = ACE_STEP_15_MIN_P_DEFAULT
+            normalized_node_ids.append(str(node_id))
+
+        if normalized_node_ids:
+            self.log_debug(
+                "MUSIC_WORKFLOW_NORMALIZED",
+                updated_nodes=normalized_node_ids,
+                min_p=ACE_STEP_15_MIN_P_DEFAULT
+            )
+
+        return normalized_node_ids
+
+    def _get_music_workflow_input(self, node_id, input_name, default=None):
+        if not self.music_workflow:
+            return default
+
+        node_inputs = self.music_workflow.get(str(node_id), {}).get("inputs", {})
+        value = node_inputs.get(input_name, default)
+        if isinstance(value, list):
+            return default
+        return value
+
+    def _coerce_music_int(self, value, default=0):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return default
+
+    def _coerce_music_float(self, value, default=0.0):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _get_music_workflow_defaults(self):
+        if self.music_workflow:
+            self._normalize_music_workflow(self.music_workflow)
+
+        return {
+            "duration": self._coerce_music_int(self._get_music_workflow_input("94", "duration", 120), 120),
+            "bpm": self._coerce_music_int(self._get_music_workflow_input("94", "bpm", 120), 120),
+            "keyscale": str(self._get_music_workflow_input("94", "keyscale", "C major") or "C major"),
+            "steps": self._coerce_music_int(self._get_music_workflow_input("3", "steps", 8), 8),
+            "cfg": self._coerce_music_float(self._get_music_workflow_input("3", "cfg", 1.0), 1.0),
+            "sampler_name": str(self._get_music_workflow_input("3", "sampler_name", "euler") or "euler"),
+            "scheduler": str(self._get_music_workflow_input("3", "scheduler", "simple") or "simple"),
+            "denoise": self._coerce_music_float(self._get_music_workflow_input("3", "denoise", 1.0), 1.0),
+            "seed": self._coerce_music_int(self._get_music_workflow_input("94", "seed", 1), 1),
+            "randomize_seed": True,
+            "timesignature": str(self._get_music_workflow_input("94", "timesignature", "4") or "4"),
+            "language": str(self._get_music_workflow_input("94", "language", "en") or "en"),
+            "generate_audio_codes": bool(self._get_music_workflow_input("94", "generate_audio_codes", True)),
+            "cfg_scale": self._coerce_music_float(self._get_music_workflow_input("94", "cfg_scale", 2.0), 2.0),
+            "temperature": self._coerce_music_float(self._get_music_workflow_input("94", "temperature", 0.85), 0.85),
+            "top_p": self._coerce_music_float(self._get_music_workflow_input("94", "top_p", 0.9), 0.9),
+            "top_k": self._coerce_music_int(self._get_music_workflow_input("94", "top_k", 0), 0),
+            "min_p": self._coerce_music_float(self._get_music_workflow_input("94", "min_p", ACE_STEP_15_MIN_P_DEFAULT), ACE_STEP_15_MIN_P_DEFAULT),
+            "quality": str(self._get_music_workflow_input("107", "quality", "V0") or "V0")
+        }
+
+    def _get_music_settings_snapshot(self):
+        return {
+            "duration": self.music_duration_var.get(),
+            "bpm": self.music_bpm_var.get(),
+            "keyscale": self.music_key_var.get().strip(),
+            "steps": self.music_steps_var.get(),
+            "cfg": self.music_cfg_var.get(),
+            "sampler_name": self.music_sampler_var.get().strip(),
+            "scheduler": self.music_scheduler_var.get().strip(),
+            "denoise": self.music_denoise_var.get(),
+            "seed": self.music_seed_var.get(),
+            "randomize_seed": bool(self.music_randomize_seed_var.get()),
+            "timesignature": self.music_timesignature_var.get().strip(),
+            "language": self.music_language_var.get().strip(),
+            "generate_audio_codes": bool(self.music_generate_audio_codes_var.get()),
+            "cfg_scale": self.music_cfg_scale_var.get(),
+            "temperature": self.music_temperature_var.get(),
+            "top_p": self.music_top_p_var.get(),
+            "top_k": self.music_top_k_var.get(),
+            "min_p": self.music_min_p_var.get(),
+            "quality": self.music_quality_var.get().strip()
+        }
+
+    def _get_music_ui_state_snapshot(self):
+        return {
+            key: bool(self.collapsible_sections.get(key, {}).get("open"))
+            for key in PERSISTED_MUSIC_SECTION_KEYS
+            if key in self.collapsible_sections
+        }
+
+    def _apply_music_ui_state_snapshot(self, ui_state=None):
+        if not isinstance(ui_state, dict):
+            return
+
+        for key in PERSISTED_MUSIC_SECTION_KEYS:
+            if key not in ui_state or key not in self.collapsible_sections:
+                continue
+            self._set_collapsible_section_open(key, bool(ui_state[key]))
+
+        self._update_music_workspace_balance()
+
+    def _schedule_project_state_save(self, delay_ms=500):
+        if not self.current_project_dir or self.project_state_restore_in_progress:
+            return
+
+        if self.project_state_save_after_id is not None:
+            try:
+                self.root.after_cancel(self.project_state_save_after_id)
+            except tk.TclError:
+                pass
+            self.project_state_save_after_id = None
+
+        try:
+            self.project_state_save_after_id = self.root.after(delay_ms, self._flush_scheduled_project_state_save)
+        except tk.TclError:
+            self.project_state_save_after_id = None
+
+    def _flush_scheduled_project_state_save(self):
+        self.project_state_save_after_id = None
+        if self.project_state_restore_in_progress:
+            return
+        self.save_project_state()
+
+    def _on_music_text_changed(self, *_args):
+        self._update_music_config_summary()
+        self._schedule_project_state_save()
+
+    def _on_music_setting_changed(self, *_args):
+        self._schedule_project_state_save()
+
+    def _register_music_persistence_hooks(self):
+        for variable in [
+            self.music_duration_var,
+            self.music_bpm_var,
+            self.music_key_var,
+            self.music_steps_var,
+            self.music_cfg_var,
+            self.music_sampler_var,
+            self.music_scheduler_var,
+            self.music_denoise_var,
+            self.music_seed_var,
+            self.music_randomize_seed_var,
+            self.music_timesignature_var,
+            self.music_language_var,
+            self.music_generate_audio_codes_var,
+            self.music_cfg_scale_var,
+            self.music_temperature_var,
+            self.music_top_p_var,
+            self.music_top_k_var,
+            self.music_min_p_var,
+            self.music_quality_var
+        ]:
+            variable.trace_add("write", self._on_music_setting_changed)
+
+    def _apply_music_settings_snapshot(self, settings=None, legacy_state=None):
+        if not hasattr(self, "music_duration_var"):
+            return
+
+        resolved = self._get_music_workflow_defaults()
+
+        if legacy_state:
+            resolved.update({
+                "duration": legacy_state.get("music_duration", resolved["duration"]),
+                "bpm": legacy_state.get("music_bpm", resolved["bpm"]),
+                "keyscale": legacy_state.get("music_key", resolved["keyscale"])
+            })
+
+        if settings:
+            resolved.update(settings)
+
+        self.music_duration_var.set(self._coerce_music_int(resolved.get("duration"), 120))
+        self.music_bpm_var.set(self._coerce_music_int(resolved.get("bpm"), 120))
+        self.music_key_var.set(str(resolved.get("keyscale", "C major") or "C major"))
+        self.music_steps_var.set(self._coerce_music_int(resolved.get("steps"), 8))
+        self.music_cfg_var.set(self._coerce_music_float(resolved.get("cfg"), 1.0))
+        self.music_sampler_var.set(str(resolved.get("sampler_name", "euler") or "euler"))
+        self.music_scheduler_var.set(str(resolved.get("scheduler", "simple") or "simple"))
+        self.music_denoise_var.set(self._coerce_music_float(resolved.get("denoise"), 1.0))
+        self.music_seed_var.set(self._coerce_music_int(resolved.get("seed"), 1))
+        self.music_randomize_seed_var.set(bool(resolved.get("randomize_seed", True)))
+        self.music_timesignature_var.set(str(resolved.get("timesignature", "4") or "4"))
+        self.music_language_var.set(str(resolved.get("language", "en") or "en"))
+        self.music_generate_audio_codes_var.set(bool(resolved.get("generate_audio_codes", True)))
+        self.music_cfg_scale_var.set(self._coerce_music_float(resolved.get("cfg_scale"), 2.0))
+        self.music_temperature_var.set(self._coerce_music_float(resolved.get("temperature"), 0.85))
+        self.music_top_p_var.set(self._coerce_music_float(resolved.get("top_p"), 0.9))
+        self.music_top_k_var.set(self._coerce_music_int(resolved.get("top_k"), 0))
+        self.music_min_p_var.set(self._coerce_music_float(resolved.get("min_p"), ACE_STEP_15_MIN_P_DEFAULT))
+        self.music_quality_var.set(str(resolved.get("quality", "V0") or "V0"))
+        self._update_music_seed_entry_state()
+
+    def _reset_music_settings_to_loaded_workflow(self):
+        self._apply_music_settings_snapshot()
+
+    def _update_music_seed_entry_state(self, *_args):
+        if hasattr(self, "music_seed_entry"):
+            self.music_seed_entry.configure(state=(tk.DISABLED if self.music_randomize_seed_var.get() else tk.NORMAL))
+
+    def _build_music_seed(self):
+        if self.music_randomize_seed_var.get():
+            resolved_seed = random.randint(1, 999999999)
+            self.music_seed_var.set(resolved_seed)
+            return resolved_seed
+        return self._coerce_music_int(self.music_seed_var.get(), 1)
 
     def _sync_video_settings_from_workflow(self, force=False):
         if not self.workflow:
@@ -3317,6 +4317,9 @@ class LTXQueueManager:
             try:
                 with open(self.music_json_path, 'r', encoding='utf-8') as f:
                     self.music_workflow = json.load(f)
+                self._normalize_music_workflow(self.music_workflow)
+                if hasattr(self, "music_duration_var"):
+                    self._reset_music_settings_to_loaded_workflow()
             except Exception as e:
                 print(f"Error loading music JSON: {e}")
 
@@ -3480,12 +4483,11 @@ class LTXQueueManager:
         # Clear Music Settings
         self.music_tags_text.delete("1.0", tk.END)
         self.music_lyrics_text.delete("1.0", tk.END)
-        self.music_duration_var.set(120)
-        self.music_bpm_var.set(120)
-        self.music_key_var.set("C major")
+        self._reset_music_settings_to_loaded_workflow()
         self.strip_audio_var.set(True)
         
         self.current_generated_audio = None
+        self.current_audio_source = None
         self.selected_video_for_music = None
         self.current_final_video = None
         self._reset_selected_video_preview()
@@ -3545,6 +4547,13 @@ class LTXQueueManager:
     def save_project_state(self):
         if not self.current_project_dir:
             return
+
+        if self.project_state_save_after_id is not None:
+            try:
+                self.root.after_cancel(self.project_state_save_after_id)
+            except tk.TclError:
+                pass
+            self.project_state_save_after_id = None
             
         project_data_file = os.path.join(self.current_project_dir, "project_data.json")
         state = {
@@ -3554,11 +4563,14 @@ class LTXQueueManager:
             "video_settings": self._get_video_settings_snapshot(),
             "music_tags": self.music_tags_text.get("1.0", tk.END).strip(),
             "music_lyrics": self.music_lyrics_text.get("1.0", tk.END).strip(),
+            "music_settings": self._get_music_settings_snapshot(),
+            "music_ui_state": self._get_music_ui_state_snapshot(),
             "music_duration": self.music_duration_var.get(),
             "music_bpm": self.music_bpm_var.get(),
             "music_key": self.music_key_var.get(),
             "strip_audio": self.strip_audio_var.get(),
             "current_generated_audio": self.current_generated_audio,
+            "current_audio_source": self.current_audio_source,
             "selected_video_for_music": self.selected_video_for_music,
             "current_final_video": getattr(self, 'current_final_video', None)
         }
@@ -3573,6 +4585,7 @@ class LTXQueueManager:
             return
             
         project_data_file = os.path.join(self.current_project_dir, "project_data.json")
+        self.project_state_restore_in_progress = True
         
         # Clear existing UI fields first
         self.clear_ui_fields()
@@ -3603,13 +4616,13 @@ class LTXQueueManager:
                 # Load Music Settings
                 self.music_tags_text.insert(tk.END, state.get("music_tags", ""))
                 self.music_lyrics_text.insert(tk.END, state.get("music_lyrics", ""))
-                self.music_duration_var.set(state.get("music_duration", 120))
-                self.music_bpm_var.set(state.get("music_bpm", 120))
-                self.music_key_var.set(state.get("music_key", "C major"))
+                self._apply_music_settings_snapshot(state.get("music_settings"), legacy_state=state)
+                self._apply_music_ui_state_snapshot(state.get("music_ui_state"))
                 self.strip_audio_var.set(state.get("strip_audio", True))
                 
                 # Load Music State
                 self.current_generated_audio = state.get("current_generated_audio")
+                self.current_audio_source = state.get("current_audio_source") or self._infer_audio_source(self.current_generated_audio)
                 self.selected_video_for_music = state.get("selected_video_for_music")
                 self.current_final_video = state.get("current_final_video")
                 
@@ -3627,6 +4640,7 @@ class LTXQueueManager:
                         self.merge_music_btn.config(state=tk.NORMAL)
                 else:
                     self.current_generated_audio = None
+                    self.current_audio_source = None
                     self.preview_music_btn.config(state=tk.DISABLED)
                     self.merge_music_btn.config(state=tk.DISABLED)
                     
@@ -3641,6 +4655,10 @@ class LTXQueueManager:
 
             except Exception as e:
                 print(f"Error loading project state: {e}")
+            finally:
+                self.project_state_restore_in_progress = False
+        else:
+            self.project_state_restore_in_progress = False
 
     def refresh_gallery(self):
         # Clear existing
@@ -3651,16 +4669,27 @@ class LTXQueueManager:
         final_files = self._get_gallery_video_files(self.final_mv_dir)
         stitched_files = self._get_gallery_video_files(self.stitched_dir)
         scene_files = self._get_gallery_video_files(self.scenes_dir)
+        imported_files = self._get_gallery_video_files(self.imported_video_dir)
         current_project_videos = {
             os.path.join(self.final_mv_dir, filename) for filename in final_files
         } | {
             os.path.join(self.stitched_dir, filename) for filename in stitched_files
         } | {
             os.path.join(self.scenes_dir, filename) for filename in scene_files
+        } | {
+            os.path.join(self.imported_video_dir, filename) for filename in imported_files
         }
         self.selected_videos = {path for path in self.selected_videos if path in current_project_videos}
 
         self._update_gallery_overview(len(final_files), len(stitched_files), len(scene_files))
+
+        self._populate_gallery_section(
+            "Imported Clips",
+            "Project-owned clips you brought in manually or by drag and drop.",
+            self.imported_video_dir,
+            imported_files,
+            show_add_music=True
+        )
 
         self._populate_gallery_section(
             "Final Music Videos",
@@ -3689,7 +4718,7 @@ class LTXQueueManager:
         if not os.path.exists(folder_path):
             return []
         return sorted(
-            [f for f in os.listdir(folder_path) if f.endswith('.mp4')],
+            [f for f in os.listdir(folder_path) if self._is_supported_video_file(f)],
             key=lambda x: os.path.getmtime(os.path.join(folder_path, x)),
             reverse=True
         )
@@ -3833,7 +4862,7 @@ class LTXQueueManager:
         self._set_selected_video_preview(video_path, thumb_path)
             
         self.notebook.select(self.music_tab)
-        self.update_music_status("Video selected. Ready to generate music.", "blue")
+        self.update_music_status("Video selected. Ready to generate music or import audio.", "blue")
 
     def toggle_video_selection(self, video_path, var):
         if var.get():
@@ -3844,8 +4873,8 @@ class LTXQueueManager:
 
     def select_all_videos(self):
         for var, path in self.video_checkbox_vars:
-            # Only select generated scenes for stitching to avoid nesting final videos
-            if os.path.dirname(path) == self.scenes_dir:
+            video_dir = os.path.dirname(path)
+            if video_dir in {self.scenes_dir, self.imported_video_dir}:
                 var.set(True)
                 self.selected_videos.add(path)
         self._update_video_selection_summary()
@@ -3872,7 +4901,11 @@ class LTXQueueManager:
         self.root.after(0, lambda: self.status_label.config(text=f"Status: {message}", fg=color))
 
     def update_music_status(self, message, color="black"):
-        self.root.after(0, lambda: self.music_status_label.config(text=f"Status: {message}", fg=color))
+        def apply_status():
+            self.music_status_label.config(text=f"Status: {message}", fg=color)
+            self._update_collapsible_section_meta("music_actions", message)
+
+        self.root.after(0, apply_status)
 
     def update_debug_prompt_status(self, prompt_text, current=None, total=None):
         if current is not None and total is not None:
@@ -4156,6 +5189,7 @@ class LTXQueueManager:
                                         dest_path = os.path.join(self.audio_dir, filename)
                                         if self.download_comfyui_video(filename, subfolder, folder_type, dest_path):
                                             self.current_generated_audio = dest_path
+                                            self.current_audio_source = "generated"
                                             self.log_debug("PROMPT_OUTPUT_DOWNLOADED", prompt_id=prompt_id, media_type="audio", filename=filename, dest_path=dest_path)
                                         break
                         except Exception as e:
@@ -4255,16 +5289,32 @@ class LTXQueueManager:
         self.update_music_status("Generating Music...", "blue")
         
         try:
+            self._normalize_music_workflow(self.music_workflow)
+            music_seed = self._build_music_seed()
             # Update workflow
             self.music_workflow["94"]["inputs"]["tags"] = tags
             self.music_workflow["94"]["inputs"]["lyrics"] = lyrics
             self.music_workflow["94"]["inputs"]["duration"] = self.music_duration_var.get()
             self.music_workflow["94"]["inputs"]["bpm"] = self.music_bpm_var.get()
             self.music_workflow["94"]["inputs"]["keyscale"] = self.music_key_var.get()
-            self.music_workflow["94"]["inputs"]["seed"] = random.randint(1, 999999999)
-            self.music_workflow["3"]["inputs"]["seed"] = random.randint(1, 999999999)
+            self.music_workflow["94"]["inputs"]["timesignature"] = self.music_timesignature_var.get()
+            self.music_workflow["94"]["inputs"]["language"] = self.music_language_var.get()
+            self.music_workflow["94"]["inputs"]["generate_audio_codes"] = bool(self.music_generate_audio_codes_var.get())
+            self.music_workflow["94"]["inputs"]["cfg_scale"] = self.music_cfg_scale_var.get()
+            self.music_workflow["94"]["inputs"]["temperature"] = self.music_temperature_var.get()
+            self.music_workflow["94"]["inputs"]["top_p"] = self.music_top_p_var.get()
+            self.music_workflow["94"]["inputs"]["top_k"] = self.music_top_k_var.get()
+            self.music_workflow["94"]["inputs"]["min_p"] = self.music_min_p_var.get()
+            self.music_workflow["94"]["inputs"]["seed"] = music_seed
+            self.music_workflow["3"]["inputs"]["seed"] = music_seed
+            self.music_workflow["3"]["inputs"]["steps"] = self.music_steps_var.get()
+            self.music_workflow["3"]["inputs"]["cfg"] = self.music_cfg_var.get()
+            self.music_workflow["3"]["inputs"]["sampler_name"] = self.music_sampler_var.get()
+            self.music_workflow["3"]["inputs"]["scheduler"] = self.music_scheduler_var.get()
+            self.music_workflow["3"]["inputs"]["denoise"] = self.music_denoise_var.get()
             self.music_workflow["98"]["inputs"]["seconds"] = self.music_duration_var.get()
             self.music_workflow["107"]["inputs"]["filename_prefix"] = f"ACE_Music_{int(time.time())}"
+            self.music_workflow["107"]["inputs"]["quality"] = self.music_quality_var.get()
         except KeyError as e:
             self.update_music_status(f"Error: Missing node in JSON ({e})", "red")
             self.root.after(0, lambda: self.gen_music_btn.config(state=tk.NORMAL))
@@ -4360,10 +5410,13 @@ class LTXQueueManager:
                 subprocess.run(['TASKKILL', '/F', '/T', '/PID', str(self.comfyui_process.pid)], creationflags=subprocess.CREATE_NO_WINDOW)
             except Exception:
                 pass
+        self.comfyui_process = None
+        self.comfyui_console_hwnd = None
+        self.comfyui_console_visible = False
         self.root.destroy()
 
 if __name__ == "__main__":
-    root = tb.Window(themename=THEME_NAME)
+    root = Prompt2MTVWindow(themename=THEME_NAME)
     app = LTXQueueManager(root)
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
     root.mainloop()

@@ -1,3 +1,4 @@
 pillow
 ttkbootstrap
 imageio-ffmpeg
+tkinterdnd2

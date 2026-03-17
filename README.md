@@ -4,6 +4,8 @@
 
 Prompt2MTV is a Windows desktop app for building end-to-end AI music videos with a local ComfyUI pipeline. It combines LTX 2.3 text-to-video generation, prompt queue management, project organization, gallery review, ACE-Step music generation, and final audio/video merging in one interface.
 
+Projects can also store user-imported video clips and audio tracks, so you can bring in your own media instead of relying only on generated outputs. The music workspace now exposes more of the original ACE-Step workflow tuning controls, keeps those settings per project, and can start ComfyUI with its terminal hidden until you explicitly reveal it.
+
 Current packaged release: `0.2.0`
 
 ## Start Here
@@ -123,9 +125,10 @@ Prompt2MTV can use bundled `imageio-ffmpeg` support inside the packaged build, s
 5. Add prompts to the prompt queue.
 6. Run scene generation through ComfyUI.
 7. Review clips in the gallery.
-8. Stitch selected renders.
-9. Generate music with ACE-Step.
-10. Merge the final soundtrack and video.
+8. Import your own video clips into the gallery if needed.
+9. Stitch selected renders.
+10. Generate music with ACE-Step or import your own audio track.
+11. Merge the final soundtrack and video.
 
 ## Key Features
 
@@ -137,9 +140,22 @@ Prompt2MTV can use bundled `imageio-ffmpeg` support inside the packaged build, s
 - missing-model detection for video and music workflows
 - automatic model download support through `model_manifest.json`
 - media gallery for generated scenes, stitched outputs, and final music videos
+- imported clip support with project-owned storage in the gallery
+- imported audio support for merging without running music generation
+- drag-and-drop video and audio import support in supported builds
 - ACE-Step music generation workflow support
+- expanded ACE-Step music controls for sampling, language, timing, seed, and advanced token settings
+- per-project music settings and collapsible music workspace state persistence
+- Windows ComfyUI launcher integration with hidden-by-default terminal and in-app show or hide toggle
 - packaged Windows `.exe` and Inno Setup installer workflow
 - About dialog and visible app version for installed builds
+
+## Music Workspace Notes
+
+- You can either generate music with the bundled ACE-Step workflow or import a finished audio file directly into the active project.
+- Imported clips appear in their own gallery section so they can be stitched or used as the music reference clip.
+- Music settings such as duration, BPM, sampler, scheduler, seed behavior, and advanced sampling values are saved with each project.
+- On Windows, Prompt2MTV can launch ComfyUI with its terminal hidden. Use the `Show ComfyUI Terminal` button in the top toolbar on the Video tab if you want to inspect the live console.
 
 ## Important Reality Check
 
