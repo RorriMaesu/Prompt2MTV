@@ -228,6 +228,24 @@ Output:
 
 If `model_manifest.json` contains valid model sources, installed builds can download missing workflow models directly into the detected ComfyUI model folders.
 
+## Upgrading Installed Builds
+
+If you already have Prompt2MTV installed and want a cleaner upgrade path for future releases, use the helper script below instead of manually copying files.
+
+Run:
+
+```powershell
+.\tools\Install-Prompt2MTVRelease.ps1
+```
+
+What it does:
+
+- closes any running `Prompt2MTV` process
+- uses a normal uninstall if Windows has a managed uninstall entry
+- removes an unmanaged local install under `%LOCALAPPDATA%\Programs\Prompt2MTV` if needed
+- reinstalls from the latest packaged installer in `dist_installer`
+- recreates the desktop shortcut
+
 ## Repository Contents
 
 - `ltx_queue_manager.py`: Main application entry point and UI logic
