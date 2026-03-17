@@ -14,9 +14,19 @@ echo Installing packaging dependency...
 "%PYTHON_EXE%" -m pip install pyinstaller
 if errorlevel 1 exit /b 1
 
+if exist "dist\Prompt2MTV\_internal\bundled_models" (
+    echo Removing obsolete bundled model payload from previous builds...
+    rmdir /s /q "dist\Prompt2MTV\_internal\bundled_models"
+)
+
 echo Building Prompt2MTV executable...
 "%PYTHON_EXE%" -m PyInstaller --noconfirm --clean Prompt2MTV.spec
 if errorlevel 1 exit /b 1
+
+if exist "dist\Prompt2MTV\_internal\bundled_models" (
+    echo Removing obsolete bundled model payload from build output...
+    rmdir /s /q "dist\Prompt2MTV\_internal\bundled_models"
+)
 
 echo.
 echo Build complete. Launch the app from "dist\Prompt2MTV\Prompt2MTV.exe".

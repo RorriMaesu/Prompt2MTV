@@ -28,3 +28,7 @@ dist/
 dist_installer/
 installer_smoke/
 tools/
+bundled_models/
+clean_close_profile/
+ffmpeg_fixed_profile/
+smoke_test_profile/

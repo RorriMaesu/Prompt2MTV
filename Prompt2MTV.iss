@@ -4,7 +4,12 @@
 #define MyAppTagline "Local AI Music Video Studio"
 #define MyAppURL "https://buymeacoffee.com/rorrimaesu"
 #define MyAppExeName "Prompt2MTV.exe"
+#ifndef MyAppDistDir
 #define MyAppDistDir "dist\\Prompt2MTV"
+#endif
+#ifndef MyAppOutputDir
+#define MyAppOutputDir "dist_installer"
+#endif
 
 [Setup]
 AppId={{8F6A8C07-EB70-4F5E-AF2F-0C7AA0F11CF1}
@@ -24,7 +29,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
-OutputDir=dist_installer
+OutputDir={#MyAppOutputDir}
 OutputBaseFilename=Prompt2MTV-Setup-{#MyAppVersion}
 SetupIconFile=Prompt2MTV.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
@@ -42,7 +47,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
 
 [Files]
-Source: "{#MyAppDistDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#MyAppDistDir}\*"; DestDir: "{app}"; Excludes: "_internal\\bundled_models\\*"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

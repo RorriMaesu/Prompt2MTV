@@ -6,6 +6,11 @@ cd /d "%~dp0"
 call .\build_exe.bat
 if errorlevel 1 exit /b 1
 
+if exist "dist\Prompt2MTV\_internal\bundled_models" (
+    echo Removing obsolete bundled model payload before installer packaging...
+    rmdir /s /q "dist\Prompt2MTV\_internal\bundled_models"
+)
+
 if exist "dist_installer" rmdir /s /q "dist_installer"
 
 set "ISCC_EXE=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"

@@ -8,6 +8,78 @@ Current packaged release: `0.2.0`
 
 The goal is simple: keep the entire prompt-to-music-video workflow in a single workspace so you can spend less time managing JSON files, output folders, and render handoffs, and more time iterating on actual creative direction.
 
+## Start Here
+
+If you just want to use Prompt2MTV, do **not** clone the repo and do **not** install Python.
+
+For most Windows users, the easiest path is:
+
+1. Install the official ComfyUI Windows portable build.
+2. Install Prompt2MTV with the Prompt2MTV setup `.exe`.
+3. Launch Prompt2MTV and point it at your ComfyUI folder if needed.
+
+## Step 0: Install ComfyUI Portable First
+
+Prompt2MTV depends on a local ComfyUI installation.
+
+If you already have the Windows portable version of ComfyUI installed and working, skip to the next section.
+
+If you do **not** have ComfyUI yet, install it first:
+
+1. Open the official ComfyUI releases page:
+	[https://github.com/Comfy-Org/ComfyUI/releases](https://github.com/Comfy-Org/ComfyUI/releases)
+2. Download the Windows portable build that matches your hardware:
+	- NVIDIA: [ComfyUI_windows_portable_nvidia.7z](https://github.com/comfyanonymous/ComfyUI/releases/latest/download/ComfyUI_windows_portable_nvidia.7z)
+	- AMD: [ComfyUI_windows_portable_amd.7z](https://github.com/comfyanonymous/ComfyUI/releases/latest/download/ComfyUI_windows_portable_amd.7z)
+3. Extract the `.7z` file.
+	- Use [7-Zip](https://7-zip.org/) if Windows does not open it directly.
+4. Put the extracted folder somewhere easy to find.
+	- Example: `D:\ComfyUI`
+5. Start ComfyUI once to confirm it opens correctly.
+6. Close ComfyUI.
+
+If Windows blocks the downloaded archive, right-click it, open `Properties`, and click `Unblock` before extracting.
+
+If the portable NVIDIA build does not start, update your NVIDIA drivers first.
+
+Use the Windows installer instead:
+
+1. Open the [GitHub Releases page](https://github.com/RorriMaesu/Prompt2MTV/releases).
+2. Download the latest `Prompt2MTV-Setup-<version>.exe` file.
+3. Double-click the installer.
+4. Finish the setup wizard.
+5. Launch `Prompt2MTV` from your desktop or Start Menu.
+
+The installer already includes the packaged app and its Python/runtime dependencies.
+
+You do **not** need to manually install:
+
+- Python
+- `pip`
+- virtual environments
+- `requirements.txt`
+- PyInstaller
+- Inno Setup
+
+You **do still need** a working local ComfyUI setup and the required models/workflows, because Prompt2MTV is a frontend for a local ComfyUI pipeline, not a cloud service.
+
+## What Is Included
+
+The Windows installer includes:
+
+- Prompt2MTV desktop app
+- packaged Python runtime for the app
+- app dependencies bundled into the packaged build
+- desktop and Start Menu shortcuts
+- per-user settings/output folders under `%LOCALAPPDATA%\Prompt2MTV`
+
+The Windows installer does **not** include:
+
+- ComfyUI itself
+- LTX models
+- ACE-Step models or their external requirements
+- custom checkpoints, LoRAs, or other large model assets
+
 ## What It Does
 
 Prompt2MTV is built for creators who want a more practical production workflow around ComfyUI-based video generation. Instead of treating each render, stitch, and music pass as a separate manual process, the app gives you a project-centered pipeline:
@@ -35,12 +107,30 @@ Prompt2MTV is built for creators who want a more practical production workflow a
 - In-app About dialog and visible version label for installed builds.
 - Debug logging to help troubleshoot local ComfyUI or workflow issues.
 
+## What You Need Before First Launch
+
+Before Prompt2MTV can actually render anything, make sure you have:
+
+- Windows
+- a working local ComfyUI installation, ideally the official Windows portable build
+- the required LTX 2.3 workflow models
+- the required ACE-Step music workflow dependencies
+
+Prompt2MTV can use bundled `imageio-ffmpeg` support inside the packaged build, so normal users do not need to manually install FFmpeg just to get the app running.
+
+On first launch, Prompt2MTV runs startup checks and tells you what is missing in plain language.
+
+If `model_manifest.json` includes valid download URLs, Prompt2MTV can offer to download missing workflow models directly into the correct ComfyUI folders automatically.
+
+If ComfyUI, model folders, or your launcher batch file live in a non-default location, open `Project > Configure Runtime Paths` inside the app.
+
 ## Repository Contents
 
 - `ltx_queue_manager.py`: Main application entry point and UI logic.
+- `model_downloader.py`: Streamed model download helper with progress, resume support, and SHA-256 verification.
 - `video_ltx2_3_t2v.json`: Primary LTX 2.3 text-to-video workflow.
 - `ACE_Step_AI_Music_Generator_Workflow.json`: Music-generation workflow.
-- `LTX_T2V_Low_VRAM_GGUF.json`: Alternate or legacy reference workflow.
+- `model_manifest.json`: Required-model manifest for workflow auditing and optional automatic installation.
 - `requirements.txt`: Python dependencies for local development and packaging.
 - `Prompt2MTV.spec`: Versioned PyInstaller build definition.
 - `Prompt2MTV.iss`: Versioned Inno Setup installer definition.
@@ -52,16 +142,7 @@ Prompt2MTV is built for creators who want a more practical production workflow a
 
 Generated project data and media outputs are written to `outputs/` at runtime and are excluded from source control.
 
-## Prerequisites
-
-Before launching Prompt2MTV, make sure your local environment is ready:
-
-- Windows system.
-- Python 3.11 or newer.
-- A working local ComfyUI installation.
-- The required LTX 2.3 workflow models.
-- The required ACE-Step music workflow dependencies.
-- FFmpeg available either from your system install or via bundled `imageio-ffmpeg` support.
+## Default Path Discovery
 
 The app can auto-discover common ComfyUI layouts and also lets you configure paths inside the UI. Default discovery looks at common locations rooted around your ComfyUI install, including setups like:
 
@@ -70,7 +151,55 @@ The app can auto-discover common ComfyUI layouts and also lets you configure pat
 
 If your ComfyUI environment uses a different layout, use `Project > Configure Runtime Paths` after launch.
 
-## Installation
+## Easiest Install For Normal Users
+
+1. Install ComfyUI portable first if you do not already have it.
+2. Open the [GitHub Releases page](https://github.com/RorriMaesu/Prompt2MTV/releases).
+3. Download the newest `Prompt2MTV-Setup-<version>.exe`.
+4. Run it.
+5. Accept the default install options unless you have a reason not to.
+6. Open Prompt2MTV from the created shortcut.
+
+Expected installer filename example:
+
+- `Prompt2MTV-Setup-0.2.0.exe`
+
+After installation, Prompt2MTV stores user data in:
+
+- `%LOCALAPPDATA%\Prompt2MTV\app_settings.json`
+- `%LOCALAPPDATA%\Prompt2MTV\outputs\`
+
+## First-Run Checklist
+
+After launching Prompt2MTV for the first time:
+
+1. Let the startup guidance finish.
+2. If the app says it cannot find ComfyUI or your model folders, open `Project > Configure Runtime Paths`.
+3. Point Prompt2MTV at your ComfyUI root folder if needed.
+4. Point Prompt2MTV at your ComfyUI launcher `.bat` file if you want the app to start ComfyUI for you.
+5. Confirm your model search paths.
+6. Create or open a project and run validation before your first queue.
+
+Typical example ComfyUI root folder:
+
+- `D:\ComfyUI`
+
+## Typical Workflow
+
+1. Launch Prompt2MTV.
+2. Load or create a project folder.
+3. Open Workflow Settings and confirm your model selections.
+4. Run validation before starting a new render batch.
+5. Add prompts to the Prompt Queue.
+6. Run the queue to send jobs to ComfyUI.
+7. Review generated scenes in the gallery.
+8. Stitch the clips you want to keep.
+9. Generate music from the ACE-Step workflow.
+10. Merge the generated soundtrack with the selected video render.
+
+## Developer Setup
+
+Only use this section if you want to modify the code, build the executable yourself, or contribute to the project.
 
 ### 1. Clone the repository
 
@@ -106,15 +235,13 @@ Make sure these workflow files remain in the project root:
 
 Then confirm that your local ComfyUI install can access the corresponding models referenced by those workflows.
 
-## Basic Usage
+## Run From Source
 
-### Start the application
+### Start the Python version
 
 ```powershell
 python ltx_queue_manager.py
 ```
-
-On first launch, Prompt2MTV runs a setup/preflight check and explains missing ComfyUI, model, launcher, or FFmpeg requirements in plain language.
 
 ### Build a Windows executable
 
@@ -131,10 +258,7 @@ The executable icon is sourced from `Prompt2MTV.ico`.
 
 The executable still expects a local ComfyUI installation and models, but it now stores app settings in a per-user Windows app-data folder and can prompt for ComfyUI runtime paths on first launch.
 
-Packaged builds store their per-user data in:
-
-- `%LOCALAPPDATA%\Prompt2MTV\app_settings.json`
-- `%LOCALAPPDATA%\Prompt2MTV\outputs\`
+If `model_manifest.json` contains valid model sources, installed builds can download missing workflow models directly into the detected ComfyUI model folders.
 
 ### Build a Windows installer
 
@@ -152,19 +276,6 @@ The current installer output name is versioned, for example:
 
 The installer is designed for non-technical Windows users and creates Start Menu and desktop shortcuts.
 
-### Typical workflow
-
-1. Launch Prompt2MTV.
-2. Load or create a project folder.
-3. Open Workflow Settings and confirm your model selections.
-4. Run validation before starting a new render batch.
-5. Add prompts to the Prompt Queue.
-6. Run the queue to send jobs to ComfyUI.
-7. Review generated scenes in the gallery.
-8. Stitch the clips you want to keep.
-9. Generate music from the ACE-Step workflow.
-10. Merge the generated soundtrack with the selected video render.
-
 ## Operational Notes
 
 - Prompt2MTV communicates with a local ComfyUI instance rather than a hosted backend.
@@ -174,6 +285,22 @@ The installer is designed for non-technical Windows users and creates Start Menu
 - If Prompt2MTV cannot find your ComfyUI launcher, root folder, or model directories, open `Project > Configure Runtime Paths`.
 - The Help menu includes an About dialog so users can confirm the installed version without opening Windows file properties.
 - The installer and packaged app do not bundle ComfyUI itself or the required models.
+
+## Important Reality Check
+
+Prompt2MTV can be made "no manual app install" for users, and the installer now covers that part.
+
+Prompt2MTV cannot currently be made "zero setup at all" unless you also ship and support:
+
+- a full ComfyUI installation
+- the required model files
+- enough disk space for those assets
+- a documented way to keep those external assets updated
+
+So the README now separates these two ideas clearly:
+
+- normal users should install Prompt2MTV with the setup `.exe`
+- Prompt2MTV still depends on a local ComfyUI environment and models
 
 ## Support / Donate
 

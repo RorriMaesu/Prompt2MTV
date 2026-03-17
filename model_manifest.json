@@ -1,0 +1,198 @@
+{
+    "version": 1,
+    "notes": "Prompt2MTV uses this manifest to detect missing workflow models and download them into the correct ComfyUI folders.",
+    "models": [
+        {
+            "id": "video_checkpoint",
+            "workflow": "video",
+            "label": "Video Checkpoint",
+            "source_name": "Hugging Face",
+            "source_page_url": "https://huggingface.co/Lightricks/LTX-2.3-fp8",
+            "filename": "ltx-2.3-22b-dev-fp8.safetensors",
+            "dest_subdir": "checkpoints",
+            "size_bytes": 29145431166,
+            "sha256": "28606c5b5a06ce56f896d4dfcb20f212739e07a68fbe48e53638188449d26450",
+            "node_refs": [
+                {
+                    "node_id": "267:221",
+                    "input": "ckpt_name"
+                },
+                {
+                    "node_id": "267:243",
+                    "input": "ckpt_name"
+                },
+                {
+                    "node_id": "267:236",
+                    "input": "ckpt_name"
+                }
+            ],
+            "sources": [
+                {
+                    "type": "download",
+                    "url": "https://huggingface.co/Lightricks/LTX-2.3-fp8/resolve/main/ltx-2.3-22b-dev-fp8.safetensors"
+                }
+            ]
+        },
+        {
+            "id": "video_text_encoder",
+            "workflow": "video",
+            "label": "Video Text Encoder",
+            "source_name": "Hugging Face",
+            "source_page_url": "https://huggingface.co/Comfy-Org/ltx-2",
+            "filename": "gemma_3_12B_it_fp4_mixed.safetensors",
+            "dest_subdir": "text_encoders",
+            "size_bytes": 9447702218,
+            "sha256": "aaca463d11e6d8d2a4bdb0d6299214c15ef78a3f73e0ef8113d5a9d0219b3f6d",
+            "node_refs": [
+                {
+                    "node_id": "267:243",
+                    "input": "text_encoder"
+                }
+            ],
+            "sources": [
+                {
+                    "type": "download",
+                    "url": "https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors"
+                }
+            ]
+        },
+        {
+            "id": "video_lora",
+            "workflow": "video",
+            "label": "Video LoRA",
+            "source_name": "Hugging Face",
+            "source_page_url": "https://huggingface.co/Lightricks/LTX-2.3",
+            "filename": "ltx-2.3-22b-distilled-lora-384.safetensors",
+            "dest_subdir": "loras",
+            "size_bytes": 7605507256,
+            "sha256": "2943ab994f3c9d88052e5a2a34cca14e4a2dfc36b1d8c407931d52d5c25dd72b",
+            "node_refs": [
+                {
+                    "node_id": "267:232",
+                    "input": "lora_name"
+                }
+            ],
+            "sources": [
+                {
+                    "type": "download",
+                    "url": "https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-22b-distilled-lora-384.safetensors"
+                }
+            ]
+        },
+        {
+            "id": "video_upscaler",
+            "workflow": "video",
+            "label": "Video Upscaler",
+            "source_name": "Hugging Face",
+            "source_page_url": "https://huggingface.co/Lightricks/LTX-2.3",
+            "filename": "ltx-2.3-spatial-upscaler-x2-1.0.safetensors",
+            "dest_subdir": "latent_upscale_models",
+            "size_bytes": 995743504,
+            "sha256": "93800de87dbc448b5b31f3c5c3a1579ba6335151de061a564f6f026b0fc770ad",
+            "node_refs": [
+                {
+                    "node_id": "267:233",
+                    "input": "model_name"
+                }
+            ],
+            "sources": [
+                {
+                    "type": "download",
+                    "url": "https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-spatial-upscaler-x2-1.0.safetensors"
+                }
+            ]
+        },
+        {
+            "id": "music_unet",
+            "workflow": "music",
+            "label": "Music UNet",
+            "source_name": "Hugging Face",
+            "source_page_url": "https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files",
+            "filename": "acestep_v1.5_turbo.safetensors",
+            "dest_subdir": "diffusion_models",
+            "size_bytes": 4787825604,
+            "sha256": "3f6e0797fad420a39bd33979eb6e840e30989e34a3794e843d23b60ec6e422d7",
+            "node_refs": [
+                {
+                    "node_id": "104",
+                    "input": "unet_name"
+                }
+            ],
+            "sources": [
+                {
+                    "type": "download",
+                    "url": "https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/diffusion_models/acestep_v1.5_turbo.safetensors"
+                }
+            ]
+        },
+        {
+            "id": "music_clip_primary",
+            "workflow": "music",
+            "label": "Music CLIP Primary",
+            "source_name": "Hugging Face",
+            "source_page_url": "https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files",
+            "filename": "qwen_0.6b_ace15.safetensors",
+            "dest_subdir": "text_encoders",
+            "size_bytes": 1191588248,
+            "sha256": "fd4590c82153b8ddb67e15a2e7aaa8afa8b83a858c8a9b82a4831063156aa7a7",
+            "node_refs": [
+                {
+                    "node_id": "105",
+                    "input": "clip_name1"
+                }
+            ],
+            "sources": [
+                {
+                    "type": "download",
+                    "url": "https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/text_encoders/qwen_0.6b_ace15.safetensors"
+                }
+            ]
+        },
+        {
+            "id": "music_clip_secondary",
+            "workflow": "music",
+            "label": "Music CLIP Secondary",
+            "source_name": "Hugging Face",
+            "source_page_url": "https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files",
+            "filename": "qwen_1.7b_ace15.safetensors",
+            "dest_subdir": "text_encoders",
+            "size_bytes": 3708523360,
+            "sha256": "ed63e9247d1f55f3ace04fa11e95b085fc82d459c82c5626f0b2e37b91ebd710",
+            "node_refs": [
+                {
+                    "node_id": "105",
+                    "input": "clip_name2"
+                }
+            ],
+            "sources": [
+                {
+                    "type": "download",
+                    "url": "https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/text_encoders/qwen_1.7b_ace15.safetensors"
+                }
+            ]
+        },
+        {
+            "id": "music_vae",
+            "workflow": "music",
+            "label": "Music VAE",
+            "source_name": "Hugging Face",
+            "source_page_url": "https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files",
+            "filename": "ace_1.5_vae.safetensors",
+            "dest_subdir": "vae",
+            "size_bytes": 337431732,
+            "sha256": "6de92e3a862acd287e08b024ac90f0783a8635451b728721a33ff03565bcb2bb",
+            "node_refs": [
+                {
+                    "node_id": "106",
+                    "input": "vae_name"
+                }
+            ],
+            "sources": [
+                {
+                    "type": "download",
+                    "url": "https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/vae/ace_1.5_vae.safetensors"
+                }
+            ]
+        }
+    ]
+}

@@ -14,6 +14,7 @@ imageio_datas, imageio_binaries, imageio_hiddenimports = collect_all('imageio_ff
 workflow_datas = [
     (str(project_root / 'video_ltx2_3_t2v.json'), '.'),
     (str(project_root / 'ACE_Step_AI_Music_Generator_Workflow.json'), '.'),
+    (str(project_root / 'model_manifest.json'), '.'),
 ]
 app_icon = str(project_root / 'Prompt2MTV.ico')
 version_file = str(project_root / 'Prompt2MTV_version_info.txt')

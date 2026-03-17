@@ -15,6 +15,7 @@ import shutil
 from datetime import datetime
 from PIL import Image, ImageTk
 import ttkbootstrap as tb
+from model_downloader import DownloadCancelledError, calculate_sha256, download_file, probe_download_size
 
 # Try to get ffmpeg from imageio_ffmpeg, fallback to 'ffmpeg'
 try:
@@ -40,11 +41,17 @@ DEFAULT_COMFYUI_LAUNCHER_NAMES = [
     "run_nvidia_gpu.bat",
     "run_cpu.bat"
 ]
+MODEL_MANIFEST_FILE = "model_manifest.json"
+BUNDLED_MODEL_DIR = "bundled_models"
 MODEL_SUBDIRECTORIES = {
     "checkpoint_name": "checkpoints",
     "text_encoder_name": "text_encoders",
     "lora_name": "loras",
     "upscaler_name": "latent_upscale_models"
+}
+WORKFLOW_MODEL_LABELS = {
+    "video": "Video Workflow",
+    "music": "Music Workflow"
 }
 THEME_NAME = "superhero"
 UI_COLORS = {
@@ -144,6 +151,9 @@ class LTXQueueManager:
         self.comfyui_root = None
         self.comfyui_launcher_path = None
         self.model_search_roots = []
+        self.model_manifest_path = self._make_workflow_path_absolute(MODEL_MANIFEST_FILE)
+        self.model_manifest = {"version": 1, "models": []}
+        self.last_model_audit = None
         self.video_model_choices = {field_name: [] for field_name in MODEL_SUBDIRECTORIES}
         self.collapsible_sections = {}
         self.collapsible_section_groups = {}
@@ -152,6 +162,7 @@ class LTXQueueManager:
         # Setup base output directory
         self.base_output_dir = self._get_default_output_dir()
         os.makedirs(self.base_output_dir, exist_ok=True)
+        self._load_model_manifest()
         
         self.thumbnail_images = []
         
@@ -254,6 +265,628 @@ class LTXQueueManager:
                 self._append_unique_path(configured_roots, os.path.join(root, "ComfyUI", "models"))
 
         return configured_roots
+
+    def _candidate_resource_paths(self, relative_path):
+        if not relative_path:
+            return []
+
+        candidate_paths = []
+        normalized_relative = str(relative_path).strip()
+        if os.path.isabs(normalized_relative):
+            self._append_unique_path(candidate_paths, normalized_relative)
+            return candidate_paths
+
+        for base_dir in [self.app_root_dir, self.resource_root_dir]:
+            self._append_unique_path(candidate_paths, os.path.join(base_dir, normalized_relative))
+        return candidate_paths
+
+    def _resolve_resource_path(self, relative_path):
+        candidate_paths = self._candidate_resource_paths(relative_path)
+        for candidate in candidate_paths:
+            if candidate and os.path.exists(candidate):
+                return candidate
+        return candidate_paths[0] if candidate_paths else None
+
+    def _load_model_manifest(self):
+        manifest_payload = {"version": 1, "models": []}
+        resolved_manifest_path = self._resolve_resource_path(MODEL_MANIFEST_FILE)
+        if resolved_manifest_path:
+            self.model_manifest_path = resolved_manifest_path
+
+        if resolved_manifest_path and os.path.exists(resolved_manifest_path):
+            try:
+                with open(resolved_manifest_path, 'r', encoding='utf-8') as manifest_file:
+                    loaded_manifest = json.load(manifest_file)
+                if isinstance(loaded_manifest, dict) and isinstance(loaded_manifest.get("models"), list):
+                    manifest_payload = loaded_manifest
+                else:
+                    print(f"Invalid model manifest structure: {resolved_manifest_path}")
+            except Exception as exc:
+                print(f"Error loading model manifest: {exc}")
+
+        self.model_manifest = manifest_payload
+        return self.model_manifest
+
+    def _get_workflow_payload_for_models(self, workflow_key):
+        if workflow_key == "video":
+            return self.workflow
+        if workflow_key == "music":
+            return self.music_workflow
+        return None
+
+    def _get_workflow_label_for_models(self, workflow_key):
+        return WORKFLOW_MODEL_LABELS.get(workflow_key, str(workflow_key or "workflow").title())
+
+    def _get_workflow_node_input_value(self, workflow_payload, node_id, input_name):
+        if not workflow_payload:
+            return ""
+        node_data = workflow_payload.get(str(node_id), {})
+        value = node_data.get("inputs", {}).get(input_name, "")
+        if isinstance(value, list):
+            return ""
+        return "" if value is None else str(value).strip()
+
+    def _resolve_manifest_entry_filename(self, entry):
+        workflow_key = str(entry.get("workflow", "")).strip().lower()
+        workflow_payload = self._get_workflow_payload_for_models(workflow_key)
+        observed_values = []
+        notes = []
+
+        for node_ref in entry.get("node_refs", []):
+            node_id = node_ref.get("node_id")
+            input_name = node_ref.get("input")
+            if not node_id or not input_name:
+                continue
+            observed_value = self._get_workflow_node_input_value(workflow_payload, node_id, input_name)
+            if observed_value:
+                observed_values.append(observed_value)
+
+        manifest_filename = str(entry.get("filename", "")).strip()
+        active_filename = observed_values[0] if observed_values else manifest_filename
+
+        unique_observed_values = sorted(set(observed_values), key=str.lower)
+        if len(unique_observed_values) > 1:
+            notes.append(
+                f"{entry.get('label', entry.get('id', 'Model'))}: workflow node references disagree on filename ({', '.join(unique_observed_values)})."
+            )
+        if manifest_filename and observed_values and any(value != manifest_filename for value in observed_values):
+            notes.append(
+                f"{entry.get('label', entry.get('id', 'Model'))}: manifest filename differs from workflow JSON value ({manifest_filename} vs {active_filename})."
+            )
+
+        return active_filename, notes
+
+    def _resolve_manifest_local_source(self, entry, filename):
+        candidate_paths = []
+        for source in entry.get("sources", []):
+            if str(source.get("type", "")).strip().lower() != "local":
+                continue
+            relative_path = source.get("relative_path")
+            if relative_path:
+                for candidate in self._candidate_resource_paths(relative_path):
+                    self._append_unique_path(candidate_paths, candidate)
+
+        dest_subdir = str(entry.get("dest_subdir", "")).strip()
+        if filename and dest_subdir:
+            default_relative_path = os.path.join(BUNDLED_MODEL_DIR, dest_subdir, filename)
+            for candidate in self._candidate_resource_paths(default_relative_path):
+                self._append_unique_path(candidate_paths, candidate)
+
+        for candidate in candidate_paths:
+            if candidate and os.path.exists(candidate):
+                return candidate
+        return None
+
+    def _resolve_manifest_download_url(self, entry):
+        for source in entry.get("sources", []):
+            if str(source.get("type", "")).strip().lower() != "download":
+                continue
+            url = str(source.get("url", "")).strip()
+            if url:
+                return url
+
+        direct_url = str(entry.get("download_url", "")).strip()
+        return direct_url or None
+
+    def _get_manifest_source_name(self, entry):
+        source_name = str(entry.get("source_name", "")).strip()
+        if source_name:
+            return source_name
+
+        for source in entry.get("sources", []):
+            if str(source.get("type", "")).strip().lower() != "download":
+                continue
+            source_name = str(source.get("source_name", "")).strip()
+            if source_name:
+                return source_name
+        return "Direct download"
+
+    def _get_manifest_source_page_url(self, entry):
+        source_page_url = str(entry.get("source_page_url", "")).strip()
+        if source_page_url:
+            return source_page_url
+
+        for source in entry.get("sources", []):
+            if str(source.get("type", "")).strip().lower() != "download":
+                continue
+            source_page_url = str(source.get("source_page_url", "")).strip()
+            if source_page_url:
+                return source_page_url
+        return None
+
+    def _get_manifest_size_bytes(self, entry):
+        raw_value = entry.get("size_bytes")
+        if raw_value is None:
+            return None
+
+        try:
+            parsed_value = int(raw_value)
+        except (TypeError, ValueError):
+            return None
+        return parsed_value if parsed_value >= 0 else None
+
+    def _get_manifest_sha256(self, entry):
+        raw_value = str(entry.get("sha256", "")).strip().lower()
+        if len(raw_value) != 64:
+            return None
+        if not all(character in "0123456789abcdef" for character in raw_value):
+            return None
+        return raw_value
+
+    def _get_preferred_model_root(self, create_if_missing=False):
+        candidate_roots = []
+        normalized_comfyui_root = self._normalize_path(self.comfyui_root)
+
+        if normalized_comfyui_root:
+            root_name = os.path.basename(os.path.normpath(normalized_comfyui_root)).lower()
+            if root_name == "comfyui":
+                self._append_unique_path(candidate_roots, os.path.join(normalized_comfyui_root, "models"))
+            else:
+                self._append_unique_path(candidate_roots, os.path.join(normalized_comfyui_root, "ComfyUI", "models"))
+                self._append_unique_path(candidate_roots, os.path.join(normalized_comfyui_root, "models"))
+
+        for configured_root in self.model_search_roots:
+            self._append_unique_path(candidate_roots, configured_root)
+
+        for candidate in candidate_roots:
+            if os.path.isdir(candidate):
+                return candidate
+
+        if candidate_roots:
+            if create_if_missing:
+                os.makedirs(candidate_roots[0], exist_ok=True)
+            return candidate_roots[0]
+        return None
+
+    def audit_required_models(self):
+        self._load_model_manifest()
+
+        reports = []
+        manifest_notes = []
+
+        for entry in self.model_manifest.get("models", []):
+            if entry.get("required", True) is False:
+                continue
+
+            entry_id = str(entry.get("id", "")).strip() or "unknown_model"
+            workflow_key = str(entry.get("workflow", "")).strip().lower()
+            label = str(entry.get("label", entry_id)).strip() or entry_id
+            dest_subdir = str(entry.get("dest_subdir", "")).strip().replace("/", os.sep).replace("\\", os.sep)
+            filename, entry_notes = self._resolve_manifest_entry_filename(entry)
+            manifest_notes.extend(entry_notes)
+
+            if not workflow_key or not filename or not dest_subdir:
+                manifest_notes.append(
+                    f"Model manifest entry '{entry_id}' is missing workflow, filename, or destination folder."
+                )
+                continue
+
+            resolved_path = self._find_model_file(filename)
+            local_source_path = None
+            download_url = None
+            install_method = None
+            if not resolved_path:
+                local_source_path = self._resolve_manifest_local_source(entry, filename)
+                download_url = self._resolve_manifest_download_url(entry)
+                if local_source_path:
+                    install_method = "copy"
+                elif download_url:
+                    install_method = "download"
+
+            destination_root = self._get_preferred_model_root(create_if_missing=False)
+            destination_path = os.path.join(destination_root, dest_subdir, filename) if destination_root else None
+
+            reports.append({
+                "id": entry_id,
+                "workflow": workflow_key,
+                "workflow_label": self._get_workflow_label_for_models(workflow_key),
+                "label": label,
+                "filename": filename,
+                "dest_subdir": dest_subdir,
+                "resolved_path": resolved_path,
+                "destination_path": destination_path,
+                "source_path": local_source_path,
+                "source_name": self._get_manifest_source_name(entry),
+                "source_page_url": self._get_manifest_source_page_url(entry),
+                "size_bytes": self._get_manifest_size_bytes(entry),
+                "sha256": self._get_manifest_sha256(entry),
+                "download_url": download_url,
+                "install_method": install_method,
+            })
+
+        missing_reports = [report for report in reports if not report["resolved_path"]]
+        installable_missing = [report for report in missing_reports if report["install_method"]]
+        blocked_missing = [report for report in missing_reports if not report["install_method"]]
+
+        audit = {
+            "reports": reports,
+            "missing": missing_reports,
+            "installable_missing": installable_missing,
+            "blocked_missing": blocked_missing,
+            "manifest_notes": sorted(set(note for note in manifest_notes if note)),
+        }
+        self.last_model_audit = audit
+        return audit
+
+    def _format_missing_model_lines(self, model_audit):
+        lines = []
+        for report in model_audit.get("missing", []):
+            install_hint = report.get("install_method") or "manual"
+            source_text = f", {report['source_name']}" if report.get("source_name") else ""
+            lines.append(
+                f"- {report['workflow_label']} | {report['label']}: {report['filename']} -> {report['dest_subdir']} ({install_hint}{source_text})"
+            )
+        return lines
+
+    def _update_model_install_controls(self, model_audit=None):
+        audit = model_audit or self.last_model_audit or {"installable_missing": []}
+        installable_count = len(audit.get("installable_missing", []))
+        button_state = tk.NORMAL if installable_count else tk.DISABLED
+
+        if hasattr(self, "install_models_btn"):
+            label_text = f"Install Missing Models ({installable_count})" if installable_count else "Install Missing Models"
+            self.install_models_btn.config(text=label_text, state=button_state)
+
+    def _format_byte_count(self, byte_count):
+        if byte_count is None:
+            return "unknown"
+
+        units = ["B", "KB", "MB", "GB", "TB"]
+        size_value = float(byte_count)
+        unit_index = 0
+
+        while size_value >= 1024 and unit_index < len(units) - 1:
+            size_value /= 1024
+            unit_index += 1
+
+        if unit_index == 0:
+            return f"{int(size_value)} {units[unit_index]}"
+        return f"{size_value:.1f} {units[unit_index]}"
+
+    def _estimate_download_sizes(self, reports):
+        total_known_bytes = 0
+        unknown_count = 0
+
+        for report in reports:
+            if report.get("install_method") != "download":
+                continue
+
+            size_bytes = report.get("size_bytes")
+            if size_bytes is None and report.get("download_url"):
+                size_bytes = probe_download_size(report["download_url"])
+                report["size_bytes"] = size_bytes
+
+            if size_bytes is None:
+                unknown_count += 1
+                continue
+
+            total_known_bytes += size_bytes
+
+        return total_known_bytes, unknown_count
+
+    def _check_download_disk_space(self, destination_root, reports):
+        known_total_bytes, unknown_size_count = self._estimate_download_sizes(reports)
+        if known_total_bytes <= 0:
+            return {
+                "ok": True,
+                "required_bytes": known_total_bytes,
+                "free_bytes": None,
+                "unknown_size_count": unknown_size_count,
+            }
+
+        free_bytes = shutil.disk_usage(destination_root).free
+        return {
+            "ok": free_bytes >= known_total_bytes,
+            "required_bytes": known_total_bytes,
+            "free_bytes": free_bytes,
+            "unknown_size_count": unknown_size_count,
+        }
+
+    def _create_model_download_dialog(self, total_models):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Downloading Models")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.geometry("560x220")
+        dialog.minsize(520, 200)
+        self._style_panel(dialog, self.colors["bg"])
+
+        shell = tk.Frame(dialog, padx=20, pady=18)
+        shell.pack(fill=tk.BOTH, expand=True)
+        self._style_panel(shell, self.colors["bg"])
+
+        title_label = tk.Label(shell, text="Downloading Missing Models")
+        title_label.pack(anchor="w")
+        self._style_label(title_label, "title", self.colors["bg"])
+
+        summary_var = tk.StringVar(value=f"Preparing to install {total_models} model(s)...")
+        summary_label = tk.Label(shell, textvariable=summary_var, justify=tk.LEFT, anchor="w", wraplength=500)
+        summary_label.pack(fill=tk.X, pady=(8, 6))
+        self._style_label(summary_label, "body", self.colors["bg"])
+
+        detail_var = tk.StringVar(value="Waiting for download to start...")
+        detail_label = tk.Label(shell, textvariable=detail_var, justify=tk.LEFT, anchor="w", wraplength=500)
+        detail_label.pack(fill=tk.X, pady=(0, 10))
+        self._style_label(detail_label, "muted", self.colors["bg"])
+
+        progress_bar = ttk.Progressbar(shell, mode="determinate", maximum=100)
+        progress_bar.pack(fill=tk.X)
+
+        progress_var = tk.StringVar(value="0%")
+        progress_label = tk.Label(shell, textvariable=progress_var, anchor="e")
+        progress_label.pack(fill=tk.X, pady=(6, 10))
+        self._style_label(progress_label, "small", self.colors["bg"])
+
+        footer = tk.Frame(shell)
+        footer.pack(fill=tk.X, pady=(8, 0))
+        self._style_panel(footer, self.colors["bg"])
+
+        cancel_button = tk.Button(footer, text="Cancel", command=lambda: setattr(self, "model_download_cancel_requested", True))
+        cancel_button.pack(side=tk.RIGHT)
+        self._style_button(cancel_button, "secondary", compact=True)
+
+        def handle_dialog_close():
+            self.model_download_cancel_requested = True
+
+        dialog.protocol("WM_DELETE_WINDOW", handle_dialog_close)
+
+        return {
+            "dialog": dialog,
+            "summary_var": summary_var,
+            "detail_var": detail_var,
+            "progress_var": progress_var,
+            "progress_bar": progress_bar,
+            "indeterminate": False,
+        }
+
+    def _update_model_download_dialog(self, dialog_state, report, index, total_models, downloaded_bytes=None, total_bytes=None, resumed=False):
+        if not dialog_state:
+            return
+
+        dialog = dialog_state["dialog"]
+        if not dialog.winfo_exists():
+            return
+
+        dialog_state["summary_var"].set(
+            f"Downloading {index} of {total_models}: {report['label']}"
+        )
+
+        source_name = report.get("source_name") or "Direct download"
+        if total_bytes is None:
+            detail_text = f"{report['filename']} from {source_name} | {self._format_byte_count(downloaded_bytes)} downloaded"
+            if not dialog_state["indeterminate"]:
+                dialog_state["progress_bar"].configure(mode="indeterminate")
+                dialog_state["progress_bar"].start(12)
+                dialog_state["indeterminate"] = True
+            dialog_state["progress_var"].set("Downloading...")
+        else:
+            if dialog_state["indeterminate"]:
+                dialog_state["progress_bar"].stop()
+                dialog_state["progress_bar"].configure(mode="determinate")
+                dialog_state["indeterminate"] = False
+
+            completion_ratio = 0 if total_bytes <= 0 else min(1.0, downloaded_bytes / total_bytes)
+            dialog_state["progress_bar"]["value"] = completion_ratio * 100
+            dialog_state["progress_var"].set(f"{completion_ratio * 100:.1f}%")
+            detail_text = (
+                f"{report['filename']} from {source_name} | "
+                f"{self._format_byte_count(downloaded_bytes)} of {self._format_byte_count(total_bytes)}"
+            )
+
+        if resumed:
+            detail_text = f"{detail_text} | resuming partial download"
+
+        dialog_state["detail_var"].set(detail_text)
+
+        try:
+            dialog.update()
+        except tk.TclError:
+            pass
+
+    def _close_model_download_dialog(self, dialog_state):
+        if not dialog_state:
+            return
+
+        dialog = dialog_state.get("dialog")
+        if not dialog:
+            return
+
+        try:
+            if dialog_state.get("indeterminate"):
+                dialog_state["progress_bar"].stop()
+            if dialog.winfo_exists():
+                dialog.destroy()
+        except tk.TclError:
+            pass
+
+    def install_missing_models(self, interactive=True, model_audit=None):
+        audit = model_audit or self.audit_required_models()
+        missing_reports = audit.get("missing", [])
+        installable_reports = audit.get("installable_missing", [])
+        known_total_bytes, unknown_size_count = self._estimate_download_sizes(installable_reports)
+
+        if not missing_reports:
+            self._update_model_install_controls(audit)
+            if interactive:
+                messagebox.showinfo("Model Installer", "All required workflow models are already present.")
+            self.update_status("All required workflow models are already present.", "green")
+            return True
+
+        if not installable_reports:
+            self._update_model_install_controls(audit)
+            guidance = [
+                "Prompt2MTV found missing workflow models, but none are currently installable automatically.",
+                f"Update {os.path.basename(self.model_manifest_path)} with valid direct download URLs or source-page metadata."
+            ]
+            if interactive:
+                messagebox.showwarning("Model Installer", "\n\n".join(guidance))
+            self.update_status("Missing models require manual sources or download URLs.", "orange")
+            return False
+
+        if interactive:
+            preview_lines = self._format_missing_model_lines({"missing": installable_reports})
+            size_summary = f"Estimated download size: {self._format_byte_count(known_total_bytes)}"
+            if unknown_size_count:
+                size_summary = f"{size_summary} + {unknown_size_count} file(s) with unknown size"
+            prompt_text = [
+                f"Prompt2MTV can install {len(installable_reports)} missing workflow model(s) into your ComfyUI model folders.",
+                "",
+                size_summary,
+                "",
+                *preview_lines,
+                "",
+                "The app will download each file directly from the configured source and place it into the matching ComfyUI models subfolder.",
+                "",
+                "Continue?"
+            ]
+            if not messagebox.askyesno("Install Missing Models", "\n".join(prompt_text)):
+                self.update_status("Missing model installation was cancelled.", "orange")
+                return False
+
+        destination_root = self._get_preferred_model_root(create_if_missing=True)
+        if not destination_root:
+            message = "Prompt2MTV cannot determine where your ComfyUI models folder lives. Configure runtime paths first."
+            if interactive:
+                messagebox.showerror("Model Installer", message)
+            self.update_status(message, "red")
+            return False
+
+        disk_check = self._check_download_disk_space(destination_root, installable_reports)
+        if not disk_check["ok"]:
+            message = (
+                "Prompt2MTV does not have enough free disk space for the missing model downloads.\n\n"
+                f"Required: {self._format_byte_count(disk_check['required_bytes'])}\n"
+                f"Available: {self._format_byte_count(disk_check['free_bytes'])}"
+            )
+            if disk_check["unknown_size_count"]:
+                message = (
+                    f"{message}\n"
+                    f"Additional files with unknown size: {disk_check['unknown_size_count']}"
+                )
+            if interactive:
+                messagebox.showerror("Model Installer", message)
+            self.update_status("Not enough free disk space for model download.", "red")
+            return False
+
+        installed_reports = []
+        failed_reports = []
+        cancelled_install = False
+        dialog_state = None
+        self.model_download_cancel_requested = False
+
+        if interactive:
+            dialog_state = self._create_model_download_dialog(len(installable_reports))
+
+        for index, report in enumerate(installable_reports, start=1):
+            dest_dir = os.path.join(destination_root, report["dest_subdir"])
+            dest_path = os.path.join(dest_dir, report["filename"])
+            self.update_status(
+                f"Installing model {index}/{len(installable_reports)}: {report['filename']}",
+                "blue"
+            )
+
+            try:
+                os.makedirs(dest_dir, exist_ok=True)
+                if report["install_method"] == "copy":
+                    self._update_model_download_dialog(dialog_state, report, index, len(installable_reports), 0, None, False)
+                    shutil.copy2(report["source_path"], dest_path)
+                elif report["install_method"] == "download":
+                    download_file(
+                        report["download_url"],
+                        dest_path,
+                        progress_callback=lambda downloaded_bytes, total_bytes, resumed, report_ref=report, index_ref=index: self._update_model_download_dialog(
+                            dialog_state,
+                            report_ref,
+                            index_ref,
+                            len(installable_reports),
+                            downloaded_bytes,
+                            total_bytes,
+                            resumed,
+                        ),
+                        cancel_check=lambda: getattr(self, "model_download_cancel_requested", False),
+                    )
+                else:
+                    raise RuntimeError("No supported installation method is available for this model.")
+
+                expected_sha256 = report.get("sha256")
+                if expected_sha256:
+                    self.update_status(f"Verifying model {index}/{len(installable_reports)}: {report['filename']}", "blue")
+                    actual_sha256 = calculate_sha256(dest_path)
+                    if actual_sha256.lower() != expected_sha256.lower():
+                        raise RuntimeError(
+                            f"SHA-256 mismatch for {report['filename']} (expected {expected_sha256}, got {actual_sha256})"
+                        )
+
+                installed_reports.append(report)
+            except DownloadCancelledError:
+                cancelled_install = True
+                break
+            except Exception as exc:
+                if os.path.exists(dest_path):
+                    try:
+                        os.remove(dest_path)
+                    except OSError:
+                        pass
+                failed_reports.append((report, str(exc)))
+
+        self._close_model_download_dialog(dialog_state)
+
+        if cancelled_install:
+            self.update_status("Model download cancelled.", "orange")
+            if interactive:
+                messagebox.showwarning("Model Installer", "Model download was cancelled. Partial downloads were kept so a later retry can resume where supported.")
+
+        self.model_search_roots = self._resolve_model_search_roots(self.model_search_roots, self.comfyui_root)
+        self.refresh_video_model_choices()
+        refreshed_audit = self.audit_required_models()
+        self._update_model_install_controls(refreshed_audit)
+        self.save_global_settings()
+        self.run_startup_preflight(interactive=False)
+
+        summary_lines = []
+        if installed_reports:
+            summary_lines.append(f"Installed {len(installed_reports)} model(s) into {destination_root}.")
+        if cancelled_install:
+            summary_lines.append("Download cancelled before all requested models were installed.")
+        if failed_reports:
+            summary_lines.append("")
+            summary_lines.append("Failed installs:")
+            summary_lines.extend([f"- {report['filename']}: {error_text}" for report, error_text in failed_reports])
+
+        if cancelled_install and not failed_reports:
+            return False
+
+        if failed_reports:
+            if interactive:
+                messagebox.showwarning("Model Installer", "\n".join(summary_lines))
+            self.update_status("Some workflow models failed to install.", "orange")
+            return False
+
+        success_text = "\n".join(summary_lines) if summary_lines else "Required workflow models were installed successfully."
+        if interactive:
+            messagebox.showinfo("Model Installer", success_text)
+        self.update_status("Required workflow models installed successfully.", "green")
+        return True
 
     def _read_global_settings_payload(self):
         for settings_path in [self.global_settings_file, self.legacy_global_settings_file]:
@@ -555,6 +1188,7 @@ class LTXQueueManager:
         warnings = []
 
         self.model_search_roots = self._resolve_model_search_roots(self.model_search_roots, self.comfyui_root)
+        model_audit = self.audit_required_models()
 
         if not os.path.exists(self.api_json_path):
             issues.append(f"Video workflow JSON not found: {self.api_json_path}")
@@ -577,7 +1211,23 @@ class LTXQueueManager:
                 "No ComfyUI launcher batch file is configured. Prompt2MTV can still connect to an already-running ComfyUI server at http://127.0.0.1:8188, or you can configure a launcher in Project > Configure Runtime Paths."
             )
 
-        preflight_text = self._compose_startup_preflight_text(issues, warnings)
+        if not self.model_manifest.get("models"):
+            warnings.append(
+                f"Model manifest not found or empty: {self.model_manifest_path or MODEL_MANIFEST_FILE}. Missing-model detection is limited until the manifest is available."
+            )
+
+        if model_audit.get("missing"):
+            if model_audit.get("installable_missing"):
+                warnings.append(
+                    f"Required workflow models are missing ({len(model_audit['missing'])}). Use Project > Install Missing Models to download them into your ComfyUI model folders automatically."
+                )
+            else:
+                warnings.append(
+                    f"Required workflow models are missing ({len(model_audit['missing'])}). Populate download URLs in {os.path.basename(self.model_manifest_path)} or add source page links for manual recovery."
+                )
+
+        preflight_text = self._compose_startup_preflight_text(issues, warnings, model_audit)
+        self._update_model_install_controls(model_audit)
 
         if issues:
             self._set_video_preflight_summary(preflight_text, "Setup required", "red")
@@ -591,13 +1241,15 @@ class LTXQueueManager:
             if interactive:
                 dialog_title = "First Launch Guidance" if self.is_first_launch else "Startup Preflight"
                 messagebox.showwarning(dialog_title, preflight_text)
+                if self.is_first_launch and model_audit.get("installable_missing"):
+                    self.install_missing_models(interactive=True, model_audit=model_audit)
         else:
-            ready_text = self._compose_startup_preflight_text([], [])
+            ready_text = self._compose_startup_preflight_text([], [], model_audit)
             self._set_video_preflight_summary(ready_text, "Ready", "green")
 
         return True
 
-    def _compose_startup_preflight_text(self, issues, warnings):
+    def _compose_startup_preflight_text(self, issues, warnings, model_audit=None):
         lines = [f"{APP_NAME} {APP_VERSION} | {APP_TAGLINE}"]
 
         if self.is_first_launch:
@@ -614,6 +1266,19 @@ class LTXQueueManager:
         if warnings:
             lines.extend(["", "Recommended fixes:"])
             lines.extend([f"- {warning}" for warning in warnings])
+
+        if model_audit and model_audit.get("manifest_notes"):
+            lines.extend(["", "Model manifest notes:"])
+            lines.extend([f"- {note}" for note in model_audit["manifest_notes"]])
+
+        if model_audit and model_audit.get("missing"):
+            lines.extend(["", "Missing required workflow models:"])
+            lines.extend(self._format_missing_model_lines(model_audit))
+        elif model_audit and model_audit.get("reports"):
+            lines.extend([
+                "",
+                f"Required workflow models detected: {len(model_audit['reports'])}"
+            ])
 
         if not issues and not warnings:
             lines.extend([
@@ -1461,6 +2126,7 @@ class LTXQueueManager:
         self.project_menu.add_command(label="Open Project", command=self.open_project)
         self.project_menu.add_command(label="Rename Current Project", command=self.rename_current_project)
         self.project_menu.add_command(label="Configure Runtime Paths", command=self.configure_runtime_paths)
+        self.project_menu.add_command(label="Install Missing Models", command=self.install_missing_models)
         self.project_menu.add_separator()
         self.project_menu.add_command(label="Exit", command=self.on_closing)
 
@@ -1738,7 +2404,25 @@ class LTXQueueManager:
         self.video_preflight_text = tk.Text(self.preflight_frame, height=3, wrap="word")
         self.video_preflight_text.pack(fill=tk.BOTH, expand=True)
         self.video_preflight_text.configure(state=tk.DISABLED)
+
+        self.preflight_action_frame = tk.Frame(self.preflight_frame)
+        self.preflight_action_frame.pack(fill=tk.X, pady=(8, 0))
+        self._style_panel(self.preflight_action_frame, self.colors["surface"])
+
+        self.install_models_btn = tk.Button(self.preflight_action_frame, text="Install Missing Models", command=self.install_missing_models)
+        self.install_models_btn.pack(side=tk.RIGHT, padx=(8, 0))
+        self._style_button(self.install_models_btn, "accent", compact=True)
+
+        self.recheck_preflight_btn = tk.Button(
+            self.preflight_action_frame,
+            text="Re-Run Startup Check",
+            command=lambda: self.run_startup_preflight(interactive=True)
+        )
+        self.recheck_preflight_btn.pack(side=tk.RIGHT)
+        self._style_button(self.recheck_preflight_btn, "secondary", compact=True)
+
         self._set_video_preflight_summary("Validation not run for current settings.", "Not validated", "gray")
+        self._update_model_install_controls({"installable_missing": []})
         
         self.prompt_section_frame = tk.Frame(self.video_prompt_queue_section["body"], padx=18, pady=16)
         self.prompt_section_frame.pack(fill=tk.BOTH, expand=True)
