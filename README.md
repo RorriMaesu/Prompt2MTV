@@ -6,7 +6,7 @@ Prompt2MTV is a Windows desktop app for building end-to-end AI music videos with
 
 Projects can also store user-imported video clips and audio tracks, so you can bring in your own media instead of relying only on generated outputs. The music workspace now exposes more of the original ACE-Step workflow tuning controls, keeps those settings per project, and can start ComfyUI with its terminal hidden until you explicitly reveal it.
 
-Current packaged release: `0.2.0`
+Current packaged release: `0.3.0`
 
 ## Start Here
 
@@ -56,7 +56,7 @@ Then:
 
 Expected installer filename example:
 
-- `Prompt2MTV-Setup-0.2.0.exe`
+- `Prompt2MTV-Setup-0.3.0.exe`
 
 The installer already includes the packaged app and its Python/runtime dependencies.
 
@@ -224,7 +224,7 @@ Build the Windows installer with:
 
 Output:
 
-- `dist_installer\Prompt2MTV-Setup-0.2.0.exe`
+- `dist_installer\Prompt2MTV-Setup-0.3.0.exe`
 
 If `model_manifest.json` contains valid model sources, installed builds can download missing workflow models directly into the detected ComfyUI model folders.
 
