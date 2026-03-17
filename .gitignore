@@ -27,7 +27,8 @@ build/
 dist/
 dist_installer/
 installer_smoke/
-tools/
+tools/*
+!tools/Install-Prompt2MTVRelease.ps1
 bundled_models/
 clean_close_profile/
 ffmpeg_fixed_profile/
