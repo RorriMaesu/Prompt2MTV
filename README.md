@@ -271,6 +271,15 @@ Generated media and project outputs are written to `outputs/` at runtime and are
 - if Prompt2MTV cannot find your ComfyUI root, launcher, or model directories, use `Project > Configure Runtime Paths`
 - the installer and packaged app do not bundle ComfyUI itself or the required models
 
+## Architecture / Workflow Flaws
+
+If you are modifying the raw `.json` workflows or contributing to the codebase, keep these current architectural flaws in mind:
+- **Node ID Fragility**: The app injects job payload data into the JSON workflows (`video_ltx2_3_t2v.json`, etc.) using hardcoded numeric Node IDs. Modifying these workflows in the native ComfyUI graph editor may shuffle node ID numbers and break the Python payload mapper.
+- **Process Management**: The app launches the ComfyUI background server via `subprocess`. Sudden Task Manager force-quits might leave zombie processes holding port `8188`, preventing the app from launching again until the process is manually killed.
+- **VRAM Contention**: Relying on a shared ComfyUI instance means generating video (LTX) and audio (ACE-Step) concurrently can trigger immediate CUDA Out-Of-Memory crashes. Ensure the queue enforces a strict single-job audio/video execution lock.
+- **Stitching Synchronization**: ComfyUI rendering outputs sometimes drift into Variable Framerates. The local FFmpeg stitcher processes these chunks with strict `-vsync 1 -r 24` parameters so they don't break audio sync during concatenation.
+- **Silent Timeout Drops**: The local REST API polling blindly waits for completion. Active JSON responses from `GET /history` need to monitor for internal ComfyUI compilation or Memory crashes, otherwise the queue UI hangs at 0%.
+
 ## Support / Donate
 
 If Prompt2MTV has made your workflow faster, cleaner, or just less painful, consider supporting development.

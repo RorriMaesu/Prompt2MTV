@@ -1,0 +1,12 @@
+PROBE_OK= False
+PROBE_STATUS= Ollama is running, but Prompt2MTV could not prepare the chatbot model automatically.
+MODELS= ['prompt2mtv-qwen-qwen3-14b-q4-k-m:latest', 'prompt2mtv-qwen3-test:latest']
+PREFERRED_OLLAMA_MODEL= prompt2mtv-qwen-qwen3-14b-q4-k-m
+Traceback (most recent call last):
+  File "D:\ComfyUI\LTX2_Custom_UI_Batch_Queue\_tmp_chatbot_ollama_test.py", line 47, in <module>
+    result = app._request_chatbot_structured_output(CHATBOT_TASK_T2I_OPTIMIZE, 'Cinematic battlefield dawn, smoke, wet asphalt, orange horizon, dramatic scale, no text overlay')
+  File "D:\ComfyUI\LTX2_Custom_UI_Batch_Queue\ltx_queue_manager.py", line 1050, in _request_chatbot_structured_output
+    parsed_output = self._extract_json_object_from_text(content)
+  File "D:\ComfyUI\LTX2_Custom_UI_Batch_Queue\ltx_queue_manager.py", line 914, in _extract_json_object_from_text
+    raise ValueError("The chatbot response did not contain a valid JSON object.")
+ValueError: The chatbot response did not contain a valid JSON object.
