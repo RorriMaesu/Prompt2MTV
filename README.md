@@ -132,23 +132,18 @@ Prompt2MTV can use bundled `imageio-ffmpeg` support inside the packaged build, s
 
 ## Key Features
 
-- LTX 2.3 text-to-video workflow integration
-- prompt queue for batching multiple scenes
-- project-based organization for repeatable work
-- startup preflight and first-launch guidance
-- runtime path configuration for ComfyUI root, launcher, model paths, and output location
-- missing-model detection for video and music workflows
-- automatic model download support through `model_manifest.json`
-- media gallery for generated scenes, stitched outputs, and final music videos
-- imported clip support with project-owned storage in the gallery
-- imported audio support for merging without running music generation
-- drag-and-drop video and audio import support in supported builds
-- ACE-Step music generation workflow support
-- expanded ACE-Step music controls for sampling, language, timing, seed, and advanced token settings
-- per-project music settings and collapsible music workspace state persistence
-- Windows ComfyUI launcher integration with hidden-by-default terminal and in-app show or hide toggle
-- packaged Windows `.exe` and Inno Setup installer workflow
-- About dialog and visible app version for installed builds
+- **Video Generation**: LTX 2.3 Text-to-Video (T2V) and Image-to-Video (I2V) workflow integration
+- **Batch Processing**: Advanced prompt queue for batching multiple video scenes sequentially
+- **Project Management**: Project-based organization for repeatable work and persistent state tracking
+- **AI Ideation**: Local Ollama AI chatbot integration for prompt structural ideation directly within the app
+- **Audio & Music**: Full ACE-Step music generation workflow support with sampling, language, and timing controls
+- **Automated setup**: Startup preflight checks, first-launch guidance, and missing-model detection
+- **Model Downloader**: Automatic model download helper for missing weights/nodes featuring SHA-256 validation via `model_manifest.json`
+- **Dynamic Settings**: Runtime configuration for your ComfyUI root, dynamic launcher scripts, and portable model paths
+- **Media Gallery**: Robust drag-and-drop media gallery for generated scenes, imported clips, outputs, and final videos
+- **NLE Editing Support**: Automatic FFmpeg-powered video stitching and audio track merging directly bypassing external tools
+- **Seamless Local Server**: In-app ComfyUI background server process control with a hidden-by-default terminal (toggleable via the UI)
+- **Packaged Builds**: Fully packaged Windows `.exe` and standard Inno Setup installation workflow
 
 ## Music Workspace Notes
 
