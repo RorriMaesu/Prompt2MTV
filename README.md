@@ -66,6 +66,17 @@ Prompt2MTV detects missing models on startup and can download them for you. Here
 
 See `model_manifest.json` for download URLs and checksums.
 
+### Chatbot Models (optional)
+
+The AI chatbot uses one of these, depending on which family you select:
+
+| Family | Model | Size | Backend |
+|--------|-------|------|---------|
+| Qwen 3 | `Qwen_Qwen3-14B-Q4_K_M.gguf` | ~9 GB | Managed, Ollama, or remote server |
+| Gemma 4 | `gemma4:e4b` (default) | ~3 GB | Ollama only |
+
+Gemma 4 also offers `e2b`, `26b`, and `31b` size variants in the app. Both models are downloaded automatically when first needed.
+
 ## Troubleshooting
 
 - **App can't find ComfyUI** — Use **Project → Configure Runtime Paths** to set the path manually.
