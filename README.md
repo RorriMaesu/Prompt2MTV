@@ -34,6 +34,8 @@ Open Prompt2MTV from the desktop shortcut or Start Menu. On first launch it will
 - Locate your ComfyUI installation
 - Detect any missing models and offer to download them automatically
 
+The built-in AI chatbot supports two model families — **Qwen 3** and **Gemma 4** — switchable from the chatbot panel. Qwen 3 supports managed, Ollama, and remote server backends. Gemma 4 runs through Ollama.
+
 If ComfyUI is in a non-default location, use **Project → Configure Runtime Paths**.
 
 ## Workflow
