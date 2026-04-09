@@ -2,281 +2,129 @@
 
 # Prompt2MTV
 
-Prompt2MTV is a Windows desktop app for building end-to-end AI music videos with a local ComfyUI pipeline. It combines LTX 2.3 text-to-video generation, prompt queue management, project organization, gallery review, ACE-Step music generation, and final audio/video merging in one interface.
+**Local AI Music Video Studio** — Generate video scenes, compose music, and merge them into finished music videos, all from one desktop app powered by ComfyUI.
 
-Projects can also store user-imported video clips and audio tracks, so you can bring in your own media instead of relying only on generated outputs. The music workspace now exposes more of the original ACE-Step workflow tuning controls, keeps those settings per project, and can start ComfyUI with its terminal hidden until you explicitly reveal it.
+## What It Does
 
-Current packaged release: `0.3.0`
+- **AI Video** — Generate scenes with LTX 2.3 (text-to-video and image-to-video)
+- **AI Music** — Compose original tracks with ACE-Step 1.5
+- **AI Chatbot** — Plan and refine scene prompts with a local Qwen 3 or Gemma 4 assistant
+- **One-click merge** — Stitch clips, sync audio, and export final music videos
+- **Project management** — Batch prompt queue, media gallery, drag-and-drop import, per-project settings
 
-## Start Here
+## Quick Start
 
-If you just want to use Prompt2MTV on Windows:
+### 1. Install ComfyUI
 
-1. Install ComfyUI portable.
-2. Install Prompt2MTV from the Windows setup `.exe`.
-3. Launch Prompt2MTV and let it guide you through missing paths or models.
+Download the portable build for your GPU and extract it (e.g. to `D:\ComfyUI`):
 
-Prompt2MTV is installable as a normal Windows app.
-Prompt2MTV is **not** a cloud service and does **not** include ComfyUI or the large model files.
+- [NVIDIA portable](https://github.com/comfyanonymous/ComfyUI/releases/latest/download/ComfyUI_windows_portable_nvidia.7z)
+- [AMD portable](https://github.com/comfyanonymous/ComfyUI/releases/latest/download/ComfyUI_windows_portable_amd.7z)
 
-## Step 1: Install ComfyUI Portable
+Start ComfyUI once to confirm it works, then close it.
 
-Prompt2MTV depends on a local ComfyUI installation.
+### 2. Install Prompt2MTV
 
-Use one of these official Windows portable downloads:
+Download the latest installer from [GitHub Releases](https://github.com/RorriMaesu/Prompt2MTV/releases) and run it. Everything the app needs is included — no Python or pip required.
 
-- NVIDIA: [ComfyUI Windows Portable NVIDIA](https://github.com/comfyanonymous/ComfyUI/releases/latest/download/ComfyUI_windows_portable_nvidia.7z)
-- AMD: [ComfyUI Windows Portable AMD](https://github.com/comfyanonymous/ComfyUI/releases/latest/download/ComfyUI_windows_portable_amd.7z)
-- Official releases page: [ComfyUI Releases](https://github.com/Comfy-Org/ComfyUI/releases)
+### 3. Launch
 
-Install it like this:
+Open Prompt2MTV from the desktop shortcut or Start Menu. On first launch it will:
 
-1. Download the portable archive that matches your GPU.
-2. Extract the `.7z` file.
-3. Put the extracted folder somewhere simple, for example `D:\ComfyUI`.
-4. Start ComfyUI once to confirm it opens correctly.
-5. Close ComfyUI.
+- Locate your ComfyUI installation
+- Detect any missing models and offer to download them automatically
 
-If Windows blocks the archive, open its file properties and click `Unblock` before extracting.
+If ComfyUI is in a non-default location, use **Project → Configure Runtime Paths**.
 
-If the NVIDIA portable build does not start, update your NVIDIA drivers first.
+## Workflow
 
-## Step 2: Install Prompt2MTV
+1. Create or open a project
+2. *(Optional)* Use the AI chatbot to brainstorm and structure scene prompts
+3. Add prompts to the batch queue
+4. Generate video scenes through ComfyUI
+5. Review clips in the gallery (or import your own)
+6. Stitch selected clips together
+7. Generate a music track with ACE-Step (or import your own audio)
+8. Merge audio and video into the final music video
 
-Download the Windows installer from GitHub Releases:
+## Required Models (~57 GB)
 
-- [Prompt2MTV Releases](https://github.com/RorriMaesu/Prompt2MTV/releases)
+Prompt2MTV detects missing models on startup and can download them for you. Here's what the workflows need:
 
-Then:
+| Group | Model | Size |
+|-------|-------|------|
+| Video | `ltx-2.3-22b-dev-fp8.safetensors` | 29.1 GB |
+| Video | `gemma_3_12B_it_fp4_mixed.safetensors` | 9.4 GB |
+| Video | `ltx-2.3-22b-distilled-lora-384.safetensors` | 7.6 GB |
+| Video | `ltx-2.3-spatial-upscaler-x2-1.0.safetensors` | 1.0 GB |
+| Music | `acestep_v1.5_turbo.safetensors` | 4.8 GB |
+| Music | `qwen_1.7b_ace15.safetensors` | 3.7 GB |
+| Music | `qwen_0.6b_ace15.safetensors` | 1.2 GB |
+| Music | `ace_1.5_vae.safetensors` | 0.3 GB |
 
-1. Download the latest `Prompt2MTV-Setup-<version>.exe` file.
-2. Double-click it.
-3. Finish the setup wizard.
-4. Launch Prompt2MTV from the desktop shortcut or Start Menu.
+See `model_manifest.json` for download URLs and checksums.
 
-Expected installer filename example:
+## Troubleshooting
 
-- `Prompt2MTV-Setup-0.3.0.exe`
+- **App can't find ComfyUI** — Use **Project → Configure Runtime Paths** to set the path manually.
+- **Port 8188 already in use** — A previous ComfyUI process may still be running. Kill it in Task Manager, then relaunch.
+- **CUDA out-of-memory** — Don't generate video and music at the same time. Let one finish before starting the other.
+- **Queue stuck at 0%** — ComfyUI may have crashed silently. Check the ComfyUI terminal (toggle it from the Video tab toolbar) and restart if needed.
 
-The installer already includes the packaged app and its Python/runtime dependencies.
+## Support
 
-You do **not** need to install manually:
+If Prompt2MTV made your workflow easier, consider supporting development:
 
-- Python
-- `pip`
-- virtual environments
-- `requirements.txt`
-- PyInstaller
-- Inno Setup
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Support-FFDD00?logo=buymeacoffee&logoColor=000000)](https://buymeacoffee.com/rorrimaesu)
 
-## What Prompt2MTV Installs
+---
 
-The Windows installer includes:
+## Developer Guide
 
-- Prompt2MTV desktop app
-- packaged Python runtime for the app
-- bundled app dependencies
-- desktop and Start Menu shortcuts
-- per-user settings and output folders under `%LOCALAPPDATA%\Prompt2MTV`
+Everything below is for contributors and anyone building from source.
 
-The Windows installer does **not** include:
-
-- ComfyUI itself
-- LTX models
-- ACE-Step models
-- other large checkpoints, LoRAs, or model assets
-
-## What Happens On First Launch
-
-On first launch, Prompt2MTV runs startup checks and tells you what is missing in plain language.
-
-It can help with:
-
-- locating your ComfyUI root folder
-- locating your ComfyUI launcher `.bat` file
-- locating your ComfyUI model folders
-- detecting missing workflow models
-
-If `model_manifest.json` contains valid download URLs, Prompt2MTV can offer to download missing workflow models directly into the correct ComfyUI folders automatically.
-
-If your ComfyUI install lives in a non-default location, use `Project > Configure Runtime Paths` inside the app.
-
-Typical example ComfyUI root folder:
-
-- `D:\ComfyUI`
-
-## Before You Render Anything
-
-Before Prompt2MTV can actually generate scenes or music, you still need:
-
-- Windows
-- a working local ComfyUI installation
-- the required LTX 2.3 workflow models
-- the required ACE-Step workflow dependencies
-
-Prompt2MTV can use bundled `imageio-ffmpeg` support inside the packaged build, so normal users do not need to manually install FFmpeg just to get the app running.
-
-## Typical Workflow
-
-1. Launch Prompt2MTV.
-2. Create or open a project.
-3. Confirm runtime paths and workflow settings.
-4. Let Prompt2MTV detect or download missing models if needed.
-5. Add prompts to the prompt queue.
-6. Run scene generation through ComfyUI.
-7. Review clips in the gallery.
-8. Import your own video clips into the gallery if needed.
-9. Stitch selected renders.
-10. Generate music with ACE-Step or import your own audio track.
-11. Merge the final soundtrack and video.
-
-## Key Features
-
-- **Video Generation**: LTX 2.3 Text-to-Video (T2V) and Image-to-Video (I2V) workflow integration
-- **Batch Processing**: Advanced prompt queue for batching multiple video scenes sequentially
-- **Project Management**: Project-based organization for repeatable work and persistent state tracking
-- **AI Ideation**: Local Ollama AI chatbot integration for prompt structural ideation directly within the app
-- **Audio & Music**: Full ACE-Step music generation workflow support with sampling, language, and timing controls
-- **Automated setup**: Startup preflight checks, first-launch guidance, and missing-model detection
-- **Model Downloader**: Automatic model download helper for missing weights/nodes featuring SHA-256 validation via `model_manifest.json`
-- **Dynamic Settings**: Runtime configuration for your ComfyUI root, dynamic launcher scripts, and portable model paths
-- **Media Gallery**: Robust drag-and-drop media gallery for generated scenes, imported clips, outputs, and final videos
-- **NLE Editing Support**: Automatic FFmpeg-powered video stitching and audio track merging directly bypassing external tools
-- **Seamless Local Server**: In-app ComfyUI background server process control with a hidden-by-default terminal (toggleable via the UI)
-- **Packaged Builds**: Fully packaged Windows `.exe` and standard Inno Setup installation workflow
-
-## Music Workspace Notes
-
-- You can either generate music with the bundled ACE-Step workflow or import a finished audio file directly into the active project.
-- Imported clips appear in their own gallery section so they can be stitched or used as the music reference clip.
-- Music settings such as duration, BPM, sampler, scheduler, seed behavior, and advanced sampling values are saved with each project.
-- On Windows, Prompt2MTV can launch ComfyUI with its terminal hidden. Use the `Show ComfyUI Terminal` button in the top toolbar on the Video tab if you want to inspect the live console.
-
-## Important Reality Check
-
-Prompt2MTV can remove most of the manual app setup.
-
-Prompt2MTV cannot currently make the whole workflow zero-setup, because the overall system still depends on:
-
-- a local ComfyUI install
-- large external model files
-- enough disk space for those model files
-- maintenance of those external assets over time
-
-So the intended user path is:
-
-- install ComfyUI portable
-- install Prompt2MTV with the setup `.exe`
-- let Prompt2MTV detect and download missing workflow models where possible
-
-## Developer Setup
-
-Use this section only if you want to modify the code, build the app yourself, or contribute to the project.
-
-### Clone the repository
+### Setup
 
 ```powershell
 git clone https://github.com/RorriMaesu/Prompt2MTV.git
 cd Prompt2MTV
-```
-
-### Create and activate a virtual environment
-
-```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-```
-
-### Install dependencies
-
-```powershell
 pip install -r requirements.txt
-```
-
-### Run from source
-
-```powershell
 python ltx_queue_manager.py
 ```
 
-## Build the Windows App
-
-Build the packaged executable with:
+### Build
 
 ```powershell
-.\build_exe.bat
+.\build_exe.bat              # → dist\Prompt2MTV\Prompt2MTV.exe
+.\build_installer.bat        # → dist_installer\Prompt2MTV-Setup-1.0.0.exe
 ```
 
-Output:
-
-- `dist\Prompt2MTV\Prompt2MTV.exe`
-
-Build the Windows installer with:
-
-```powershell
-.\build_installer.bat
-```
-
-Output:
-
-- `dist_installer\Prompt2MTV-Setup-0.3.0.exe`
-
-If `model_manifest.json` contains valid model sources, installed builds can download missing workflow models directly into the detected ComfyUI model folders.
-
-## Upgrading Installed Builds
-
-If you already have Prompt2MTV installed and want a cleaner upgrade path for future releases, use the helper script below instead of manually copying files.
-
-Run:
+### Upgrade helper
 
 ```powershell
 .\tools\Install-Prompt2MTVRelease.ps1
 ```
 
-What it does:
+Closes any running instance, uninstalls the previous version, reinstalls from the latest installer in `dist_installer`, and recreates the desktop shortcut.
 
-- closes any running `Prompt2MTV` process
-- uses a normal uninstall if Windows has a managed uninstall entry
-- removes an unmanaged local install under `%LOCALAPPDATA%\Programs\Prompt2MTV` if needed
-- reinstalls from the latest packaged installer in `dist_installer`
-- recreates the desktop shortcut
+### Repository layout
 
-## Repository Contents
+| File | Purpose |
+|------|---------|
+| `ltx_queue_manager.py` | Main app entry point and UI |
+| `model_downloader.py` | Streamed model downloads with resume and SHA-256 verification |
+| `model_manifest.json` | Required-model manifest for auditing and auto-download |
+| `video_ltx2_3_t2v.json` | LTX 2.3 text-to-video ComfyUI workflow |
+| `ACE_Step_AI_Music_Generator_Workflow.json` | ACE-Step music generation workflow |
+| `Prompt2MTV.spec` | PyInstaller build config |
+| `Prompt2MTV.iss` | Inno Setup installer config |
+| `build_exe.bat` / `build_installer.bat` | Build scripts |
 
-- `ltx_queue_manager.py`: Main application entry point and UI logic
-- `model_downloader.py`: Streamed model download helper with progress, resume support, and SHA-256 verification
-- `video_ltx2_3_t2v.json`: Primary LTX 2.3 text-to-video workflow
-- `ACE_Step_AI_Music_Generator_Workflow.json`: Music-generation workflow
-- `model_manifest.json`: Required-model manifest for workflow auditing and automatic installation
-- `requirements.txt`: Python dependencies for local development and packaging
-- `Prompt2MTV.spec`: PyInstaller build definition
-- `Prompt2MTV.iss`: Inno Setup installer definition
-- `build_exe.bat`: Windows app build helper
-- `build_installer.bat`: Windows installer build helper
-- `Prompt2MTV.ico`: App and installer icon
-- `Prompt2MTV_version_info.txt`: Windows executable version metadata
+### Known architecture notes
 
-Generated media and project outputs are written to `outputs/` at runtime and are excluded from source control.
-
-## Operational Notes
-
-- Prompt2MTV communicates with a local ComfyUI instance, not a hosted backend
-- packaged builds keep user settings and outputs in `%LOCALAPPDATA%\Prompt2MTV`
-- source checkouts keep local runtime files such as `app_settings.json` and `app_state.json` out of version control
-- if Prompt2MTV cannot find your ComfyUI root, launcher, or model directories, use `Project > Configure Runtime Paths`
-- the installer and packaged app do not bundle ComfyUI itself or the required models
-
-## Architecture / Workflow Flaws
-
-If you are modifying the raw `.json` workflows or contributing to the codebase, keep these current architectural flaws in mind:
-- **Node ID Fragility**: The app injects job payload data into the JSON workflows (`video_ltx2_3_t2v.json`, etc.) using hardcoded numeric Node IDs. Modifying these workflows in the native ComfyUI graph editor may shuffle node ID numbers and break the Python payload mapper.
-- **Process Management**: The app launches the ComfyUI background server via `subprocess`. Sudden Task Manager force-quits might leave zombie processes holding port `8188`, preventing the app from launching again until the process is manually killed.
-- **VRAM Contention**: Relying on a shared ComfyUI instance means generating video (LTX) and audio (ACE-Step) concurrently can trigger immediate CUDA Out-Of-Memory crashes. Ensure the queue enforces a strict single-job audio/video execution lock.
-- **Stitching Synchronization**: ComfyUI rendering outputs sometimes drift into Variable Framerates. The local FFmpeg stitcher processes these chunks with strict `-vsync 1 -r 24` parameters so they don't break audio sync during concatenation.
-- **Silent Timeout Drops**: The local REST API polling blindly waits for completion. Active JSON responses from `GET /history` need to monitor for internal ComfyUI compilation or Memory crashes, otherwise the queue UI hangs at 0%.
-
-## Support / Donate
-
-If Prompt2MTV has made your workflow faster, cleaner, or just less painful, consider supporting development.
-
-[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Support-FFDD00?logo=buymeacoffee&logoColor=000000)](https://buymeacoffee.com/rorrimaesu)
+- **Node ID fragility** — Workflows use hardcoded node IDs. Editing them in the ComfyUI graph editor may renumber IDs and break the payload mapper.
+- **Process management** — ComfyUI runs as a subprocess. Force-killing the app can leave zombie processes holding port 8188.
+- **VRAM contention** — Video and music generation share one ComfyUI instance. Running both concurrently will OOM. The queue enforces single-job execution.
+- **Variable framerate** — ComfyUI outputs can drift to VFR. The stitcher normalizes with `-vsync 1 -r 24` to maintain audio sync.

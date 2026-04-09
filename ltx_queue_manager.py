@@ -44,6 +44,8 @@ SUPPORTED_AUDIO_EXTENSIONS = (".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg")
 SUPPORTED_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
 PROJECT_STATE_SCHEMA_VERSION = 3
 CHATBOT_CREATIVE_STATE_SCHEMA_VERSION = 1
+TUTORIAL_PHASE_HISTORY_SCHEMA_VERSION = 1
+TUTORIAL_PHASE_HISTORY_MAX_SAMPLES = 12
 SCENE_MODE_T2V = "t2v"
 SCENE_MODE_I2V = "i2v"
 MUSIC_SAMPLER_OPTIONS = [
@@ -124,7 +126,7 @@ WINDOWS_HIDE = 0
 WINDOWS_SHOW = 5
 WINDOWS_RESTORE = 9
 APP_NAME = "Prompt2MTV"
-APP_VERSION = "0.3.0"
+APP_VERSION = "1.0.0"
 APP_PUBLISHER = "Prompt2MTV"
 APP_TAGLINE = "Local AI Music Video Studio"
 ENV_COMFYUI_ROOT_KEYS = ("PROMPT2MTV_COMFYUI_ROOT", "COMFYUI_ROOT")
@@ -153,6 +155,28 @@ DEFAULT_CHATBOT_TOP_K = 20
 DEFAULT_CHATBOT_MIN_P = 0.0
 DEFAULT_CHATBOT_REPEAT_PENALTY = 1.5
 DEFAULT_CHATBOT_DEFAULT_TO_NON_THINKING = True
+CHATBOT_MODEL_FAMILY_QWEN3 = "qwen3"
+CHATBOT_MODEL_FAMILY_GEMMA4 = "gemma4"
+DEFAULT_CHATBOT_MODEL_FAMILY = CHATBOT_MODEL_FAMILY_QWEN3
+DEFAULT_GEMMA4_OLLAMA_TAG = "gemma4:e4b"
+GEMMA4_OLLAMA_TAG_OPTIONS = ["gemma4:e2b", "gemma4:e4b", "gemma4:26b", "gemma4:31b"]
+DEFAULT_GEMMA4_TEMPERATURE = 1.0
+DEFAULT_GEMMA4_TOP_P = 0.95
+DEFAULT_GEMMA4_TOP_K = 64
+DEFAULT_GEMMA4_MIN_P = 0.0
+DEFAULT_GEMMA4_REPEAT_PENALTY = 1.0
+PHASE_DISPLAY_NAMES = {
+    "video_single": "Generating Video Clip",
+    "video_queue": "Running Video Queue",
+    "video_render": "Rendering Scene Timeline",
+    "image_single": "Generating Image",
+    "image_generate": "Running Image Queue",
+    "music_generate": "Generating Soundtrack",
+    "merge": "Merging Audio & Video",
+    "stitch": "Stitching Videos",
+    "chatbot_chat": "Chatbot Responding",
+    "chatbot_task": "Generating Prompt Draft",
+}
 CHATBOT_BACKEND_MODE_CONNECT = "connect"
 CHATBOT_BACKEND_MODE_MANAGED = "managed"
 CHATBOT_BACKEND_MODE_OLLAMA = "ollama"
@@ -325,9 +349,11 @@ class LTXQueueManager:
         self.comfyui_process = None
         self.global_settings_file = os.path.join(self.user_data_dir, "app_settings.json")
         self.legacy_global_settings_file = os.path.join(self.app_root_dir, "app_settings.json")
+        self.tutorial_phase_history_file = os.path.join(self.user_data_dir, "tutorial_phase_history.json")
         self.is_first_launch = False
         self.selected_videos = set()
         self.video_checkbox_vars = []
+        self.gallery_video_cards = {}
         self.selected_video_for_music = None
         self.current_generated_audio = None
         self.current_audio_source = None
@@ -364,6 +390,8 @@ class LTXQueueManager:
         self.chatbot_model_path = self._get_chatbot_model_path_from_root(self.chatbot_model_root)
         self.chatbot_preferred_drive = "M"
         self.chatbot_backend_mode = CHATBOT_BACKEND_MODE_CONNECT
+        self.chatbot_model_family = DEFAULT_CHATBOT_MODEL_FAMILY
+        self.chatbot_gemma4_ollama_tag = DEFAULT_GEMMA4_OLLAMA_TAG
         self.chatbot_server_url = DEFAULT_CHATBOT_SERVER_URL
         self.chatbot_server_executable_path = ""
         self.chatbot_context_size = DEFAULT_CHATBOT_CONTEXT_SIZE
@@ -389,6 +417,12 @@ class LTXQueueManager:
         self.chatbot_pending_request_mode = None
         self.chatbot_download_cancel_requested = False
         self.chatbot_setup_prompted_this_session = False
+        self.tutorial_runtime_progress = {}
+        self.tutorial_phase_history = self._create_empty_tutorial_phase_history()
+        self.eta_active_phase = None
+        self.eta_item_start_time = None
+        self.eta_phase_start_time = None
+        self.eta_tick_id = None
         
         # Setup base output directory
         self.base_output_dir = self._get_default_output_dir()
@@ -597,6 +631,8 @@ class LTXQueueManager:
         return command
 
     def _ensure_ollama_model_registered(self, timeout_seconds=180):
+        if self.chatbot_model_family == CHATBOT_MODEL_FAMILY_GEMMA4:
+            return self._ensure_gemma4_ollama_model(timeout_seconds=timeout_seconds)
         preferred_model_id = self._get_chatbot_preferred_ollama_model_name()
         try:
             discovered_model_ids = self._fetch_chatbot_backend_models(timeout_seconds=min(10, timeout_seconds))
@@ -665,6 +701,57 @@ class LTXQueueManager:
             self.chatbot_discovered_model_ids = refreshed_model_ids
             return refreshed_model_ids[0]
         raise ValueError("Ollama completed model registration, but Prompt2MTV could not discover a usable model from /v1/models.")
+
+    def _ensure_gemma4_ollama_model(self, timeout_seconds=180):
+        tag = str(self.chatbot_gemma4_ollama_tag or DEFAULT_GEMMA4_OLLAMA_TAG).strip()
+        try:
+            discovered_model_ids = self._fetch_chatbot_backend_models(timeout_seconds=min(10, timeout_seconds))
+        except Exception:
+            discovered_model_ids = []
+
+        for discovered_model_id in discovered_model_ids:
+            if str(discovered_model_id).strip().lower().startswith("gemma4"):
+                if tag.replace(":", "-") in discovered_model_id.replace(":", "-") or discovered_model_id.strip().lower() == tag.lower():
+                    return discovered_model_id
+
+        for discovered_model_id in discovered_model_ids:
+            if str(discovered_model_id).strip().lower().startswith("gemma4"):
+                return discovered_model_id
+
+        executable_path = self._get_active_chatbot_server_executable_path(backend_mode=CHATBOT_BACKEND_MODE_OLLAMA)
+        if not executable_path:
+            raise ValueError("Prompt2MTV could not find ollama.exe to pull the Gemma4 model.")
+
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+        completed_process = subprocess.run(
+            [executable_path, "pull", tag],
+            capture_output=True,
+            timeout=max(300, int(timeout_seconds)),
+            creationflags=creation_flags,
+        )
+        if completed_process.returncode != 0:
+            error_output = (completed_process.stderr or completed_process.stdout or b"")
+            if isinstance(error_output, bytes):
+                error_output = error_output.decode("utf-8", errors="replace")
+            raise RuntimeError(f"Ollama pull {tag} failed: {str(error_output or '').strip() or 'unknown error'}")
+
+        deadline = time.time() + max(10, min(30, timeout_seconds))
+        poll_delay_seconds = 0.75
+        while time.time() < deadline:
+            try:
+                refreshed_model_ids = self._fetch_chatbot_backend_models(timeout_seconds=min(10, timeout_seconds))
+            except Exception:
+                refreshed_model_ids = []
+
+            for discovered_model_id in refreshed_model_ids:
+                if str(discovered_model_id).strip().lower().startswith("gemma4"):
+                    self.chatbot_discovered_model_ids = refreshed_model_ids
+                    return discovered_model_id
+
+            time.sleep(poll_delay_seconds)
+            poll_delay_seconds = min(3.0, poll_delay_seconds * 1.5)
+
+        raise ValueError(f"Ollama pull {tag} completed, but Prompt2MTV could not discover the model from /v1/models.")
 
     def _get_chatbot_model_resolution_status(self, model_id):
         normalized_model_id = str(model_id or "").strip()
@@ -842,6 +929,15 @@ class LTXQueueManager:
 
     def _resolve_chatbot_generation_model_id(self, timeout_seconds=5):
         model_ids = self._fetch_chatbot_backend_models(timeout_seconds=timeout_seconds)
+        if self.chatbot_model_family == CHATBOT_MODEL_FAMILY_GEMMA4:
+            tag = str(self.chatbot_gemma4_ollama_tag or DEFAULT_GEMMA4_OLLAMA_TAG).strip().lower()
+            for discovered_model_id in model_ids:
+                mid = str(discovered_model_id).strip().lower()
+                if mid == tag or (mid.startswith("gemma4") and tag.replace(":", "-") in mid.replace(":", "-")):
+                    return discovered_model_id
+            for discovered_model_id in model_ids:
+                if str(discovered_model_id).strip().lower().startswith("gemma4"):
+                    return discovered_model_id
         if self.chatbot_backend_mode == CHATBOT_BACKEND_MODE_OLLAMA:
             preferred_model_id = self._get_chatbot_preferred_ollama_model_name().lower()
             for discovered_model_id in model_ids:
@@ -1060,6 +1156,8 @@ class LTXQueueManager:
             self._style_button(self.chatbot_copy_output_btn, "secondary", compact=True)
         if hasattr(self, "chatbot_apply_btn"):
             self._style_button(self.chatbot_apply_btn, "success", compact=True)
+        if hasattr(self, "chatbot_apply_scene_btn"):
+            self._style_button(self.chatbot_apply_scene_btn, "success", compact=True)
         if "chatbot_focus_workspace" in self.collapsible_sections:
             self._update_collapsible_section_meta("chatbot_focus_workspace", self._get_chatbot_focus_section_meta())
 
@@ -1071,6 +1169,40 @@ class LTXQueueManager:
         if not self.chatbot_last_result and not self._get_chatbot_transcript_turns():
             self.chatbot_output_preview_cache = self._get_chatbot_empty_state_text(selected_task)
         self._refresh_chatbot_output_preview()
+
+    def _on_chatbot_model_family_changed(self, _event=None):
+        chosen_family = str(self.chatbot_model_family_var.get() or "").strip().lower()
+        if chosen_family not in {CHATBOT_MODEL_FAMILY_QWEN3, CHATBOT_MODEL_FAMILY_GEMMA4}:
+            chosen_family = CHATBOT_MODEL_FAMILY_QWEN3
+        self.chatbot_model_family = chosen_family
+        if chosen_family == CHATBOT_MODEL_FAMILY_GEMMA4:
+            if self.chatbot_backend_mode != CHATBOT_BACKEND_MODE_OLLAMA:
+                self._pre_gemma4_backend_mode = self.chatbot_backend_mode
+                self._pre_gemma4_server_url = self.chatbot_server_url
+            self.chatbot_backend_mode = CHATBOT_BACKEND_MODE_OLLAMA
+            self.chatbot_server_url = self._get_default_chatbot_server_url(CHATBOT_BACKEND_MODE_OLLAMA)
+            if not self.chatbot_server_executable_path:
+                self.chatbot_server_executable_path = self._get_active_chatbot_server_executable_path(backend_mode=CHATBOT_BACKEND_MODE_OLLAMA)
+            self.chatbot_gemma4_tag_row.pack(fill=tk.X, pady=(6, 0), after=self.chatbot_model_family_row)
+        else:
+            if hasattr(self, "chatbot_gemma4_tag_row"):
+                self.chatbot_gemma4_tag_row.pack_forget()
+            restored_mode = getattr(self, "_pre_gemma4_backend_mode", None)
+            if restored_mode and restored_mode in {CHATBOT_BACKEND_MODE_CONNECT, CHATBOT_BACKEND_MODE_MANAGED, CHATBOT_BACKEND_MODE_OLLAMA}:
+                self.chatbot_backend_mode = restored_mode
+                self.chatbot_server_url = getattr(self, "_pre_gemma4_server_url", "") or self._get_default_chatbot_server_url(restored_mode)
+            elif self.chatbot_backend_mode == CHATBOT_BACKEND_MODE_OLLAMA:
+                self.chatbot_backend_mode = CHATBOT_BACKEND_MODE_CONNECT
+                self.chatbot_server_url = self._get_default_chatbot_server_url(CHATBOT_BACKEND_MODE_CONNECT)
+        self.save_global_settings()
+        self._refresh_chatbot_runtime_ui()
+
+    def _on_chatbot_gemma4_tag_changed(self, _event=None):
+        chosen_tag = str(self.chatbot_gemma4_tag_var.get() or "").strip()
+        if chosen_tag in GEMMA4_OLLAMA_TAG_OPTIONS:
+            self.chatbot_gemma4_ollama_tag = chosen_tag
+        self.save_global_settings()
+        self._refresh_chatbot_runtime_ui()
 
     def _create_empty_chatbot_state(self):
         return {
@@ -1401,7 +1533,8 @@ class LTXQueueManager:
             "You are Prompt2MTV's creative assistant for music video development. "
             "Reply conversationally and collaboratively. Help the user shape concept, mood, pacing, scene ideas, visual motifs, and prompt direction. "
             "Do not return JSON or schema output unless the app explicitly requests a structured artifact. "
-            "Do not expose chain-of-thought, reasoning markers, or control tokens like /think or /no_think in the visible reply. "
+            "Do not expose chain-of-thought, reasoning markers, or control tokens "
+            "like /think, /no_think, <think>, or <|channel>thought in the visible reply. "
             "Keep replies practical, focused, and creatively useful."
         )
 
@@ -1412,18 +1545,26 @@ class LTXQueueManager:
         resolved_model_path = str(self.chatbot_model_path or self.chatbot_model_filename or "").strip().lower()
         return "qwen3" in resolved_model_path
 
-    def _chatbot_should_force_non_thinking(self, model_id=None):
-        return bool(
-            self.chatbot_backend_mode == CHATBOT_BACKEND_MODE_OLLAMA
-            and self.chatbot_default_to_non_thinking
-            and self._chatbot_request_targets_qwen3(model_id=model_id)
-        )
+    def _chatbot_request_targets_gemma4(self, model_id=None):
+        if self.chatbot_model_family == CHATBOT_MODEL_FAMILY_GEMMA4:
+            return True
+        resolved_model_id = str(model_id or "").strip().lower()
+        return "gemma4" in resolved_model_id
 
-    def _apply_chatbot_non_thinking_suffix(self, text, force_non_thinking=False):
+    def _chatbot_should_force_non_thinking(self, model_id=None):
+        if not self.chatbot_default_to_non_thinking:
+            return False
+        if self.chatbot_backend_mode != CHATBOT_BACKEND_MODE_OLLAMA:
+            return False
+        return self._chatbot_request_targets_qwen3(model_id=model_id) or self._chatbot_request_targets_gemma4(model_id=model_id)
+
+    def _apply_chatbot_non_thinking_suffix(self, text, force_non_thinking=False, model_id=None):
         content_text = str(text or "").strip()
         if not content_text:
             return content_text
         if not force_non_thinking:
+            return content_text
+        if self._chatbot_request_targets_gemma4(model_id=model_id):
             return content_text
         lowered_text = content_text.lower()
         if "/no_think" in lowered_text or "/think" in lowered_text:
@@ -1447,19 +1588,37 @@ class LTXQueueManager:
                     continue
                 request_messages[message_index] = dict(
                     request_messages[message_index],
-                    content=self._apply_chatbot_non_thinking_suffix(request_messages[message_index].get("content"), force_non_thinking=True),
+                    content=self._apply_chatbot_non_thinking_suffix(request_messages[message_index].get("content"), force_non_thinking=True, model_id=model_id),
                 )
                 break
         return request_messages
 
-    def _build_chatbot_sampling_payload(self):
-        payload = {
-            "temperature": float(self.chatbot_temperature or DEFAULT_CHATBOT_TEMPERATURE),
-            "top_p": float(self.chatbot_top_p if self.chatbot_top_p is not None else DEFAULT_CHATBOT_TOP_P),
-            "top_k": max(1, int(self.chatbot_top_k or DEFAULT_CHATBOT_TOP_K)),
-            "min_p": max(0.0, float(self.chatbot_min_p if self.chatbot_min_p is not None else DEFAULT_CHATBOT_MIN_P)),
+    def _get_chatbot_effective_defaults(self):
+        if self.chatbot_model_family == CHATBOT_MODEL_FAMILY_GEMMA4:
+            return {
+                "temperature": DEFAULT_GEMMA4_TEMPERATURE,
+                "top_p": DEFAULT_GEMMA4_TOP_P,
+                "top_k": DEFAULT_GEMMA4_TOP_K,
+                "min_p": DEFAULT_GEMMA4_MIN_P,
+                "repeat_penalty": DEFAULT_GEMMA4_REPEAT_PENALTY,
+            }
+        return {
+            "temperature": DEFAULT_CHATBOT_TEMPERATURE,
+            "top_p": DEFAULT_CHATBOT_TOP_P,
+            "top_k": DEFAULT_CHATBOT_TOP_K,
+            "min_p": DEFAULT_CHATBOT_MIN_P,
+            "repeat_penalty": DEFAULT_CHATBOT_REPEAT_PENALTY,
         }
-        repeat_penalty = float(self.chatbot_repeat_penalty if self.chatbot_repeat_penalty is not None else DEFAULT_CHATBOT_REPEAT_PENALTY)
+
+    def _build_chatbot_sampling_payload(self):
+        defaults = self._get_chatbot_effective_defaults()
+        payload = {
+            "temperature": float(self.chatbot_temperature if self.chatbot_temperature is not None else defaults["temperature"]),
+            "top_p": float(self.chatbot_top_p if self.chatbot_top_p is not None else defaults["top_p"]),
+            "top_k": max(1, int(self.chatbot_top_k if self.chatbot_top_k is not None else defaults["top_k"])),
+            "min_p": max(0.0, float(self.chatbot_min_p if self.chatbot_min_p is not None else defaults["min_p"])),
+        }
+        repeat_penalty = float(self.chatbot_repeat_penalty if self.chatbot_repeat_penalty is not None else defaults["repeat_penalty"])
         if repeat_penalty > 0:
             payload["repeat_penalty"] = repeat_penalty
         return payload
@@ -1472,6 +1631,9 @@ class LTXQueueManager:
         visible_text = re.sub(r"<think>.*?</think>", "", visible_text, flags=re.DOTALL | re.IGNORECASE)
         visible_text = re.sub(r"(?im)^[ \t]*/(?:no_)?think[ \t]*\r?\n?", "", visible_text)
         visible_text = re.sub(r"(?im)^[ \t]*</?think>[ \t]*\r?\n?", "", visible_text)
+        visible_text = re.sub(r"<\|channel>thought\n.*?<channel\|>", "", visible_text, flags=re.DOTALL)
+        visible_text = re.sub(r"(?m)^[ \t]*<\|channel>thought[ \t]*\r?\n?", "", visible_text)
+        visible_text = re.sub(r"(?m)^[ \t]*<channel\|>[ \t]*\r?\n?", "", visible_text)
         return visible_text.strip()
 
     def _extract_chatbot_response_parts(self, response_payload):
@@ -1549,6 +1711,8 @@ class LTXQueueManager:
             "stream": False,
         }
         payload.update(self._build_chatbot_sampling_payload())
+        if force_non_thinking and self._chatbot_request_targets_gemma4(model_id=model_id):
+            payload["think"] = False
         response_payload = self._post_chatbot_completion_payload(
             payload,
             timeout_seconds=timeout_seconds,
@@ -2109,6 +2273,13 @@ class LTXQueueManager:
                 if task_label == CHATBOT_TASK_SCENE_PLAN or task_label == "scene_plan"
                 else "Add Prompt to Image Queue"
             )
+        if hasattr(self, "chatbot_apply_scene_btn"):
+            is_scene_plan = task_label == CHATBOT_TASK_SCENE_PLAN or task_label == "scene_plan"
+            if is_scene_plan:
+                self.chatbot_apply_scene_btn.pack_forget()
+            else:
+                self.chatbot_apply_scene_btn.config(state=tk.NORMAL if can_apply else tk.DISABLED)
+                self.chatbot_apply_scene_btn.pack(side=tk.LEFT, padx=(10, 0))
         if hasattr(self, "chatbot_task_combo"):
             self.chatbot_task_combo.config(state=tk.DISABLED if is_running else "readonly")
         if hasattr(self, "chatbot_new_chat_btn"):
@@ -2361,6 +2532,8 @@ class LTXQueueManager:
             "stream": False,
         }
         base_payload.update(self._build_chatbot_sampling_payload())
+        if force_non_thinking and self._chatbot_request_targets_gemma4(model_id=model_id):
+            base_payload["think"] = False
         return [
             dict(base_payload, response_format={"type": "json_schema", "json_schema": task_config["json_schema"]}),
             dict(base_payload, response_format={"type": "json_object"}),
@@ -2433,6 +2606,38 @@ class LTXQueueManager:
         self.update_status("Chatbot prompt added to the Image Phase queue.", "green")
         messagebox.showinfo("Chatbot", "The optimized prompt was added to the Image Phase queue.")
 
+    def apply_chatbot_result_to_scene_timeline(self):
+        task_label = str((self.chatbot_last_result or {}).get("task_label") or (self.chatbot_last_result or {}).get("task") or "").strip()
+        if task_label == CHATBOT_TASK_SCENE_PLAN or task_label == "scene_plan":
+            self.apply_chatbot_scene_plan_to_timeline()
+            return
+
+        if not self.chatbot_last_result:
+            messagebox.showwarning("Chatbot", "Generate a prompt draft first.")
+            return
+
+        optimized_prompt = str(self.chatbot_last_result.get("optimized_prompt") or "").strip()
+        if not optimized_prompt:
+            messagebox.showwarning("Chatbot", "The current chatbot result does not include an optimized prompt.")
+            return
+
+        next_index = len(self.scene_timeline) + 1
+        new_entry = self._create_scene_entry(next_index, mode=SCENE_MODE_T2V, prompt=optimized_prompt)
+        self.scene_timeline.append(new_entry)
+        self.scene_timeline = self._normalize_scene_timeline(self.scene_timeline)
+        if hasattr(self, "scene_scrollable_frame"):
+            self._rebuild_scene_timeline_from_state(self.scene_timeline)
+        self._record_chatbot_artifact_apply(
+            target_type="scene_timeline",
+            target_scope="append_timeline",
+            apply_mode="append",
+            summary="Added optimized prompt as a new scene in the Scene Timeline.",
+        )
+        self.update_status("Chatbot prompt added to the Scene Timeline.", "green")
+        if hasattr(self, "notebook") and hasattr(self, "video_tab"):
+            self.notebook.select(self.video_tab)
+        messagebox.showinfo("Chatbot", "The optimized prompt was added to the Scene Timeline.")
+
     def apply_chatbot_scene_plan_to_timeline(self):
         if not self.chatbot_last_result:
             messagebox.showwarning("Chatbot", "Generate a scene plan first.")
@@ -2493,15 +2698,19 @@ class LTXQueueManager:
         self._set_chatbot_generation_state(True)
         self._set_chatbot_output_preview(loading_text)
         self.update_status(start_status, "blue")
+        self._set_tutorial_runtime_progress("chatbot_task", reset=True, status="Generating structured output...", current=0, total=1, item_label="Chatbot task", stage="preparing")
 
         def worker():
+            task_start = time.time()
             try:
                 backend_result = self._ensure_chatbot_backend_ready_for_use(action_label=str(task_name or "chatbot generation").lower())
                 if not backend_result.get("ok"):
                     raise RuntimeError(backend_result.get("detail") or backend_result.get("status") or "The chatbot backend is not ready.")
+                self._set_tutorial_runtime_progress("chatbot_task", status="Waiting for chatbot output...", current=1, total=1, item_label="Chatbot task", stage="running")
                 result = self._request_chatbot_structured_output(task_name, briefing_text)
             except Exception as exc:
                 error_message = str(exc)
+                self._set_tutorial_runtime_progress("chatbot_task", status="Chatbot task failed.", current=1, total=1, item_label="Chatbot task", stage="failed")
 
                 def on_error():
                     self.chatbot_pending_request_mode = None
@@ -2513,6 +2722,9 @@ class LTXQueueManager:
 
                 self.root.after(0, on_error)
                 return
+
+            self.record_tutorial_phase_timing("chatbot_task", time.time() - task_start)
+            self._set_tutorial_runtime_progress("chatbot_task", status="Chatbot task complete.", current=1, total=1, item_label="Chatbot task", stage="complete")
 
             def on_success():
                 self.chatbot_pending_request_mode = None
@@ -2544,15 +2756,19 @@ class LTXQueueManager:
         self._set_chatbot_generation_state(True)
         self._set_chatbot_output_preview("The assistant is thinking about your latest message...")
         self.update_status("Chatbot reply started.", "blue")
+        self._set_tutorial_runtime_progress("chatbot_chat", reset=True, status="Chatbot is responding...", current=0, total=1, item_label="Chat reply", stage="preparing")
 
         def worker():
+            chat_start = time.time()
             try:
                 backend_result = self._ensure_chatbot_backend_ready_for_use(action_label="chat reply")
                 if not backend_result.get("ok"):
                     raise RuntimeError(backend_result.get("detail") or backend_result.get("status") or "The chatbot backend is not ready.")
+                self._set_tutorial_runtime_progress("chatbot_chat", status="Waiting for chatbot reply...", current=1, total=1, item_label="Chat reply", stage="running")
                 reply = self._request_chatbot_chat_reply(conversation_id=conversation_id)
             except Exception as exc:
                 error_message = str(exc)
+                self._set_tutorial_runtime_progress("chatbot_chat", status="Chat reply failed.", current=1, total=1, item_label="Chat reply", stage="failed")
 
                 def on_error():
                     self.chatbot_pending_request_mode = None
@@ -2564,6 +2780,9 @@ class LTXQueueManager:
 
                 self.root.after(0, on_error)
                 return
+
+            self.record_tutorial_phase_timing("chatbot_chat", time.time() - chat_start)
+            self._set_tutorial_runtime_progress("chatbot_chat", status="Chat reply ready.", current=1, total=1, item_label="Chat reply", stage="complete")
 
             def on_success():
                 self.chatbot_pending_request_mode = None
@@ -2656,6 +2875,8 @@ class LTXQueueManager:
         self,
         model_root=None,
         model_path=None,
+        model_family=None,
+        gemma4_ollama_tag=None,
         backend_mode=None,
         server_url=None,
         server_executable_path=None,
@@ -2671,6 +2892,15 @@ class LTXQueueManager:
         preferred_drive=None,
     ):
         previous_backend_mode = self.chatbot_backend_mode
+        if model_family is not None:
+            normalized_family = str(model_family or "").strip().lower()
+            if normalized_family not in {CHATBOT_MODEL_FAMILY_QWEN3, CHATBOT_MODEL_FAMILY_GEMMA4}:
+                normalized_family = CHATBOT_MODEL_FAMILY_QWEN3
+            self.chatbot_model_family = normalized_family
+        if gemma4_ollama_tag is not None:
+            tag = str(gemma4_ollama_tag or "").strip()
+            if tag in GEMMA4_OLLAMA_TAG_OPTIONS:
+                self.chatbot_gemma4_ollama_tag = tag
         if model_root is not None:
             self.chatbot_model_root = self._normalize_path(model_root)
         if model_path is not None:
@@ -2756,6 +2986,10 @@ class LTXQueueManager:
             self.chatbot_destination_value_label.config(text=self.chatbot_model_root or "Unset")
         if hasattr(self, "chatbot_backend_value_label"):
             self.chatbot_backend_value_label.config(text=self._get_chatbot_backend_mode_label())
+        if hasattr(self, "chatbot_model_family_var"):
+            self.chatbot_model_family_var.set(self.chatbot_model_family or DEFAULT_CHATBOT_MODEL_FAMILY)
+        if hasattr(self, "chatbot_gemma4_tag_var"):
+            self.chatbot_gemma4_tag_var.set(self.chatbot_gemma4_ollama_tag or DEFAULT_GEMMA4_OLLAMA_TAG)
         if hasattr(self, "chatbot_next_step_value_label"):
             self.chatbot_next_step_value_label.config(text=self._get_chatbot_next_step_text())
         if hasattr(self, "chatbot_runtime_status_label"):
@@ -3041,8 +3275,8 @@ class LTXQueueManager:
         dialog.title("Advanced Chatbot Runtime Settings")
         dialog.transient(self.root)
         dialog.grab_set()
-        dialog.geometry("760x430")
-        dialog.minsize(700, 390)
+        dialog.geometry("760x510")
+        dialog.minsize(700, 470)
         self._style_panel(dialog, self.colors["bg"])
 
         shell = tk.Frame(dialog, padx=18, pady=18)
@@ -3066,6 +3300,8 @@ class LTXQueueManager:
         card.grid_columnconfigure(1, weight=1)
 
         backend_mode_var = tk.StringVar(value=self.chatbot_backend_mode or CHATBOT_BACKEND_MODE_CONNECT)
+        model_family_var = tk.StringVar(value=self.chatbot_model_family or DEFAULT_CHATBOT_MODEL_FAMILY)
+        gemma4_tag_var = tk.StringVar(value=self.chatbot_gemma4_ollama_tag or DEFAULT_GEMMA4_OLLAMA_TAG)
         server_url_var = tk.StringVar(value=self.chatbot_server_url or DEFAULT_CHATBOT_SERVER_URL)
         server_executable_var = tk.StringVar(value=self.chatbot_server_executable_path or "")
         auto_launch_var = tk.BooleanVar(value=bool(self.chatbot_auto_launch_server) or self.chatbot_backend_mode == CHATBOT_BACKEND_MODE_MANAGED)
@@ -3101,16 +3337,53 @@ class LTXQueueManager:
         backend_combo.grid(row=1, column=1, columnspan=2, sticky="ew", pady=(0, 10))
         backend_combo.configure(style="TCombobox")
 
+        model_family_label = tk.Label(card, text="Model family")
+        model_family_label.grid(row=2, column=0, sticky="w", padx=(0, 12), pady=(0, 10))
+        self._style_label(model_family_label, "body_strong", self.colors["surface"])
+
+        model_family_combo = ttk.Combobox(
+            card,
+            textvariable=model_family_var,
+            state="readonly",
+            values=[CHATBOT_MODEL_FAMILY_QWEN3, CHATBOT_MODEL_FAMILY_GEMMA4],
+        )
+        model_family_combo.grid(row=2, column=1, columnspan=2, sticky="ew", pady=(0, 10))
+        model_family_combo.configure(style="TCombobox")
+
+        gemma4_tag_label = tk.Label(card, text="Gemma4 model tag")
+        gemma4_tag_label.grid(row=3, column=0, sticky="w", padx=(0, 12), pady=(0, 10))
+        self._style_label(gemma4_tag_label, "body_strong", self.colors["surface"])
+
+        gemma4_tag_combo = ttk.Combobox(
+            card,
+            textvariable=gemma4_tag_var,
+            state="readonly",
+            values=GEMMA4_OLLAMA_TAG_OPTIONS,
+        )
+        gemma4_tag_combo.grid(row=3, column=1, columnspan=2, sticky="ew", pady=(0, 10))
+        gemma4_tag_combo.configure(style="TCombobox")
+
+        def _refresh_model_family_widgets(*_args):
+            is_gemma4 = model_family_var.get() == CHATBOT_MODEL_FAMILY_GEMMA4
+            state = "readonly" if is_gemma4 else "disabled"
+            gemma4_tag_combo.configure(state=state)
+            if is_gemma4:
+                backend_mode_var.set(CHATBOT_BACKEND_MODE_OLLAMA)
+                refresh_mode_hint()
+
+        model_family_var.trace_add("write", _refresh_model_family_widgets)
+        _refresh_model_family_widgets()
+
         labels_and_vars = [
-            (2, "Local server URL", server_url_var),
-            (3, "Runtime executable", server_executable_var),
-            (4, "Context size", context_size_var),
-            (5, "Request timeout (s)", timeout_var),
-            (6, "Temperature", temperature_var),
-            (7, "Top P", top_p_var),
-            (8, "Top K", top_k_var),
-            (9, "Min P", min_p_var),
-            (10, "Repeat Penalty", repeat_penalty_var),
+            (4, "Local server URL", server_url_var),
+            (5, "Runtime executable", server_executable_var),
+            (6, "Context size", context_size_var),
+            (7, "Request timeout (s)", timeout_var),
+            (8, "Temperature", temperature_var),
+            (9, "Top P", top_p_var),
+            (10, "Top K", top_k_var),
+            (11, "Min P", min_p_var),
+            (12, "Repeat Penalty", repeat_penalty_var),
         ]
         for row_index, label_text, variable in labels_and_vars:
             label = tk.Label(card, text=label_text)
@@ -3118,10 +3391,10 @@ class LTXQueueManager:
             self._style_label(label, "body_strong", self.colors["surface"])
 
             entry = tk.Entry(card, textvariable=variable)
-            entry.grid(row=row_index, column=1, columnspan=2 if row_index != 3 else 1, sticky="ew", pady=(0, 10))
+            entry.grid(row=row_index, column=1, columnspan=2 if row_index != 5 else 1, sticky="ew", pady=(0, 10))
             self._style_text_input(entry)
 
-            if row_index == 3:
+            if row_index == 5:
                 browse_exec_btn = tk.Button(
                     card,
                     text="Browse",
@@ -3130,12 +3403,12 @@ class LTXQueueManager:
                 browse_exec_btn.grid(row=row_index, column=2, sticky="e", padx=(8, 0), pady=(0, 10))
                 self._style_button(browse_exec_btn, "secondary", compact=True)
 
-        non_thinking_cb = tk.Checkbutton(card, text="Default normal chat to Qwen non-thinking mode when using Ollama", variable=non_thinking_var)
-        non_thinking_cb.grid(row=11, column=0, columnspan=3, sticky="w", pady=(0, 10))
+        non_thinking_cb = tk.Checkbutton(card, text="Default normal chat to non-thinking mode when using Ollama", variable=non_thinking_var)
+        non_thinking_cb.grid(row=13, column=0, columnspan=3, sticky="w", pady=(0, 10))
         self._style_checkbutton(non_thinking_cb)
 
         auto_launch_cb = tk.Checkbutton(card, text="Automatically start the selected local chatbot backend when the chatbot is used", variable=auto_launch_var)
-        auto_launch_cb.grid(row=12, column=0, columnspan=3, sticky="w", pady=(0, 10))
+        auto_launch_cb.grid(row=14, column=0, columnspan=3, sticky="w", pady=(0, 10))
         self._style_checkbutton(auto_launch_cb)
 
         status_var = tk.StringVar(value="Connect mode uses the server URL. Managed llama.cpp needs llama-server. Ollama mode can auto-detect ollama.exe.")
@@ -3175,6 +3448,8 @@ class LTXQueueManager:
                 return
             result.update({
                 "confirmed": True,
+                "model_family": model_family_var.get(),
+                "gemma4_ollama_tag": gemma4_tag_var.get(),
                 "backend_mode": backend_mode_var.get(),
                 "server_url": server_url_var.get(),
                 "server_executable_path": sanitized_exec_path,
@@ -3320,6 +3595,8 @@ class LTXQueueManager:
             return
 
         self._apply_chatbot_runtime_settings(
+            model_family=runtime_result.get("model_family"),
+            gemma4_ollama_tag=runtime_result.get("gemma4_ollama_tag"),
             backend_mode=runtime_result.get("backend_mode"),
             server_url=runtime_result.get("server_url"),
             server_executable_path=runtime_result.get("server_executable_path"),
@@ -5427,6 +5704,10 @@ class LTXQueueManager:
         dialog.wait_visibility()
         dialog.focus_set()
 
+    def run_interactive_tutorial(self):
+        from tools.tutorial_runner import TutorialRunner
+        TutorialRunner(self).start()
+
     def show_about_dialog(self):
         dialog = tk.Toplevel(self.root)
         dialog.title(f"About {APP_NAME}")
@@ -5859,7 +6140,7 @@ class LTXQueueManager:
             "music_actions": False,
             "music_media_state": False,
             "music_preview": False,
-            "chatbot_focus_workspace": False,
+            "chatbot_focus_workspace": True,
             "chatbot_history": False,
             "chatbot_readiness": False,
         }
@@ -6611,6 +6892,7 @@ class LTXQueueManager:
             (self.chatbot_output_mode_btn, "ghost"),
             (self.chatbot_copy_output_btn, "secondary"),
             (self.chatbot_apply_btn, "accent"),
+            (self.chatbot_apply_scene_btn, "accent"),
             (self.chatbot_send_btn, "secondary"),
             (self.chatbot_scene_plan_btn, "secondary"),
             (self.chatbot_new_chat_btn, "ghost"),
@@ -6649,7 +6931,8 @@ class LTXQueueManager:
             (self.chatbot_send_btn, "secondary"),
             (self.chatbot_scene_plan_btn, "secondary"),
             (self.chatbot_new_chat_btn, "ghost"),
-            (self.chatbot_apply_btn, "accent")
+            (self.chatbot_apply_btn, "accent"),
+            (self.chatbot_apply_scene_btn, "accent")
         ]:
             self._style_button(compact_button, variant, compact=True)
 
@@ -6878,8 +7161,9 @@ class LTXQueueManager:
         self.help_menu.add_command(label="Show ComfyUI Terminal", command=self.toggle_comfyui_terminal, state=tk.DISABLED)
         self.help_menu_toggle_terminal_index = self.help_menu.index("end")
         self.help_menu.add_separator()
+        self.help_menu.add_command(label="Run Interactive Tutorial", command=self.run_interactive_tutorial)
         self.help_menu.add_command(label=f"About {APP_NAME}", command=self.show_about_dialog)
-        
+
         # Project Status Bar
         self.status_frame = tk.Frame(self.root, pady=8)
         self.status_frame.pack(fill=tk.X)
@@ -6888,30 +7172,49 @@ class LTXQueueManager:
         self.project_label.pack(side=tk.LEFT, padx=10, fill=tk.X, expand=True)
         self.version_label = tk.Label(self.status_frame, text=f"{APP_NAME} {APP_VERSION}")
         self.version_label.pack(side=tk.RIGHT, padx=10)
+
+        # ETA Progress Panel (hidden by default)
+        self.eta_panel_frame = tk.Frame(self.root, relief=tk.GROOVE, borderwidth=1, padx=8, pady=4)
+        eta_top_row = tk.Frame(self.eta_panel_frame)
+        eta_top_row.pack(fill=tk.X)
+        self.eta_phase_label = tk.Label(eta_top_row, text="", font=("", 9, "bold"), anchor=tk.W)
+        self.eta_phase_label.pack(side=tk.LEFT)
+        self.eta_item_label = tk.Label(eta_top_row, text="", anchor=tk.W, padx=12)
+        self.eta_item_label.pack(side=tk.LEFT)
+        self.eta_elapsed_label = tk.Label(eta_top_row, text="Elapsed: 0s", anchor=tk.W, padx=12)
+        self.eta_elapsed_label.pack(side=tk.LEFT)
+        self.eta_countdown_label = tk.Label(eta_top_row, text="ETA: Estimating...", anchor=tk.E, padx=12)
+        self.eta_countdown_label.pack(side=tk.RIGHT)
+        eta_bar_row = tk.Frame(self.eta_panel_frame)
+        eta_bar_row.pack(fill=tk.X, pady=(2, 0))
+        self.eta_progress_bar = ttk.Progressbar(eta_bar_row, mode="determinate", maximum=100)
+        self.eta_progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.eta_percent_label = tk.Label(eta_bar_row, text="0%", width=5, anchor=tk.E)
+        self.eta_percent_label.pack(side=tk.RIGHT, padx=(6, 0))
         
         # Create Notebook (Tabs)
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
-        # Tab 1: Image Phase
+        # Tab 1: Chatbot
+        self.chatbot_tab = tk.Frame(self.notebook)
+        self.notebook.add(self.chatbot_tab, text="Chatbot")
+
+        # Tab 2: Image Phase
         self.image_tab = tk.Frame(self.notebook)
         self.notebook.add(self.image_tab, text="Image Phase")
         
-        # Tab 2: Video Generation
+        # Tab 3: Video Generation
         self.video_tab = tk.Frame(self.notebook)
         self.notebook.add(self.video_tab, text="Video Generation")
 
-        # Tab 3: Gallery
+        # Tab 4: Gallery
         self.gallery_tab = tk.Frame(self.notebook)
         self.notebook.add(self.gallery_tab, text="Gallery")
 
-        # Tab 4: Music Studio
+        # Tab 5: Music Studio
         self.music_tab = tk.Frame(self.notebook)
         self.notebook.add(self.music_tab, text="Music Studio")
-
-        # Tab 5: Chatbot
-        self.chatbot_tab = tk.Frame(self.notebook)
-        self.notebook.add(self.chatbot_tab, text="Chatbot")
         
         # --- Video Tab Content ---
         self.left_frame = tk.Frame(self.video_tab, padx=0, pady=0)
@@ -8085,7 +8388,7 @@ class LTXQueueManager:
             "chatbot_focus_workspace",
             "Creative Workspace",
             meta_text=self._get_chatbot_focus_section_meta(),
-            is_open=False,
+            is_open=True,
             body_expand=True,
             body_background=self.colors["surface"],
         )
@@ -8142,6 +8445,44 @@ class LTXQueueManager:
         self.chatbot_task_combo.configure(style="TCombobox")
         self.chatbot_task_combo.bind("<<ComboboxSelected>>", self._on_chatbot_task_changed)
 
+        self.chatbot_model_family_var = tk.StringVar(value=self.chatbot_model_family or DEFAULT_CHATBOT_MODEL_FAMILY)
+        self.chatbot_model_family_row = tk.Frame(self.chatbot_briefing_card)
+        self.chatbot_model_family_row.pack(fill=tk.X, pady=(8, 0))
+        self._style_panel(self.chatbot_model_family_row, self.chatbot_briefing_card.cget("bg"))
+        self.chatbot_model_family_label = tk.Label(self.chatbot_model_family_row, text="Model")
+        self.chatbot_model_family_label.pack(side=tk.LEFT)
+        self._style_label(self.chatbot_model_family_label, "body_strong", self.chatbot_model_family_row.cget("bg"))
+        self.chatbot_model_family_combo = ttk.Combobox(
+            self.chatbot_model_family_row,
+            textvariable=self.chatbot_model_family_var,
+            values=[CHATBOT_MODEL_FAMILY_QWEN3, CHATBOT_MODEL_FAMILY_GEMMA4],
+            state="readonly",
+            width=28,
+        )
+        self.chatbot_model_family_combo.pack(side=tk.LEFT, padx=(10, 0), fill=tk.X, expand=True)
+        self.chatbot_model_family_combo.configure(style="TCombobox")
+        self.chatbot_model_family_combo.bind("<<ComboboxSelected>>", self._on_chatbot_model_family_changed)
+
+        self.chatbot_gemma4_tag_var = tk.StringVar(value=self.chatbot_gemma4_ollama_tag or DEFAULT_GEMMA4_OLLAMA_TAG)
+        self.chatbot_gemma4_tag_row = tk.Frame(self.chatbot_briefing_card)
+        self.chatbot_gemma4_tag_row.pack(fill=tk.X, pady=(6, 0))
+        self._style_panel(self.chatbot_gemma4_tag_row, self.chatbot_briefing_card.cget("bg"))
+        self.chatbot_gemma4_tag_label = tk.Label(self.chatbot_gemma4_tag_row, text="Tag")
+        self.chatbot_gemma4_tag_label.pack(side=tk.LEFT)
+        self._style_label(self.chatbot_gemma4_tag_label, "body_strong", self.chatbot_gemma4_tag_row.cget("bg"))
+        self.chatbot_gemma4_tag_combo = ttk.Combobox(
+            self.chatbot_gemma4_tag_row,
+            textvariable=self.chatbot_gemma4_tag_var,
+            values=GEMMA4_OLLAMA_TAG_OPTIONS,
+            state="readonly",
+            width=28,
+        )
+        self.chatbot_gemma4_tag_combo.pack(side=tk.LEFT, padx=(10, 0), fill=tk.X, expand=True)
+        self.chatbot_gemma4_tag_combo.configure(style="TCombobox")
+        self.chatbot_gemma4_tag_combo.bind("<<ComboboxSelected>>", self._on_chatbot_gemma4_tag_changed)
+        if self.chatbot_model_family != CHATBOT_MODEL_FAMILY_GEMMA4:
+            self.chatbot_gemma4_tag_row.pack_forget()
+
         self.chatbot_mode_summary_label = tk.Label(self.chatbot_briefing_card, text=self._get_chatbot_task_primary_action_copy(CHATBOT_TASK_CHAT), anchor="w", justify=tk.LEFT, wraplength=860)
         self.chatbot_mode_summary_label.pack(anchor="w", fill=tk.X, pady=(8, 0))
         self._style_label(self.chatbot_mode_summary_label, "muted", self.chatbot_briefing_card.cget("bg"))
@@ -8156,12 +8497,9 @@ class LTXQueueManager:
         self.chatbot_briefing_hint_label = tk.Label(self.chatbot_briefing_card, text=self._get_chatbot_task_briefing_hint(CHATBOT_TASK_CHAT), anchor="w", justify=tk.LEFT, wraplength=860)
         self.chatbot_briefing_hint_label.pack(anchor="w", fill=tk.X, pady=(6, 10))
         self._style_label(self.chatbot_briefing_hint_label, "muted", self.chatbot_briefing_card.cget("bg"))
-        self.chatbot_briefing_text = tk.Text(self.chatbot_briefing_card, height=10, wrap="word")
-        self.chatbot_briefing_text.pack(fill=tk.BOTH, expand=True)
-        self._style_text_input(self.chatbot_briefing_text, multiline=True)
 
         self.chatbot_task_actions_frame = tk.Frame(self.chatbot_briefing_card)
-        self.chatbot_task_actions_frame.pack(fill=tk.X, pady=(12, 0))
+        self.chatbot_task_actions_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(12, 0))
         self._style_panel(self.chatbot_task_actions_frame, self.chatbot_briefing_card.cget("bg"))
         self.chatbot_send_btn = tk.Button(self.chatbot_task_actions_frame, text="Send", command=self._handle_chatbot_send, state=tk.DISABLED)
         self.chatbot_send_btn.pack(side=tk.LEFT)
@@ -8171,6 +8509,10 @@ class LTXQueueManager:
         self.chatbot_generate_btn.pack(side=tk.LEFT, padx=(10, 0))
         self.chatbot_new_chat_btn = tk.Button(self.chatbot_task_actions_frame, text="New Chat", command=self._start_new_chatbot_conversation)
         self.chatbot_new_chat_btn.pack(side=tk.LEFT, padx=(10, 0))
+
+        self.chatbot_briefing_text = tk.Text(self.chatbot_briefing_card, height=10, wrap="word")
+        self.chatbot_briefing_text.pack(fill=tk.BOTH, expand=True)
+        self._style_text_input(self.chatbot_briefing_text, multiline=True)
 
         self.chatbot_output_card = tk.Frame(self.chatbot_focus_workspace_frame, padx=18, pady=16)
         self.chatbot_output_card.grid(row=0, column=1, sticky="nsew")
@@ -8216,6 +8558,8 @@ class LTXQueueManager:
         self.chatbot_copy_output_btn.pack(side=tk.LEFT, padx=(10, 0))
         self.chatbot_apply_btn = tk.Button(self.chatbot_output_actions_frame, text="Add Prompt to Image Queue", command=self.apply_chatbot_result_to_image_queue, state=tk.DISABLED)
         self.chatbot_apply_btn.pack(side=tk.LEFT, padx=(10, 0))
+        self.chatbot_apply_scene_btn = tk.Button(self.chatbot_output_actions_frame, text="Add Prompt to Scene Timeline", command=self.apply_chatbot_result_to_scene_timeline, state=tk.DISABLED)
+        self.chatbot_apply_scene_btn.pack(side=tk.LEFT, padx=(10, 0))
 
         self.chatbot_transcript_shell = tk.Frame(self.chatbot_output_card)
         self.chatbot_transcript_shell.pack(fill=tk.BOTH, expand=True)
@@ -9824,6 +10168,15 @@ class LTXQueueManager:
 
     def _run_scene_timeline_thread(self, scene_timeline, video_settings):
         total = len(scene_timeline)
+        self._set_tutorial_runtime_progress(
+            "video_render",
+            reset=True,
+            status="Preparing scene timeline render...",
+            current=0,
+            total=total,
+            item_label="Scene timeline",
+            stage="preparing",
+        )
         for index, scene_entry in enumerate(scene_timeline, start=1):
             scene_id = scene_entry.get("scene_id")
             scene_mode = scene_entry.get("mode", SCENE_MODE_T2V)
@@ -9831,6 +10184,14 @@ class LTXQueueManager:
             self.root.after(0, lambda sid=scene_id: self._set_scene_entry_render_state(sid, "rendering"))
             self.update_status(f"Rendering scene {index} of {total}...", "blue")
             self.update_debug_prompt_status(prompt_text, current=index, total=total)
+            self._set_tutorial_runtime_progress(
+                "video_render",
+                status=f"Submitting scene {index} of {total}...",
+                current=index,
+                total=total,
+                item_label=f"Scene {index}",
+                stage="submitting",
+            )
 
             before_files = self._snapshot_media_files(self.scenes_dir, SUPPORTED_VIDEO_EXTENSIONS)
             filename_prefix = self._build_video_filename_prefix(video_settings, "timeline", index)
@@ -9853,20 +10214,40 @@ class LTXQueueManager:
             prompt_id = self.queue_prompt(workflow_to_submit)
             if not prompt_id:
                 self.root.after(0, lambda sid=scene_id: self._set_scene_entry_render_state(sid, "failed"))
+                self._set_tutorial_runtime_progress("video_render", status=f"Scene {index} failed to submit.", current=index, total=total, item_label=f"Scene {index}", stage="failed")
                 break
 
-            success = self.wait_for_completion(prompt_id)
+            item_start = time.time()
+            self.eta_item_start_time = item_start
+            success = self.wait_for_completion(
+                prompt_id,
+                tutorial_progress_phase="video_render",
+                tutorial_progress_current=index,
+                tutorial_progress_total=total,
+                tutorial_progress_label=f"Scene {index}",
+            )
             if not success:
                 self.root.after(0, lambda sid=scene_id: self._set_scene_entry_render_state(sid, "failed"))
                 break
 
+            self.record_tutorial_phase_timing("video_render", time.time() - item_start)
             rendered_output = self._get_newest_rendered_media(before_files, self.scenes_dir, SUPPORTED_VIDEO_EXTENSIONS)
             scene_entry["output_path"] = rendered_output
             scene_entry["render_status"] = "ready"
             self.root.after(0, lambda sid=scene_id, output_path=rendered_output: self._set_scene_entry_render_state(sid, "ready", output_path))
             self.root.after(0, self.refresh_gallery)
+            self._set_tutorial_runtime_progress(
+                "video_render",
+                status=f"Rendered scene {index} of {total}.",
+                current=index,
+                total=total,
+                item_label=f"Scene {index}",
+                stage="item_complete",
+                output_path=rendered_output,
+            )
         else:
             self.update_status("Scene timeline render complete.", "green")
+            self._set_tutorial_runtime_progress("video_render", status="Scene timeline render complete.", current=total, total=total, item_label="Scene timeline", stage="complete")
 
         self.scene_timeline = self._normalize_scene_timeline(scene_timeline)
         self.root.after(0, self.save_project_state)
@@ -10121,7 +10502,9 @@ class LTXQueueManager:
             "chatbot_min_p": self.chatbot_min_p,
             "chatbot_repeat_penalty": self.chatbot_repeat_penalty,
             "chatbot_default_to_non_thinking": self.chatbot_default_to_non_thinking,
-            "chatbot_auto_launch_server": self.chatbot_auto_launch_server
+            "chatbot_auto_launch_server": self.chatbot_auto_launch_server,
+            "chatbot_model_family": self.chatbot_model_family,
+            "chatbot_gemma4_ollama_tag": self.chatbot_gemma4_ollama_tag
         }
         try:
             os.makedirs(os.path.dirname(self.global_settings_file), exist_ok=True)
@@ -10187,6 +10570,10 @@ class LTXQueueManager:
                 self.chatbot_repeat_penalty = DEFAULT_CHATBOT_REPEAT_PENALTY
             self.chatbot_default_to_non_thinking = bool(settings.get("chatbot_default_to_non_thinking", DEFAULT_CHATBOT_DEFAULT_TO_NON_THINKING))
             self.chatbot_auto_launch_server = bool(settings.get("chatbot_auto_launch_server", False))
+            saved_model_family = str(settings.get("chatbot_model_family", DEFAULT_CHATBOT_MODEL_FAMILY)).strip().lower()
+            self.chatbot_model_family = saved_model_family if saved_model_family in {CHATBOT_MODEL_FAMILY_QWEN3, CHATBOT_MODEL_FAMILY_GEMMA4} else DEFAULT_CHATBOT_MODEL_FAMILY
+            saved_gemma4_tag = str(settings.get("chatbot_gemma4_ollama_tag", DEFAULT_GEMMA4_OLLAMA_TAG)).strip()
+            self.chatbot_gemma4_ollama_tag = saved_gemma4_tag if saved_gemma4_tag in GEMMA4_OLLAMA_TAG_OPTIONS else DEFAULT_GEMMA4_OLLAMA_TAG
             if (
                 self.chatbot_backend_mode == CHATBOT_BACKEND_MODE_CONNECT
                 and (self.chatbot_server_url or "").rstrip("/") == DEFAULT_CHATBOT_SERVER_URL
@@ -10200,6 +10587,7 @@ class LTXQueueManager:
                     self.chatbot_auto_launch_server = True
                     chatbot_settings_dirty = True
             self._refresh_chatbot_runtime_ui()
+            self.load_tutorial_phase_history()
 
             last_project = self._normalize_path(settings.get("last_project_dir"))
             if last_project and os.path.exists(last_project):
@@ -10236,9 +10624,286 @@ class LTXQueueManager:
             self.chatbot_auto_launch_server = False
             self.remember_section_open_states = False
             self.chatbot_backend_health_text = "Backend check: Not tested yet."
+            self.tutorial_phase_history = self._create_empty_tutorial_phase_history()
             self._refresh_chatbot_runtime_ui()
             default_project = os.path.join(self.base_output_dir, f"Project_{int(time.time())}")
             self.set_project(default_project)
+
+    def _create_empty_tutorial_phase_history(self):
+        return {
+            "schema_version": TUTORIAL_PHASE_HISTORY_SCHEMA_VERSION,
+            "phases": {},
+            "metadata": {
+                "updated_at": "",
+                "total_recorded_samples": 0,
+            },
+        }
+
+    def load_tutorial_phase_history(self):
+        history_state = self._create_empty_tutorial_phase_history()
+        try:
+            if os.path.exists(self.tutorial_phase_history_file):
+                with open(self.tutorial_phase_history_file, "r", encoding="utf-8") as history_file:
+                    payload = json.load(history_file)
+                if isinstance(payload, dict):
+                    history_state["schema_version"] = int(payload.get("schema_version") or TUTORIAL_PHASE_HISTORY_SCHEMA_VERSION)
+                    history_state["metadata"] = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else history_state["metadata"]
+                    phase_map = payload.get("phases") if isinstance(payload.get("phases"), dict) else {}
+                    normalized_phases = {}
+                    for phase_key, phase_state in phase_map.items():
+                        normalized_key = str(phase_key or "").strip()
+                        if not normalized_key or not isinstance(phase_state, dict):
+                            continue
+                        samples = []
+                        for sample in phase_state.get("samples") or []:
+                            if not isinstance(sample, dict):
+                                continue
+                            try:
+                                elapsed_seconds = max(0.0, float(sample.get("elapsed_seconds") or 0.0))
+                            except (TypeError, ValueError):
+                                continue
+                            if elapsed_seconds <= 0:
+                                continue
+                            samples.append(
+                                {
+                                    "elapsed_seconds": elapsed_seconds,
+                                    "completed_at": str(sample.get("completed_at") or "").strip(),
+                                    "status": str(sample.get("status") or "complete").strip() or "complete",
+                                }
+                            )
+                        if not samples:
+                            continue
+                        trimmed_samples = samples[-TUTORIAL_PHASE_HISTORY_MAX_SAMPLES:]
+                        normalized_phases[normalized_key] = self._build_tutorial_phase_history_entry(normalized_key, trimmed_samples)
+                    history_state["phases"] = normalized_phases
+                    history_state["metadata"] = self._build_tutorial_phase_history_metadata(normalized_phases)
+        except Exception as exc:
+            print(f"Error loading tutorial phase history: {exc}")
+        self.tutorial_phase_history = history_state
+        return history_state
+
+    def _build_tutorial_phase_history_entry(self, phase_key, samples):
+        trimmed_samples = list(samples or [])[-TUTORIAL_PHASE_HISTORY_MAX_SAMPLES:]
+        elapsed_values = [max(0.0, float(sample.get("elapsed_seconds") or 0.0)) for sample in trimmed_samples]
+        elapsed_values = [value for value in elapsed_values if value > 0]
+        average_seconds = (sum(elapsed_values) / len(elapsed_values)) if elapsed_values else 0.0
+        last_completed_at = str(trimmed_samples[-1].get("completed_at") or "").strip() if trimmed_samples else ""
+        return {
+            "phase_key": str(phase_key or "").strip(),
+            "samples": trimmed_samples,
+            "sample_count": len(trimmed_samples),
+            "average_seconds": average_seconds,
+            "last_completed_at": last_completed_at,
+        }
+
+    def _build_tutorial_phase_history_metadata(self, phase_map):
+        phase_map = phase_map if isinstance(phase_map, dict) else {}
+        total_samples = sum(int((phase_state or {}).get("sample_count") or 0) for phase_state in phase_map.values())
+        return {
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "total_recorded_samples": total_samples,
+        }
+
+    def save_tutorial_phase_history(self):
+        try:
+            os.makedirs(os.path.dirname(self.tutorial_phase_history_file), exist_ok=True)
+            phase_map = self.tutorial_phase_history.get("phases") if isinstance(self.tutorial_phase_history, dict) else {}
+            normalized_phases = {}
+            for phase_key, phase_state in (phase_map or {}).items():
+                if not isinstance(phase_state, dict):
+                    continue
+                normalized_entry = self._build_tutorial_phase_history_entry(phase_key, phase_state.get("samples") or [])
+                if normalized_entry.get("sample_count"):
+                    normalized_phases[str(phase_key)] = normalized_entry
+            payload = {
+                "schema_version": TUTORIAL_PHASE_HISTORY_SCHEMA_VERSION,
+                "phases": normalized_phases,
+                "metadata": self._build_tutorial_phase_history_metadata(normalized_phases),
+            }
+            with open(self.tutorial_phase_history_file, "w", encoding="utf-8") as history_file:
+                json.dump(payload, history_file, indent=4)
+            self.tutorial_phase_history = payload
+        except Exception as exc:
+            print(f"Error saving tutorial phase history: {exc}")
+
+    def record_tutorial_phase_timing(self, phase_key, elapsed_seconds, status="complete"):
+        normalized_key = str(phase_key or "").strip()
+        normalized_status = str(status or "complete").strip().lower() or "complete"
+        try:
+            normalized_elapsed = max(0.0, float(elapsed_seconds or 0.0))
+        except (TypeError, ValueError):
+            return None
+        if not normalized_key or normalized_status != "complete" or normalized_elapsed <= 0:
+            return None
+
+        history_state = self.tutorial_phase_history if isinstance(self.tutorial_phase_history, dict) else self._create_empty_tutorial_phase_history()
+        phase_map = history_state.setdefault("phases", {})
+        phase_entry = phase_map.get(normalized_key) if isinstance(phase_map.get(normalized_key), dict) else {"samples": []}
+        samples = list(phase_entry.get("samples") or [])
+        samples.append(
+            {
+                "elapsed_seconds": normalized_elapsed,
+                "completed_at": datetime.now().isoformat(timespec="seconds"),
+                "status": normalized_status,
+            }
+        )
+        phase_map[normalized_key] = self._build_tutorial_phase_history_entry(normalized_key, samples)
+        history_state["metadata"] = self._build_tutorial_phase_history_metadata(phase_map)
+        self.tutorial_phase_history = history_state
+        self.save_tutorial_phase_history()
+        return phase_map.get(normalized_key)
+
+    def get_tutorial_phase_average_seconds(self, phase_key, fallback_seconds=None):
+        normalized_key = str(phase_key or "").strip()
+        if not normalized_key:
+            return fallback_seconds
+        phase_map = self.tutorial_phase_history.get("phases") if isinstance(self.tutorial_phase_history, dict) else {}
+        phase_entry = phase_map.get(normalized_key) if isinstance(phase_map, dict) else None
+        if not isinstance(phase_entry, dict):
+            return fallback_seconds
+        try:
+            average_seconds = float(phase_entry.get("average_seconds") or 0.0)
+        except (TypeError, ValueError):
+            return fallback_seconds
+        return average_seconds if average_seconds > 0 else fallback_seconds
+
+    def _format_eta_display(self, eta_seconds):
+        if eta_seconds is None or eta_seconds < 0:
+            return "Estimating..."
+        eta_seconds = int(eta_seconds)
+        if eta_seconds < 10:
+            return "< 10s"
+        if eta_seconds < 60:
+            return f"~{eta_seconds}s"
+        minutes, seconds = divmod(eta_seconds, 60)
+        if minutes < 60:
+            return f"~{minutes}m {seconds:02d}s"
+        hours, minutes = divmod(minutes, 60)
+        return f"~{hours}h {minutes:02d}m"
+
+    def _format_elapsed_display(self, elapsed_seconds):
+        if elapsed_seconds is None or elapsed_seconds < 0:
+            return "0s"
+        elapsed_seconds = int(elapsed_seconds)
+        if elapsed_seconds < 60:
+            return f"{elapsed_seconds}s"
+        minutes, seconds = divmod(elapsed_seconds, 60)
+        if minutes < 60:
+            return f"{minutes}m {seconds:02d}s"
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}h {minutes:02d}m"
+
+    def _calculate_phase_eta(self, phase_key, current_item, total_items):
+        avg = self.get_tutorial_phase_average_seconds(phase_key)
+        if avg is None or total_items <= 0:
+            return None
+        remaining_items = max(0, total_items - current_item)
+        current_elapsed = 0.0
+        if self.eta_item_start_time:
+            current_elapsed = time.time() - self.eta_item_start_time
+        if current_item < total_items:
+            remaining_on_current = max(0.0, avg - current_elapsed)
+        else:
+            remaining_on_current = 0.0
+        eta_seconds = (remaining_items * avg) + remaining_on_current
+        return max(0.0, eta_seconds)
+
+    def _show_eta_panel(self, phase_key, total, current=0):
+        self.eta_active_phase = phase_key
+        self.eta_phase_start_time = time.time()
+        self.eta_item_start_time = time.time()
+        display_name = PHASE_DISPLAY_NAMES.get(phase_key, phase_key)
+        try:
+            self.eta_phase_label.config(text=display_name)
+            self.eta_item_label.config(text=f"Item {current} of {total}" if total > 1 else "Processing...")
+            self.eta_elapsed_label.config(text="Elapsed: 0s")
+            self.eta_countdown_label.config(text="ETA: Estimating...")
+            self.eta_progress_bar["value"] = 0
+            self.eta_percent_label.config(text="0%")
+            self.eta_panel_frame.pack(fill=tk.X, padx=10, pady=(0, 2))
+        except tk.TclError:
+            return
+        self._start_eta_tick()
+
+    def _hide_eta_panel(self, delay_ms=3000):
+        def do_hide():
+            self.eta_active_phase = None
+            self.eta_item_start_time = None
+            self.eta_phase_start_time = None
+            self._stop_eta_tick()
+            try:
+                self.eta_panel_frame.pack_forget()
+            except tk.TclError:
+                pass
+        if delay_ms > 0:
+            self.root.after(delay_ms, do_hide)
+        else:
+            do_hide()
+
+    def _update_eta_display(self, phase_key, current, total, stage=None):
+        if not hasattr(self, "eta_panel_frame"):
+            return
+        if stage in ("complete", "failed"):
+            elapsed = time.time() - self.eta_phase_start_time if self.eta_phase_start_time else 0
+            pct = 100 if stage == "complete" else int((current / max(total, 1)) * 100)
+            try:
+                self.eta_progress_bar["value"] = pct
+                self.eta_percent_label.config(text=f"{pct}%")
+                self.eta_elapsed_label.config(text=f"Elapsed: {self._format_elapsed_display(elapsed)}")
+                status_text = "Complete!" if stage == "complete" else "Failed"
+                self.eta_countdown_label.config(text=status_text)
+                self.eta_item_label.config(text=f"Done — {current} of {total}" if stage == "complete" else f"Failed at {current} of {total}")
+            except tk.TclError:
+                pass
+            self._hide_eta_panel(delay_ms=5000)
+            return
+        if stage == "item_complete":
+            self.eta_item_start_time = time.time()
+        pct = int((max(current - 1, 0) / max(total, 1)) * 100) if stage != "item_complete" else int((current / max(total, 1)) * 100)
+        eta_seconds = self._calculate_phase_eta(phase_key, current if stage == "item_complete" else current - 1, total)
+        elapsed = time.time() - self.eta_phase_start_time if self.eta_phase_start_time else 0
+        try:
+            self.eta_progress_bar["value"] = pct
+            self.eta_percent_label.config(text=f"{pct}%")
+            self.eta_elapsed_label.config(text=f"Elapsed: {self._format_elapsed_display(elapsed)}")
+            self.eta_countdown_label.config(text=f"ETA: {self._format_eta_display(eta_seconds)}")
+            if total > 1:
+                self.eta_item_label.config(text=f"Item {current} of {total}")
+            else:
+                self.eta_item_label.config(text="Processing...")
+        except tk.TclError:
+            pass
+
+    def _tick_eta_display(self):
+        if not self.eta_active_phase or not self.eta_phase_start_time:
+            return
+        elapsed = time.time() - self.eta_phase_start_time
+        progress_state = self.tutorial_runtime_progress.get(self.eta_active_phase, {})
+        current = progress_state.get("current", 0)
+        total = progress_state.get("total", 1)
+        stage = progress_state.get("stage", "")
+        if stage in ("complete", "failed"):
+            return
+        completed = current - 1 if stage not in ("item_complete",) else current
+        eta_seconds = self._calculate_phase_eta(self.eta_active_phase, max(completed, 0), total)
+        try:
+            self.eta_elapsed_label.config(text=f"Elapsed: {self._format_elapsed_display(elapsed)}")
+            self.eta_countdown_label.config(text=f"ETA: {self._format_eta_display(eta_seconds)}")
+        except tk.TclError:
+            pass
+        self.eta_tick_id = self.root.after(1000, self._tick_eta_display)
+
+    def _start_eta_tick(self):
+        self._stop_eta_tick()
+        self.eta_tick_id = self.root.after(1000, self._tick_eta_display)
+
+    def _stop_eta_tick(self):
+        if self.eta_tick_id is not None:
+            try:
+                self.root.after_cancel(self.eta_tick_id)
+            except tk.TclError:
+                pass
+            self.eta_tick_id = None
 
     def save_project_state(self):
         if not self.current_project_dir:
@@ -10395,6 +11060,7 @@ class LTXQueueManager:
             widget.destroy()
         self.thumbnail_images.clear()
         self.video_checkbox_vars.clear()
+        self.gallery_video_cards.clear()
         final_files = self._get_gallery_video_files(self.final_mv_dir)
         stitched_files = self._get_gallery_video_files(self.stitched_dir)
         scene_files = self._get_gallery_video_files(self.scenes_dir)
@@ -10642,11 +11308,24 @@ class LTXQueueManager:
         delete_btn = tk.Button(btn_frame, text="Delete", fg="red", command=lambda p=video_path, t=thumb_path: self.delete_video(p, t))
         delete_btn.grid(row=0, column=1, sticky="ew", padx=(4, 0))
         self._style_button(delete_btn, "danger", compact=True)
-        
+        add_music_btn = None
         if show_add_music:
             add_music_btn = tk.Button(btn_frame, text="Add Music", command=lambda p=video_path, t=thumb_path: self.select_video_for_music(p, t))
             add_music_btn.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
             self._style_button(add_music_btn, "accent", compact=True)
+
+        self.gallery_video_cards[os.path.normcase(video_path)] = {
+            "frame": frame,
+            "thumbnail_button": btn,
+            "title_label": lbl,
+            "checkbox": chk,
+            "checkbox_var": var,
+            "add_music_btn": add_music_btn,
+            "open_folder_btn": open_folder_btn,
+            "delete_btn": delete_btn,
+            "thumb_path": thumb_path,
+            "video_path": video_path,
+        }
 
     def add_gallery_image_item(self, parent, image_path, title, image_asset=None, usage_map=None):
         frame = tk.Frame(parent, bd=0, relief=tk.FLAT)
@@ -10918,6 +11597,35 @@ class LTXQueueManager:
 
         self.root.after(0, apply_status)
 
+    def _set_tutorial_runtime_progress(self, phase, reset=False, **kwargs):
+        if not phase:
+            return
+
+        if reset or phase not in self.tutorial_runtime_progress:
+            progress_state = {"phase": phase, "started_at": time.time()}
+        else:
+            progress_state = dict(self.tutorial_runtime_progress.get(phase, {}))
+
+        progress_state.update(kwargs)
+        progress_state["phase"] = phase
+        progress_state["updated_at"] = time.time()
+        self.tutorial_runtime_progress[phase] = progress_state
+
+        stage = kwargs.get("stage")
+        current = progress_state.get("current", 0)
+        total = progress_state.get("total", 1)
+
+        if stage == "preparing" and reset:
+            self.root.after(0, lambda p=phase, t=total, c=current: self._show_eta_panel(p, t, c))
+        elif stage in ("submitting", "running", "item_complete", "complete", "failed"):
+            self.root.after(0, lambda p=phase, c=current, t=total, s=stage: self._update_eta_display(p, c, t, s))
+
+    def _clear_tutorial_runtime_progress(self, phase=None):
+        if phase is None:
+            self.tutorial_runtime_progress.clear()
+            return
+        self.tutorial_runtime_progress.pop(phase, None)
+
     def update_debug_prompt_status(self, prompt_text, current=None, total=None):
         if current is not None and total is not None:
             message = f"Debug: Queued Prompt ({current}/{total}): {prompt_text}"
@@ -10940,6 +11648,15 @@ class LTXQueueManager:
         thread.start()
 
     def process_stitching(self, filepaths, strip_audio):
+        self._set_tutorial_runtime_progress(
+            "stitch",
+            reset=True,
+            status="Preparing stitched render...",
+            current=0,
+            total=len(filepaths),
+            item_label="Selected clips",
+            stage="preparing",
+        )
         self.update_status("Stitching videos...", "blue")
         timestamp = int(time.time())
         list_file = f"concat_{timestamp}.txt"
@@ -10961,10 +11678,30 @@ class LTXQueueManager:
                 cmd.extend(['-c:a', 'copy'])
                 
             cmd.append(output_file)
+            self._set_tutorial_runtime_progress(
+                "stitch",
+                status=f"Stitching {len(filepaths)} selected clip{'s' if len(filepaths) != 1 else ''}...",
+                current=len(filepaths),
+                total=len(filepaths),
+                item_label="Selected clips",
+                stage="running",
+                output_path=output_file,
+            )
             
+            stitch_start = time.time()
             subprocess.run(cmd, creationflags=subprocess.CREATE_NO_WINDOW, capture_output=True, text=True, check=True)
+            self.record_tutorial_phase_timing("stitch", time.time() - stitch_start)
             
             self.update_status(f"Stitching Complete! Saved as {os.path.basename(output_file)}", "green")
+            self._set_tutorial_runtime_progress(
+                "stitch",
+                status=f"Stitching complete: {os.path.basename(output_file)}",
+                current=len(filepaths),
+                total=len(filepaths),
+                item_label="Selected clips",
+                stage="complete",
+                output_path=output_file,
+            )
             
             # Clear selection after successful stitch
             self.selected_videos.clear()
@@ -10973,10 +11710,13 @@ class LTXQueueManager:
             
         except FileNotFoundError:
             self.update_status("Error: FFmpeg not found. Please install FFmpeg or imageio-ffmpeg.", "red")
+            self._set_tutorial_runtime_progress("stitch", status="FFmpeg not found for stitching.", stage="failed")
         except subprocess.CalledProcessError as e:
             self.update_status(f"FFmpeg Error: {e.stderr}", "red")
+            self._set_tutorial_runtime_progress("stitch", status="FFmpeg reported a stitching error.", stage="failed", detail=e.stderr)
         except Exception as e:
             self.update_status(f"Stitching Error: {str(e)}", "red")
+            self._set_tutorial_runtime_progress("stitch", status=f"Stitching error: {str(e)}", stage="failed")
         finally:
             if os.path.exists(list_file):
                 try:
@@ -11025,17 +11765,24 @@ class LTXQueueManager:
             filename_prefix,
             video_settings
         )
-            
+
+        self._set_tutorial_runtime_progress("video_single", reset=True, status="Generating video clip...", current=0, total=1, item_label="Single clip", stage="preparing")
         prompt_id = self.queue_prompt(workflow_to_submit)
         if prompt_id:
             self.log_debug("SINGLE_PROMPT_QUEUED", prompt_id=prompt_id)
+            item_start = time.time()
+            self.eta_item_start_time = item_start
+            self._set_tutorial_runtime_progress("video_single", status="Rendering video clip...", current=1, total=1, item_label="Single clip", stage="submitting")
             success = self.wait_for_completion(prompt_id)
             if success:
+                self.record_tutorial_phase_timing("video_single", time.time() - item_start)
                 self.update_status("Single clip generated successfully!", "green")
                 self.log_debug("SINGLE_PROMPT_COMPLETE", prompt_id=prompt_id, success=True)
+                self._set_tutorial_runtime_progress("video_single", status="Single clip generated.", current=1, total=1, item_label="Single clip", stage="complete")
             else:
                 self.update_status("Failed to generate single clip.", "red")
                 self.log_debug("SINGLE_PROMPT_COMPLETE", prompt_id=prompt_id, success=False)
+                self._set_tutorial_runtime_progress("video_single", status="Single clip failed.", current=1, total=1, item_label="Single clip", stage="failed")
                 
         if hasattr(self, "run_queue_btn"):
             self.root.after(0, lambda: self.run_queue_btn.config(state=tk.NORMAL))
@@ -11072,11 +11819,28 @@ class LTXQueueManager:
 
     def run_queue(self, prompts_text, video_settings):
         total = len(prompts_text)
+        self._set_tutorial_runtime_progress(
+            "video_queue",
+            reset=True,
+            status="Preparing video queue...",
+            current=0,
+            total=total,
+            item_label="Prompt queue",
+            stage="preparing",
+        )
         
         for i, prompt_text in enumerate(prompts_text, start=1):
             self.update_status(f"Generating {i} of {total}...", "blue")
             self.update_debug_prompt_status(prompt_text, current=i, total=total)
             self.log_debug("QUEUE_ITEM_START", index=i, total=total, prompt_preview=self._truncate_text(prompt_text, 140))
+            self._set_tutorial_runtime_progress(
+                "video_queue",
+                status=f"Submitting video prompt {i} of {total}...",
+                current=i,
+                total=total,
+                item_label=f"Prompt {i}",
+                stage="submitting",
+            )
 
             filename_prefix = self._build_video_filename_prefix(video_settings, "queue", i)
 
@@ -11087,22 +11851,41 @@ class LTXQueueManager:
             )
                 
             # Send POST request
+            item_start = time.time()
+            self.eta_item_start_time = item_start
             prompt_id = self.queue_prompt(workflow_to_submit)
             if not prompt_id:
                 self.log_debug("QUEUE_ITEM_ABORTED", index=i, reason="queue_prompt_failed")
+                self._set_tutorial_runtime_progress("video_queue", status=f"Video prompt {i} failed to submit.", current=i, total=total, item_label=f"Prompt {i}", stage="failed")
                 break
             self.log_debug("QUEUE_ITEM_QUEUED", index=i, prompt_id=prompt_id)
                 
             # Polling Loop
-            success = self.wait_for_completion(prompt_id)
+            success = self.wait_for_completion(
+                prompt_id,
+                tutorial_progress_phase="video_queue",
+                tutorial_progress_current=i,
+                tutorial_progress_total=total,
+                tutorial_progress_label=f"Prompt {i}",
+            )
             if not success:
                 self.log_debug("QUEUE_ITEM_FAILED", index=i, prompt_id=prompt_id)
                 break
+            self.record_tutorial_phase_timing("video_queue", time.time() - item_start)
             self.log_debug("QUEUE_ITEM_COMPLETE", index=i, prompt_id=prompt_id)
+            self._set_tutorial_runtime_progress(
+                "video_queue",
+                status=f"Completed video prompt {i} of {total}.",
+                current=i,
+                total=total,
+                item_label=f"Prompt {i}",
+                stage="item_complete",
+            )
                 
         else:
             self.update_status("Finished all prompts!", "green")
             self.log_debug("QUEUE_COMPLETE", total=total)
+            self._set_tutorial_runtime_progress("video_queue", status="Finished all video prompts.", current=total, total=total, item_label="Prompt queue", stage="complete")
             
         if hasattr(self, "run_queue_btn"):
             self.root.after(0, lambda: self.run_queue_btn.config(state=tk.NORMAL))
@@ -11111,34 +11894,68 @@ class LTXQueueManager:
 
     def run_image_queue(self, prompts_text, image_settings=None):
         total = len(prompts_text)
+        self._set_tutorial_runtime_progress(
+            "image_generate",
+            reset=True,
+            status="Preparing image queue...",
+            current=0,
+            total=total,
+            item_label="Image queue",
+            stage="preparing",
+        )
 
         for i, prompt_text in enumerate(prompts_text, start=1):
             self.update_status(f"Generating image {i} of {total}...", "blue")
             self.update_debug_prompt_status(prompt_text, current=i, total=total)
             self.log_debug("IMAGE_QUEUE_ITEM_START", index=i, total=total, prompt_preview=self._truncate_text(prompt_text, 140))
+            self._set_tutorial_runtime_progress(
+                "image_generate",
+                status=f"Submitting image prompt {i} of {total}...",
+                current=i,
+                total=total,
+                item_label=f"Image {i}",
+                stage="submitting",
+            )
 
             filename_prefix = self._build_image_filename_prefix("queue", i)
             workflow_to_submit = self._build_image_workflow_for_prompt(prompt_text, filename_prefix, image_settings=image_settings)
 
+            item_start = time.time()
+            self.eta_item_start_time = item_start
             prompt_id = self.queue_prompt(workflow_to_submit)
             if not prompt_id:
                 self.log_debug("IMAGE_QUEUE_ITEM_ABORTED", index=i, reason="queue_prompt_failed")
+                self._set_tutorial_runtime_progress("image_generate", status=f"Image prompt {i} failed to submit.", current=i, total=total, item_label=f"Image {i}", stage="failed")
                 break
 
             success = self.wait_for_completion(
                 prompt_id,
                 output_kind="image",
                 destination_dir=self.generated_image_dir,
-                prompt_text=prompt_text
+                prompt_text=prompt_text,
+                tutorial_progress_phase="image_generate",
+                tutorial_progress_current=i,
+                tutorial_progress_total=total,
+                tutorial_progress_label=f"Image {i}",
             )
             if not success:
                 self.log_debug("IMAGE_QUEUE_ITEM_FAILED", index=i, prompt_id=prompt_id)
                 break
 
+            self.record_tutorial_phase_timing("image_generate", time.time() - item_start)
             self.log_debug("IMAGE_QUEUE_ITEM_COMPLETE", index=i, prompt_id=prompt_id)
+            self._set_tutorial_runtime_progress(
+                "image_generate",
+                status=f"Completed image {i} of {total}.",
+                current=i,
+                total=total,
+                item_label=f"Image {i}",
+                stage="item_complete",
+            )
         else:
             self.update_status("Finished all image prompts!", "green")
             self.log_debug("IMAGE_QUEUE_COMPLETE", total=total)
+            self._set_tutorial_runtime_progress("image_generate", status="Finished all image prompts.", current=total, total=total, item_label="Image queue", stage="complete")
 
     def run_single_image_prompt_thread(self, prompt_text, image_settings=None):
         self.update_status("Generating single image...", "blue")
@@ -11148,8 +11965,12 @@ class LTXQueueManager:
         filename_prefix = self._build_image_filename_prefix("single")
         workflow_to_submit = self._build_image_workflow_for_prompt(prompt_text, filename_prefix, image_settings=image_settings)
 
+        self._set_tutorial_runtime_progress("image_single", reset=True, status="Generating image...", current=0, total=1, item_label="Single image", stage="preparing")
         prompt_id = self.queue_prompt(workflow_to_submit)
         if prompt_id:
+            item_start = time.time()
+            self.eta_item_start_time = item_start
+            self._set_tutorial_runtime_progress("image_single", status="Rendering image...", current=1, total=1, item_label="Single image", stage="submitting")
             success = self.wait_for_completion(
                 prompt_id,
                 output_kind="image",
@@ -11157,11 +11978,14 @@ class LTXQueueManager:
                 prompt_text=prompt_text
             )
             if success:
+                self.record_tutorial_phase_timing("image_single", time.time() - item_start)
                 self.update_status("Single image generated successfully!", "green")
                 self.log_debug("SINGLE_IMAGE_PROMPT_COMPLETE", prompt_id=prompt_id, success=True)
+                self._set_tutorial_runtime_progress("image_single", status="Single image generated.", current=1, total=1, item_label="Single image", stage="complete")
             else:
                 self.update_status("Failed to generate single image.", "red")
                 self.log_debug("SINGLE_IMAGE_PROMPT_COMPLETE", prompt_id=prompt_id, success=False)
+                self._set_tutorial_runtime_progress("image_single", status="Single image failed.", current=1, total=1, item_label="Single image", stage="failed")
 
         self.root.after(0, lambda: self.run_image_queue_btn.config(state=tk.NORMAL))
         self.root.after(0, lambda: self.add_image_prompt_btn.config(state=tk.NORMAL))
@@ -11322,10 +12146,23 @@ class LTXQueueManager:
     def download_comfyui_video(self, filename, subfolder, folder_type, dest_path):
         return self.download_comfyui_media(filename, subfolder, folder_type, dest_path)
 
-    def wait_for_completion(self, prompt_id, is_music=False, output_kind=None, destination_dir=None, prompt_text=""):
+    def wait_for_completion(self, prompt_id, is_music=False, output_kind=None, destination_dir=None, prompt_text="", tutorial_progress_phase=None, tutorial_progress_current=None, tutorial_progress_total=None, tutorial_progress_label=""):
         resolved_output_kind = output_kind or ("audio" if is_music else "video")
         resolved_destination_dir = destination_dir or self._get_output_directory_for_kind(resolved_output_kind)
+        progress_label = tutorial_progress_label or resolved_output_kind.title()
+        progress_current = tutorial_progress_current if tutorial_progress_current is not None else 1
+        progress_total = tutorial_progress_total if tutorial_progress_total is not None else 1
         error_count = 0
+        if tutorial_progress_phase:
+            self._set_tutorial_runtime_progress(
+                tutorial_progress_phase,
+                status=f"Queued {progress_label} in ComfyUI...",
+                current=progress_current,
+                total=progress_total,
+                item_label=progress_label,
+                stage="queued",
+                prompt_id=prompt_id,
+            )
         while True:
             try:
                 # Check history
@@ -11339,6 +12176,16 @@ class LTXQueueManager:
                         continue
                     if prompt_id in history:
                         self.log_debug("PROMPT_HISTORY_FOUND", prompt_id=prompt_id, is_music=is_music, output_kind=resolved_output_kind)
+                        if tutorial_progress_phase:
+                            self._set_tutorial_runtime_progress(
+                                tutorial_progress_phase,
+                                status=f"Downloading {progress_label} output...",
+                                current=progress_current,
+                                total=progress_total,
+                                item_label=progress_label,
+                                stage="downloading",
+                                prompt_id=prompt_id,
+                            )
                         # Extract output filename and download
                         try:
                             outputs = history[prompt_id].get('outputs', {})
@@ -11372,6 +12219,16 @@ class LTXQueueManager:
                         except Exception as e:
                             print(f"Error parsing history for output: {e}")
                             self.log_debug("PROMPT_HISTORY_PARSE_ERROR", prompt_id=prompt_id, details=str(e))
+                        if tutorial_progress_phase:
+                            self._set_tutorial_runtime_progress(
+                                tutorial_progress_phase,
+                                status=f"{progress_label} complete.",
+                                current=progress_current,
+                                total=progress_total,
+                                item_label=progress_label,
+                                stage="complete",
+                                prompt_id=prompt_id,
+                            )
                         return True
                 
                 # Check queue
@@ -11387,13 +12244,27 @@ class LTXQueueManager:
                     # queue_data has "queue_running" and "queue_pending"
                     # Each is a list of items, where item[1] is the prompt_id
                     in_queue = False
+                    queue_stage = None
                     for q_list in [queue_data.get("queue_running", []), queue_data.get("queue_pending", [])]:
                         for item in q_list:
                             if item[1] == prompt_id:
                                 in_queue = True
+                                queue_stage = "running" if q_list is queue_data.get("queue_running", []) else "pending"
                                 break
                         if in_queue:
                             break
+
+                    if in_queue and tutorial_progress_phase:
+                        queue_status = "Running in ComfyUI..." if queue_stage == "running" else "Waiting in ComfyUI queue..."
+                        self._set_tutorial_runtime_progress(
+                            tutorial_progress_phase,
+                            status=f"{progress_label}: {queue_status}",
+                            current=progress_current,
+                            total=progress_total,
+                            item_label=progress_label,
+                            stage=queue_stage,
+                            prompt_id=prompt_id,
+                        )
                             
                     if not in_queue:
                         # Final race-condition check
@@ -11403,6 +12274,16 @@ class LTXQueueManager:
                                 history_check = json.loads(response.read())
                                 if prompt_id in history_check:
                                     self.log_debug("PROMPT_HISTORY_FOUND_FINAL_CHECK", prompt_id=prompt_id)
+                                    if tutorial_progress_phase:
+                                        self._set_tutorial_runtime_progress(
+                                            tutorial_progress_phase,
+                                            status=f"{progress_label} complete.",
+                                            current=progress_current,
+                                            total=progress_total,
+                                            item_label=progress_label,
+                                            stage="complete",
+                                            prompt_id=prompt_id,
+                                        )
                                     return True
                             except json.JSONDecodeError:
                                 pass
@@ -11410,6 +12291,16 @@ class LTXQueueManager:
                         self.update_status(f"Error: Prompt {prompt_id} failed or was cancelled in ComfyUI", "red")
                         self.update_music_status(f"Error: Prompt {prompt_id} failed or was cancelled in ComfyUI", "red")
                         self.log_debug("PROMPT_FAILED_OR_CANCELLED", prompt_id=prompt_id)
+                        if tutorial_progress_phase:
+                            self._set_tutorial_runtime_progress(
+                                tutorial_progress_phase,
+                                status=f"{progress_label} failed or was cancelled in ComfyUI.",
+                                current=progress_current,
+                                total=progress_total,
+                                item_label=progress_label,
+                                stage="failed",
+                                prompt_id=prompt_id,
+                            )
                         return False
 
             except urllib.error.URLError as e:
@@ -11417,22 +12308,30 @@ class LTXQueueManager:
                 if error_count >= 10:
                     self.update_status("Fatal Error: Server unresponsive. Aborting.", "red")
                     self.update_music_status("Fatal Error: Server unresponsive. Aborting.", "red")
+                    if tutorial_progress_phase:
+                        self._set_tutorial_runtime_progress(tutorial_progress_phase, status=f"{progress_label} aborted: ComfyUI became unresponsive.", current=progress_current, total=progress_total, item_label=progress_label, stage="failed", prompt_id=prompt_id)
                     return False
                 # Don't abort on timeouts or temporary connection refusals under heavy GPU load
                 error_reason = getattr(e, 'reason', str(e))
                 self.update_status(f"Server busy or timeout ({error_reason}). Waiting...", "orange")
                 self.update_music_status(f"Server busy or timeout ({error_reason}). Waiting...", "orange")
                 self.log_debug("PROMPT_POLL_RETRY", prompt_id=prompt_id, error=str(error_reason), error_count=error_count)
+                if tutorial_progress_phase:
+                    self._set_tutorial_runtime_progress(tutorial_progress_phase, status=f"{progress_label}: waiting for ComfyUI ({error_reason}).", current=progress_current, total=progress_total, item_label=progress_label, stage="retrying", prompt_id=prompt_id)
                 pass # Let it fall through to time.sleep(3) and try again
             except Exception as e:
                 error_count += 1
                 if error_count >= 10:
                     self.update_status("Fatal Error: Server unresponsive. Aborting.", "red")
                     self.update_music_status("Fatal Error: Server unresponsive. Aborting.", "red")
+                    if tutorial_progress_phase:
+                        self._set_tutorial_runtime_progress(tutorial_progress_phase, status=f"{progress_label} aborted after repeated polling errors.", current=progress_current, total=progress_total, item_label=progress_label, stage="failed", prompt_id=prompt_id)
                     return False
                 self.update_status(f"Polling error: {str(e)}. Retrying...", "orange")
                 self.update_music_status(f"Polling error: {str(e)}. Retrying...", "orange")
                 self.log_debug("PROMPT_POLL_EXCEPTION", prompt_id=prompt_id, error=str(e), error_count=error_count)
+                if tutorial_progress_phase:
+                    self._set_tutorial_runtime_progress(tutorial_progress_phase, status=f"{progress_label}: polling retry after error.", current=progress_current, total=progress_total, item_label=progress_label, stage="retrying", prompt_id=prompt_id, detail=str(e))
                 pass # Let it fall through to time.sleep(3) and try again
                 
             time.sleep(3)
@@ -11463,6 +12362,15 @@ class LTXQueueManager:
         thread.start()
 
     def run_music_generation(self, tags, lyrics):
+        self._set_tutorial_runtime_progress(
+            "music_generate",
+            reset=True,
+            status="Preparing music workflow...",
+            current=0,
+            total=1,
+            item_label="Soundtrack",
+            stage="preparing",
+        )
         self.update_music_status("Generating Music...", "blue")
         
         try:
@@ -11492,25 +12400,40 @@ class LTXQueueManager:
             self.music_workflow["98"]["inputs"]["seconds"] = self.music_duration_var.get()
             self.music_workflow["107"]["inputs"]["filename_prefix"] = f"ACE_Music_{int(time.time())}"
             self.music_workflow["107"]["inputs"]["quality"] = self.music_quality_var.get()
+            self._set_tutorial_runtime_progress("music_generate", status="Submitting soundtrack workflow to ComfyUI...", current=1, total=1, item_label="Soundtrack", stage="submitting")
         except KeyError as e:
             self.update_music_status(f"Error: Missing node in JSON ({e})", "red")
+            self._set_tutorial_runtime_progress("music_generate", status=f"Music workflow is missing node {e}.", current=1, total=1, item_label="Soundtrack", stage="failed")
             self.root.after(0, lambda: self.gen_music_btn.config(state=tk.NORMAL))
             return
             
         prompt_id = self.queue_prompt(self.music_workflow)
         if not prompt_id:
+            self._set_tutorial_runtime_progress("music_generate", status="Failed to submit soundtrack workflow.", current=1, total=1, item_label="Soundtrack", stage="failed")
             self.root.after(0, lambda: self.gen_music_btn.config(state=tk.NORMAL))
             return
-            
-        success = self.wait_for_completion(prompt_id, is_music=True)
+
+        item_start = time.time()
+        self.eta_item_start_time = item_start
+        success = self.wait_for_completion(
+            prompt_id,
+            is_music=True,
+            tutorial_progress_phase="music_generate",
+            tutorial_progress_current=1,
+            tutorial_progress_total=1,
+            tutorial_progress_label="Soundtrack",
+        )
         
         if success and self.current_generated_audio:
+            self.record_tutorial_phase_timing("music_generate", time.time() - item_start)
             self.update_music_status("Music Generation Complete! Ready to preview or merge.", "green")
+            self._set_tutorial_runtime_progress("music_generate", status="Soundtrack generation complete.", current=1, total=1, item_label="Soundtrack", stage="complete", output_path=self.current_generated_audio)
             self.root.after(0, lambda: self.preview_music_btn.config(state=tk.NORMAL))
             self.root.after(0, lambda: self.merge_music_btn.config(state=tk.NORMAL))
             self.root.after(0, self._refresh_music_sidebar_state)
         else:
             self.update_music_status("Music Generation Failed.", "red")
+            self._set_tutorial_runtime_progress("music_generate", status="Soundtrack generation failed.", current=1, total=1, item_label="Soundtrack", stage="failed")
             self.root.after(0, self._refresh_music_sidebar_state)
             
         self.root.after(0, lambda: self.gen_music_btn.config(state=tk.NORMAL))
@@ -11541,6 +12464,15 @@ class LTXQueueManager:
         thread.start()
 
     def process_merge(self):
+        self._set_tutorial_runtime_progress(
+            "merge",
+            reset=True,
+            status="Preparing final audio and video merge...",
+            current=0,
+            total=1,
+            item_label="Final video",
+            stage="preparing",
+        )
         self.update_music_status("Merging Audio and Video...", "blue")
         timestamp = int(time.time())
         output_file = os.path.join(self.final_mv_dir, f"Final_Music_Video_{timestamp}.mp4")
@@ -11559,21 +12491,28 @@ class LTXQueueManager:
                 '-c:v', 'copy', '-c:a', 'aac', 
                 '-shortest', output_file
             ]
+            self._set_tutorial_runtime_progress("merge", status="Running FFmpeg final merge...", current=1, total=1, item_label="Final video", stage="running", output_path=output_file)
             
+            merge_start = time.time()
             subprocess.run(cmd, creationflags=subprocess.CREATE_NO_WINDOW, capture_output=True, text=True, check=True)
+            self.record_tutorial_phase_timing("merge", time.time() - merge_start)
             
             self.current_final_video = output_file
             self.update_music_status(f"Merge Complete! Saved as {os.path.basename(output_file)}", "green")
+            self._set_tutorial_runtime_progress("merge", status=f"Final merge complete: {os.path.basename(output_file)}", current=1, total=1, item_label="Final video", stage="complete", output_path=output_file)
             self.root.after(0, self.refresh_gallery)
             self.root.after(0, lambda: self.preview_final_btn.config(state=tk.NORMAL))
             self.root.after(0, self._refresh_music_sidebar_state)
             
         except FileNotFoundError:
             self.update_music_status("Error: FFmpeg not found.", "red")
+            self._set_tutorial_runtime_progress("merge", status="FFmpeg not found for final merge.", current=1, total=1, item_label="Final video", stage="failed")
         except subprocess.CalledProcessError as e:
             self.update_music_status(f"FFmpeg Error: {e.stderr}", "red")
+            self._set_tutorial_runtime_progress("merge", status="FFmpeg reported a final merge error.", current=1, total=1, item_label="Final video", stage="failed", detail=e.stderr)
         except Exception as e:
             self.update_music_status(f"Merge Error: {str(e)}", "red")
+            self._set_tutorial_runtime_progress("merge", status=f"Final merge error: {str(e)}", current=1, total=1, item_label="Final video", stage="failed")
         finally:
             self.root.after(0, lambda: self.merge_music_btn.config(state=tk.NORMAL))
             self.root.after(0, lambda: self.gen_music_btn.config(state=tk.NORMAL))
