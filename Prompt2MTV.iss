@@ -1,5 +1,5 @@
 #define MyAppName "Prompt2MTV"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.2.0"
 #define MyAppPublisher "Prompt2MTV"
 #define MyAppTagline "Local AI Music Video Studio"
 #define MyAppURL "https://buymeacoffee.com/rorrimaesu"
@@ -39,12 +39,17 @@ VersionInfoProductName={#MyAppName}
 VersionInfoProductVersion={#MyAppVersion}
 VersionInfoTextVersion={#MyAppVersion}
 WizardImageStretch=no
+CloseApplications=yes
+RestartApplications=no
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
+Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"
+
+[InstallDelete]
+Type: filesandordirs; Name: "{app}\*"
 
 [Files]
 Source: "{#MyAppDistDir}\*"; DestDir: "{app}"; Excludes: "_internal\\bundled_models\\*"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -61,3 +66,30 @@ WelcomeLabel1=Welcome to the [name] Setup Wizard
 WelcomeLabel2=This installer sets up Prompt2MTV, a local AI music video studio for ComfyUI-based scene generation, music generation, and final merge workflows.
 FinishedHeadingLabel=Prompt2MTV setup is complete
 FinishedLabel=Prompt2MTV has been installed successfully. Launch it now to review runtime paths and confirm your local ComfyUI environment.
+
+[Code]
+function GetUninstallString(): String;
+var
+  sUnInstPath: String;
+  sUnInstallString: String;
+begin
+  sUnInstPath := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{8F6A8C07-EB70-4F5E-AF2F-0C7AA0F11CF1}_is1';
+  sUnInstallString := '';
+  if not RegQueryStringValue(HKLM, sUnInstPath, 'UninstallString', sUnInstallString) then
+    RegQueryStringValue(HKCU, sUnInstPath, 'UninstallString', sUnInstallString);
+  Result := sUnInstallString;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  sUnInstallString: String;
+  iResultCode: Integer;
+begin
+  Result := '';
+  sUnInstallString := GetUninstallString();
+  if sUnInstallString <> '' then
+  begin
+    sUnInstallString := RemoveQuotes(sUnInstallString);
+    Exec(sUnInstallString, '/VERYSILENT /NORESTART /SUPPRESSMSGBOXES', '', SW_HIDE, ewWaitUntilTerminated, iResultCode);
+  end;
+end;

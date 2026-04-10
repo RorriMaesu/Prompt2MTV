@@ -7,8 +7,8 @@
 ## What It Does
 
 - **AI Video** — Generate scenes with LTX 2.3 (text-to-video and image-to-video)
-- **AI Music** — Compose original tracks with ACE-Step 1.5
-- **AI Chatbot** — Plan and refine scene prompts with a local Qwen 3 or Gemma 4 assistant
+- **AI Music** — Compose original tracks with ACE-Step 1.5-XL (Turbo or SFT variants)
+- **AI Chatbot** — Plan and refine scene prompts, brainstorm song concepts, and generate structured lyrics with a local Qwen 3 or Gemma 4 assistant
 - **One-click merge** — Stitch clips, sync audio, and export final music videos
 - **Project management** — Batch prompt queue, media gallery, drag-and-drop import, per-project settings
 
@@ -41,7 +41,7 @@ If ComfyUI is in a non-default location, use **Project → Configure Runtime Pat
 ## Workflow
 
 1. Create or open a project
-2. *(Optional)* Use the AI chatbot to brainstorm and structure scene prompts
+2. *(Optional)* Use the AI chatbot to brainstorm and structure scene prompts or song lyrics
 3. Add prompts to the batch queue
 4. Generate video scenes through ComfyUI
 5. Review clips in the gallery (or import your own)
@@ -49,7 +49,7 @@ If ComfyUI is in a non-default location, use **Project → Configure Runtime Pat
 7. Generate a music track with ACE-Step (or import your own audio)
 8. Merge audio and video into the final music video
 
-## Required Models (~57 GB)
+## Required Models (~62 GB)
 
 Prompt2MTV detects missing models on startup and can download them for you. Here's what the workflows need:
 
@@ -59,10 +59,13 @@ Prompt2MTV detects missing models on startup and can download them for you. Here
 | Video | `gemma_3_12B_it_fp4_mixed.safetensors` | 9.4 GB |
 | Video | `ltx-2.3-22b-distilled-lora-384.safetensors` | 7.6 GB |
 | Video | `ltx-2.3-spatial-upscaler-x2-1.0.safetensors` | 1.0 GB |
-| Music | `acestep_v1.5_turbo.safetensors` | 4.8 GB |
+| Music | `acestep_v1.5_xl_turbo_bf16.safetensors` | 10.0 GB |
+| Music | `acestep_v1.5_xl_sft_bf16.safetensors` | 10.0 GB |
 | Music | `qwen_1.7b_ace15.safetensors` | 3.7 GB |
 | Music | `qwen_0.6b_ace15.safetensors` | 1.2 GB |
 | Music | `ace_1.5_vae.safetensors` | 0.3 GB |
+
+The XL music models are selectable via the **Music Model** dropdown on the Music tab. You only need to download the variant(s) you plan to use — XL Turbo (fast, 8 steps) or XL SFT (best quality, 50 steps). The installer will let you choose which to download.
 
 See `model_manifest.json` for download URLs and checksums.
 
@@ -111,7 +114,7 @@ python ltx_queue_manager.py
 
 ```powershell
 .\build_exe.bat              # → dist\Prompt2MTV\Prompt2MTV.exe
-.\build_installer.bat        # → dist_installer\Prompt2MTV-Setup-1.0.0.exe
+.\build_installer.bat        # → dist_installer\Prompt2MTV-Setup-1.2.0.exe
 ```
 
 ### Upgrade helper
@@ -140,4 +143,5 @@ Closes any running instance, uninstalls the previous version, reinstalls from th
 - **Node ID fragility** — Workflows use hardcoded node IDs. Editing them in the ComfyUI graph editor may renumber IDs and break the payload mapper.
 - **Process management** — ComfyUI runs as a subprocess. Force-killing the app can leave zombie processes holding port 8188.
 - **VRAM contention** — Video and music generation share one ComfyUI instance. Running both concurrently will OOM. The queue enforces single-job execution.
+- **XL music models** — ACE-Step 1.5-XL models require ≥12 GB VRAM (≥20 GB recommended). A warning label is shown in the Music tab.
 - **Variable framerate** — ComfyUI outputs can drift to VFR. The stitcher normalizes with `-vsync 1 -r 24` to maintain audio sync.

@@ -103,15 +103,15 @@
             ]
         },
         {
-            "id": "music_unet",
+            "id": "music_unet_turbo",
             "workflow": "music",
-            "label": "Music UNet",
+            "label": "Music DiT Turbo",
+            "variant_group": "music_dit",
             "source_name": "Hugging Face",
             "source_page_url": "https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files",
             "filename": "acestep_v1.5_turbo.safetensors",
             "dest_subdir": "diffusion_models",
-            "size_bytes": 4787825604,
-            "sha256": "3f6e0797fad420a39bd33979eb6e840e30989e34a3794e843d23b60ec6e422d7",
+            "size_bytes": 5145583616,
             "node_refs": [
                 {
                     "node_id": "104",
@@ -122,6 +122,50 @@
                 {
                     "type": "download",
                     "url": "https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/diffusion_models/acestep_v1.5_turbo.safetensors"
+                }
+            ]
+        },
+        {
+            "id": "music_unet_xl_turbo",
+            "workflow": "music",
+            "label": "Music DiT XL Turbo",
+            "variant_group": "music_dit",
+            "source_name": "Hugging Face",
+            "source_page_url": "https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files",
+            "filename": "acestep_v1.5_xl_turbo_bf16.safetensors",
+            "dest_subdir": "diffusion_models",
+            "node_refs": [
+                {
+                    "node_id": "104",
+                    "input": "unet_name"
+                }
+            ],
+            "sources": [
+                {
+                    "type": "download",
+                    "url": "https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/diffusion_models/acestep_v1.5_xl_turbo_bf16.safetensors"
+                }
+            ]
+        },
+        {
+            "id": "music_unet_xl_sft",
+            "workflow": "music",
+            "label": "Music DiT XL SFT",
+            "variant_group": "music_dit",
+            "source_name": "Hugging Face",
+            "source_page_url": "https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files",
+            "filename": "acestep_v1.5_xl_sft_bf16.safetensors",
+            "dest_subdir": "diffusion_models",
+            "node_refs": [
+                {
+                    "node_id": "104",
+                    "input": "unet_name"
+                }
+            ],
+            "sources": [
+                {
+                    "type": "download",
+                    "url": "https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/diffusion_models/acestep_v1.5_xl_sft_bf16.safetensors"
                 }
             ]
         },

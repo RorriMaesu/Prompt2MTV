@@ -19,6 +19,12 @@ import uuid
 from datetime import datetime
 from PIL import Image, ImageTk
 import ttkbootstrap as tb
+try:
+    import websocket as _ws_mod
+    WS_AVAILABLE = True
+except ImportError:
+    _ws_mod = None
+    WS_AVAILABLE = False
 from model_downloader import DownloadCancelledError, calculate_sha256, download_file, probe_download_size
 
 try:
@@ -112,6 +118,34 @@ MUSIC_LANGUAGE_OPTIONS = [
 ]
 MUSIC_TIME_SIGNATURE_OPTIONS = ["2", "3", "4", "6"]
 MUSIC_MP3_QUALITY_OPTIONS = [f"V{i}" for i in range(10)]
+MUSIC_MODEL_VARIANT_OPTIONS = ["Turbo (fast, 8 steps)", "XL Turbo (fast, 8 steps)", "XL SFT (best quality, 50 steps)"]
+MUSIC_MODEL_VARIANT_MAP = {
+    "Turbo (fast, 8 steps)": {"filename": "acestep_v1.5_turbo.safetensors", "steps": 8, "manifest_id": "music_unet_turbo", "backend": "comfyui"},
+    "XL Turbo (fast, 8 steps)": {"filename": "acestep_v1.5_xl_turbo_bf16.safetensors", "steps": 8, "manifest_id": "music_unet_xl_turbo", "backend": "acestep_api", "api_model_id": "acestep-v15-xl-turbo"},
+    "XL SFT (best quality, 50 steps)": {"filename": "acestep_v1.5_xl_sft_bf16.safetensors", "steps": 50, "manifest_id": "music_unet_xl_sft", "backend": "acestep_api", "api_model_id": "acestep-v15-xl-sft"},
+}
+MUSIC_MODEL_VARIANT_DEFAULT = "Turbo (fast, 8 steps)"
+ACESTEP_API_URL = "http://127.0.0.1:8001"
+ACESTEP_API_POLL_INTERVAL = 2  # seconds between polling for XL generation results
+ACESTEP_API_TIMEOUT = 1800  # max seconds to wait for XL generation (first run downloads ~20GB of models)
+XL_PHASE_SUBMIT_COLD = "xl_submit_cold"
+XL_PHASE_SUBMIT_WARM = "xl_submit_warm"
+XL_PHASE_GENERATION = "xl_generation"
+XL_PHASE_DOWNLOAD = "xl_download"
+XL_COLD_START_DEFAULT_SECONDS = 420  # 7 min fallback for first cold start
+XL_WARM_SUBMIT_DEFAULT_SECONDS = 5
+XL_GENERATION_DEFAULT_SECONDS = 15
+XL_DOWNLOAD_DEFAULT_SECONDS = 3
+CHATBOT_PHASE_CHAT_COLD = "chatbot_chat_cold"
+CHATBOT_PHASE_CHAT_WARM = "chatbot_chat_warm"
+CHATBOT_PHASE_SCENE_PLAN_COLD = "chatbot_scene_plan_cold"
+CHATBOT_PHASE_SCENE_PLAN_WARM = "chatbot_scene_plan_warm"
+CHATBOT_PHASE_T2I_OPTIMIZE_COLD = "chatbot_t2i_optimize_cold"
+CHATBOT_PHASE_T2I_OPTIMIZE_WARM = "chatbot_t2i_optimize_warm"
+CHATBOT_PHASE_SONG_FINALIZE_COLD = "chatbot_song_finalize_cold"
+CHATBOT_PHASE_SONG_FINALIZE_WARM = "chatbot_song_finalize_warm"
+CHATBOT_COLD_START_DEFAULT_SECONDS = 45
+CHATBOT_WARM_DEFAULT_SECONDS = 10
 PERSISTED_MUSIC_SECTION_KEYS = [
     "music_prompt",
     "music_lyrics",
@@ -126,7 +160,7 @@ WINDOWS_HIDE = 0
 WINDOWS_SHOW = 5
 WINDOWS_RESTORE = 9
 APP_NAME = "Prompt2MTV"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.2.0"
 APP_PUBLISHER = "Prompt2MTV"
 APP_TAGLINE = "Local AI Music Video Studio"
 ENV_COMFYUI_ROOT_KEYS = ("PROMPT2MTV_COMFYUI_ROOT", "COMFYUI_ROOT")
@@ -147,7 +181,7 @@ CHATBOT_MODEL_URL = "https://huggingface.co/bartowski/Qwen_Qwen3-14B-GGUF/resolv
 CHATBOT_MODEL_SOURCE_PAGE = "https://huggingface.co/bartowski/Qwen_Qwen3-14B-GGUF"
 DEFAULT_CHATBOT_SERVER_URL = "http://127.0.0.1:8080"
 DEFAULT_OLLAMA_SERVER_URL = "http://127.0.0.1:11434"
-DEFAULT_CHATBOT_CONTEXT_SIZE = 8192
+DEFAULT_CHATBOT_CONTEXT_SIZE = 16384
 DEFAULT_CHATBOT_REQUEST_TIMEOUT = 120
 DEFAULT_CHATBOT_TEMPERATURE = 0.7
 DEFAULT_CHATBOT_TOP_P = 0.8
@@ -172,10 +206,19 @@ PHASE_DISPLAY_NAMES = {
     "image_single": "Generating Image",
     "image_generate": "Running Image Queue",
     "music_generate": "Generating Soundtrack",
+    "music_generate_xl": "Generating Soundtrack (XL)",
     "merge": "Merging Audio & Video",
     "stitch": "Stitching Videos",
     "chatbot_chat": "Chatbot Responding",
     "chatbot_task": "Generating Prompt Draft",
+    "chatbot_chat_cold": "Chatbot Responding (loading model)",
+    "chatbot_chat_warm": "Chatbot Responding",
+    "chatbot_scene_plan_cold": "Planning Scenes (loading model)",
+    "chatbot_scene_plan_warm": "Planning Scenes",
+    "chatbot_t2i_optimize_cold": "Generating Prompt Draft (loading model)",
+    "chatbot_t2i_optimize_warm": "Generating Prompt Draft",
+    "chatbot_song_finalize_cold": "Finalizing Song (loading model)",
+    "chatbot_song_finalize_warm": "Finalizing Song",
 }
 CHATBOT_BACKEND_MODE_CONNECT = "connect"
 CHATBOT_BACKEND_MODE_MANAGED = "managed"
@@ -183,6 +226,7 @@ CHATBOT_BACKEND_MODE_OLLAMA = "ollama"
 CHATBOT_TASK_CHAT = "Chat / Explore"
 CHATBOT_TASK_T2I_OPTIMIZE = "Optimize Image Prompt (T2I)"
 CHATBOT_TASK_SCENE_PLAN = "Plan Scenes"
+CHATBOT_TASK_SONG_BRAINSTORM = "Brainstorm Song (Lyrics & Style)"
 BUNDLED_MODEL_DIR = "bundled_models"
 MODEL_SUBDIRECTORIES = {
     "checkpoint_name": "checkpoints",
@@ -408,6 +452,7 @@ class LTXQueueManager:
         self.chatbot_server_process = None
         self.chatbot_server_managed_by_app = False
         self.chatbot_server_command = []
+        self.chatbot_model_warm = False
         self.chatbot_state = self._create_empty_chatbot_state()
         self.chatbot_last_result = None
         self.chatbot_result_history = []
@@ -423,6 +468,17 @@ class LTXQueueManager:
         self.eta_item_start_time = None
         self.eta_phase_start_time = None
         self.eta_tick_id = None
+        self.comfyui_client_id = str(uuid.uuid4())
+        self.ws_progress = {"step": 0, "total": 0, "active": False}
+        self.ws_thread = None
+        self.eta_variant_timing_key = None
+        self.acestep_api_process = None
+        self.acestep_api_healthy = False
+        self.acestep_model_loaded = False
+        self.xl_gen_phase = None
+        self.xl_gen_phase_start = None
+        self.xl_gen_progress = 0.0
+        self.xl_gen_stage_text = ""
         
         # Setup base output directory
         self.base_output_dir = self._get_default_output_dir()
@@ -781,6 +837,7 @@ class LTXQueueManager:
             self.chatbot_server_process = None
             self.chatbot_server_managed_by_app = False
             self.chatbot_server_command = []
+            self.chatbot_model_warm = False
 
     def _start_managed_chatbot_server(self):
         if self._is_chatbot_server_process_running():
@@ -1038,6 +1095,7 @@ class LTXQueueManager:
             CHATBOT_TASK_CHAT,
             CHATBOT_TASK_SCENE_PLAN,
             CHATBOT_TASK_T2I_OPTIMIZE,
+            CHATBOT_TASK_SONG_BRAINSTORM,
         ]
 
     def _get_selected_chatbot_task(self):
@@ -1054,6 +1112,8 @@ class LTXQueueManager:
             return "Use this mode when you want the assistant to turn the current direction into a scene-by-scene draft you can review and apply to the timeline."
         if task_label == CHATBOT_TASK_T2I_OPTIMIZE:
             return "Use this mode when the creative direction is clear enough to turn into a tighter production-ready image prompt for the image queue."
+        if task_label == CHATBOT_TASK_SONG_BRAINSTORM:
+            return "Brainstorm song lyrics, hooks, and style tags with the assistant. Chat back and forth to refine ideas, then Finalize to send lyrics and style to the Music tab."
         return "Select a task to see its generation workflow."
 
     def _get_chatbot_task_briefing_hint(self, task_name=None):
@@ -1073,6 +1133,11 @@ class LTXQueueManager:
                 "Summarize the strongest direction, subject, mood, composition, lighting, and style choices. "
                 "The assistant will convert that into a more production-ready image prompt."
             )
+        if task_label == CHATBOT_TASK_SONG_BRAINSTORM:
+            return (
+                "Describe the mood, genre, theme, or concept for your song. "
+                "Chat naturally to brainstorm lyrics, hooks, and style ideas, then click Finalize Song when ready."
+            )
         return "Describe what you want the chatbot to generate."
 
     def _get_chatbot_task_output_hint(self, task_name=None):
@@ -1083,6 +1148,8 @@ class LTXQueueManager:
             return "Scene plans appear here as reusable assistant artifacts. Review the breakdown, compare saved drafts, then apply the plan to the Scene Timeline when it is ready."
         if task_label == CHATBOT_TASK_T2I_OPTIMIZE:
             return "Prompt drafts appear here as reusable assistant artifacts. Review the wording, copy it, or send it straight to the Image Phase queue when it is ready."
+        if task_label == CHATBOT_TASK_SONG_BRAINSTORM:
+            return "Chat to brainstorm lyrics and style ideas. When happy, click Finalize Song to produce sendable lyrics and style tags, then Send to Music Tab."
         return "Assistant replies and generated results appear here."
 
     def _get_chatbot_task_primary_action_copy(self, task_name=None):
@@ -1091,6 +1158,8 @@ class LTXQueueManager:
             return "Primary action: Plan Scenes"
         if task_label == CHATBOT_TASK_T2I_OPTIMIZE:
             return "Primary action: Generate Prompt Draft"
+        if task_label == CHATBOT_TASK_SONG_BRAINSTORM:
+            return "Primary action: Send  |  Finalize Song when ready"
         return "Primary action: Send"
 
     def _get_chatbot_empty_state_heading(self, task_name=None):
@@ -1099,6 +1168,8 @@ class LTXQueueManager:
             return "Scene planning starts here"
         if task_label == CHATBOT_TASK_T2I_OPTIMIZE:
             return "Prompt drafting starts here"
+        if task_label == CHATBOT_TASK_SONG_BRAINSTORM:
+            return "Song brainstorming starts here"
         return "Conversation starts here"
 
     def _get_chatbot_empty_state_text(self, task_name=None):
@@ -1107,6 +1178,8 @@ class LTXQueueManager:
             return "Describe the concept, flow, and must-hit beats, then use Plan Scenes when you want a first scene breakdown."
         if task_label == CHATBOT_TASK_T2I_OPTIMIZE:
             return "Summarize the strongest visual direction here, then use Generate Prompt Draft when you want a tighter image prompt."
+        if task_label == CHATBOT_TASK_SONG_BRAINSTORM:
+            return "Describe your song concept, mood, or genre and start chatting. The assistant will help brainstorm lyrics and style ideas. Click Finalize Song when you are happy."
         return "Start a conversation here. Explore the idea naturally before you ask for a structured plan or prompt draft."
 
     def _get_chatbot_idle_status_text(self, task_name=None):
@@ -1115,6 +1188,8 @@ class LTXQueueManager:
             return "No scene plan yet. Describe the creative direction, then use Plan Scenes when you want a structured breakdown."
         if task_label == CHATBOT_TASK_T2I_OPTIMIZE:
             return "No prompt draft yet. Define the strongest visual direction, then use Generate Prompt Draft when you want structured output."
+        if task_label == CHATBOT_TASK_SONG_BRAINSTORM:
+            return "No song draft yet. Chat about your song concept to brainstorm lyrics and style, then use Finalize Song when the direction feels strong."
         return "No reply yet. Start chatting, then switch modes when you want a structured plan or prompt draft."
     
     def _get_chatbot_focus_section_meta(self):
@@ -1138,9 +1213,11 @@ class LTXQueueManager:
         if hasattr(self, "chatbot_mode_summary_label"):
             self.chatbot_mode_summary_label.config(text=self._get_chatbot_task_primary_action_copy(selected_task))
 
-        send_variant = "primary" if selected_task == CHATBOT_TASK_CHAT else "secondary"
+        send_variant = "primary" if selected_task in (CHATBOT_TASK_CHAT, CHATBOT_TASK_SONG_BRAINSTORM) else "secondary"
         scene_variant = "primary" if selected_task == CHATBOT_TASK_SCENE_PLAN else "secondary"
         generate_variant = "primary" if selected_task == CHATBOT_TASK_T2I_OPTIMIZE else "accent"
+        finalize_song_variant = "primary" if selected_task == CHATBOT_TASK_SONG_BRAINSTORM else "secondary"
+        apply_music_variant = "success" if selected_task == CHATBOT_TASK_SONG_BRAINSTORM else "secondary"
 
         if hasattr(self, "chatbot_send_btn"):
             self._style_button(self.chatbot_send_btn, send_variant)
@@ -1148,8 +1225,12 @@ class LTXQueueManager:
             self._style_button(self.chatbot_scene_plan_btn, scene_variant)
         if hasattr(self, "chatbot_generate_btn"):
             self._style_button(self.chatbot_generate_btn, generate_variant)
+        if hasattr(self, "chatbot_finalize_song_btn"):
+            self._style_button(self.chatbot_finalize_song_btn, finalize_song_variant)
         if hasattr(self, "chatbot_new_chat_btn"):
             self._style_button(self.chatbot_new_chat_btn, "ghost")
+        if hasattr(self, "chatbot_clear_chat_btn"):
+            self._style_button(self.chatbot_clear_chat_btn, "ghost")
         if hasattr(self, "chatbot_output_mode_btn"):
             self._style_button(self.chatbot_output_mode_btn, "ghost", compact=True)
         if hasattr(self, "chatbot_copy_output_btn"):
@@ -1158,6 +1239,8 @@ class LTXQueueManager:
             self._style_button(self.chatbot_apply_btn, "success", compact=True)
         if hasattr(self, "chatbot_apply_scene_btn"):
             self._style_button(self.chatbot_apply_scene_btn, "success", compact=True)
+        if hasattr(self, "chatbot_apply_music_btn"):
+            self._style_button(self.chatbot_apply_music_btn, apply_music_variant, compact=True)
         if "chatbot_focus_workspace" in self.collapsible_sections:
             self._update_collapsible_section_meta("chatbot_focus_workspace", self._get_chatbot_focus_section_meta())
 
@@ -1463,6 +1546,17 @@ class LTXQueueManager:
                     content_label.configure(fg=bubble_tone)
                     self._style_label(content_label, "body", bubble.cget("bg"))
 
+                if content:
+                    actions_row = tk.Frame(bubble)
+                    actions_row.pack(anchor="w", fill=tk.X, pady=(4, 0))
+                    self._style_panel(actions_row, bubble_color)
+                    copy_btn = tk.Button(
+                        actions_row, text="Copy", cursor="hand2",
+                        command=lambda msg=content: self._copy_chatbot_message_to_clipboard(msg),
+                    )
+                    copy_btn.pack(side=tk.LEFT)
+                    self._style_button(copy_btn, "ghost", compact=True)
+
                 artifact_ids = [
                     str(artifact_id or "").strip()
                     for artifact_id in (turn.get("artifact_ids") or [])
@@ -1529,6 +1623,21 @@ class LTXQueueManager:
             self.chatbot_transcript_canvas.yview_moveto(max(0.0, previous_view_top))
 
     def _get_chatbot_chat_system_prompt(self):
+        selected_task = self._get_selected_chatbot_task()
+        if selected_task == CHATBOT_TASK_SONG_BRAINSTORM:
+            return (
+                "You are Prompt2MTV's songwriting assistant. "
+                "Help the user brainstorm song lyrics, hooks, verse/chorus/bridge structures, and style direction. "
+                "Suggest genre tags, mood, texture, instrumentation, and vocal style that work well together. "
+                "When writing lyrics, use section markers like [verse], [chorus], [bridge], [outro], and [intro] "
+                "because the music generator (ACE-Step) expects that format. "
+                "Stay conversational and collaborative. Offer alternatives, variations, and creative pivots. "
+                "Ask clarifying questions about vibe, tempo, theme, and emotion to sharpen the direction. "
+                "Do not return JSON or structured output during chat. "
+                "Do not expose chain-of-thought, reasoning markers, or control tokens "
+                "like /think, /no_think, <think>, or <|channel>thought in the visible reply. "
+                "Keep replies practical, focused, and creatively useful."
+            )
         return (
             "You are Prompt2MTV's creative assistant for music video development. "
             "Reply conversationally and collaboratively. Help the user shape concept, mood, pacing, scene ideas, visual motifs, and prompt direction. "
@@ -1699,6 +1808,8 @@ class LTXQueueManager:
         timeout_seconds = max(15, int(self.chatbot_request_timeout or DEFAULT_CHATBOT_REQUEST_TIMEOUT))
         model_id = self._resolve_chatbot_generation_model_id(timeout_seconds=min(timeout_seconds, 10))
         force_non_thinking = self._chatbot_should_force_non_thinking(model_id=model_id)
+        selected_task = self._get_selected_chatbot_task()
+        is_song_mode = selected_task == CHATBOT_TASK_SONG_BRAINSTORM
         messages = self._build_chatbot_request_messages(
             [{"role": "system", "content": self._get_chatbot_chat_system_prompt()}] + self._get_chatbot_conversation_turns(conversation_id=conversation_id, limit=12),
             model_id=model_id,
@@ -1707,7 +1818,7 @@ class LTXQueueManager:
         payload = {
             "model": model_id,
             "messages": messages,
-            "max_tokens": 900,
+            "max_tokens": 2048 if is_song_mode else 900,
             "stream": False,
         }
         payload.update(self._build_chatbot_sampling_payload())
@@ -1742,12 +1853,28 @@ class LTXQueueManager:
         self._refresh_chatbot_output_preview()
         self.update_status("Started a new chatbot conversation.", "blue")
 
+    def _clear_chatbot_conversation(self):
+        if self.chatbot_generation_in_progress:
+            return
+        conversation = self._get_chatbot_active_conversation()
+        if not conversation or not conversation.get("turns"):
+            return
+        conversation["turns"] = []
+        self.chatbot_last_result = None
+        self.chatbot_output_show_raw = False
+        self.chatbot_pending_request_mode = None
+        self.chatbot_output_preview_cache = self._get_chatbot_empty_state_text(self._get_selected_chatbot_task())
+        self._refresh_chatbot_output_preview()
+        self.update_status("Chat history cleared.", "blue")
+
     def _infer_chatbot_artifact_type(self, task_name=None):
         task_label = str(task_name or "").strip() or CHATBOT_TASK_T2I_OPTIMIZE
         if task_label == CHATBOT_TASK_T2I_OPTIMIZE:
             return "t2i_prompt_optimize"
         if task_label == CHATBOT_TASK_SCENE_PLAN:
             return "scene_plan"
+        if task_label == CHATBOT_TASK_SONG_BRAINSTORM:
+            return "song_brainstorm"
         return "chatbot_result"
 
     def _get_chatbot_recent_history_entries(self, limit=20):
@@ -2017,6 +2144,27 @@ class LTXQueueManager:
                 lines.append(f"Model\n{model_id}")
             return "\n\n".join(lines).strip()
 
+        if task_label == CHATBOT_TASK_SONG_BRAINSTORM or str(result.get("task") or "").strip() == "song_brainstorm":
+            lines = []
+            title_value = str(result.get("title") or "").strip()
+            lyrics = str(result.get("lyrics") or "").strip()
+            style_tags = str(result.get("style_tags") or "").strip()
+            rationale = str(result.get("rationale") or "").strip()
+            model_id = str(result.get("model_id") or "").strip()
+            if task_label:
+                lines.append(f"Task\n{task_label}")
+            if title_value:
+                lines.append(f"Title\n{title_value}")
+            if style_tags:
+                lines.append(f"Style Tags\n{style_tags}")
+            if lyrics:
+                lines.append(f"Lyrics\n{lyrics}")
+            if rationale:
+                lines.append(f"Creative Choices\n{rationale}")
+            if model_id:
+                lines.append(f"Model\n{model_id}")
+            return "\n\n".join(lines).strip()
+
         lines = []
         title_value = str(result.get("title") or "").strip()
         optimized_prompt = str(result.get("optimized_prompt") or "").strip()
@@ -2042,6 +2190,8 @@ class LTXQueueManager:
         resolved_task = str(task_label or "").strip()
         if resolved_task == CHATBOT_TASK_SCENE_PLAN or resolved_task == "scene_plan":
             return "Apply target: Scene Timeline"
+        if resolved_task == CHATBOT_TASK_SONG_BRAINSTORM or resolved_task == "song_brainstorm":
+            return "Apply target: Music Tab (Lyrics & Style)"
         return "Apply target: Image Phase queue"
 
     def _build_chatbot_artifact_preview_text(self, artifact, show_raw=False, max_length=420):
@@ -2140,6 +2290,14 @@ class LTXQueueManager:
         self.root.clipboard_clear()
         self.root.clipboard_append(output_text)
         self.update_status("Chatbot result copied to clipboard.", "green")
+
+    def _copy_chatbot_message_to_clipboard(self, text):
+        text = str(text or "").strip()
+        if not text:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.update_status("Message copied to clipboard.", "green")
 
     def _record_chatbot_history_entry(self, task_name, briefing_text, result):
         conversation_id = self._ensure_active_chatbot_conversation()
@@ -2250,6 +2408,11 @@ class LTXQueueManager:
                 state=tk.DISABLED if is_running or not self._chatbot_generation_prerequisites_ready() else tk.NORMAL,
                 text="Generating Prompt..." if is_running and pending_mode == "artifact" else "Generate Prompt Draft",
             )
+        if hasattr(self, "chatbot_finalize_song_btn"):
+            self.chatbot_finalize_song_btn.config(
+                state=tk.DISABLED if is_running or not self._chatbot_generation_prerequisites_ready() else tk.NORMAL,
+                text="Finalizing Song..." if is_running and pending_mode == "artifact" else "Finalize Song",
+            )
         if hasattr(self, "chatbot_apply_btn"):
             task_label = str((self.chatbot_last_result or {}).get("task_label") or (self.chatbot_last_result or {}).get("task") or "").strip()
             can_apply = bool(
@@ -2280,10 +2443,21 @@ class LTXQueueManager:
             else:
                 self.chatbot_apply_scene_btn.config(state=tk.NORMAL if can_apply else tk.DISABLED)
                 self.chatbot_apply_scene_btn.pack(side=tk.LEFT, padx=(10, 0))
+        if hasattr(self, "chatbot_apply_music_btn"):
+            is_song = task_label == CHATBOT_TASK_SONG_BRAINSTORM or task_label == "song_brainstorm"
+            can_apply_music = bool(
+                not is_running
+                and self.chatbot_last_result
+                and is_song
+                and (str(self.chatbot_last_result.get("lyrics") or "").strip() or str(self.chatbot_last_result.get("style_tags") or "").strip())
+            )
+            self.chatbot_apply_music_btn.config(state=tk.NORMAL if can_apply_music else tk.DISABLED)
         if hasattr(self, "chatbot_task_combo"):
             self.chatbot_task_combo.config(state=tk.DISABLED if is_running else "readonly")
         if hasattr(self, "chatbot_new_chat_btn"):
             self.chatbot_new_chat_btn.config(state=tk.DISABLED if is_running else tk.NORMAL)
+        if hasattr(self, "chatbot_clear_chat_btn"):
+            self.chatbot_clear_chat_btn.config(state=tk.DISABLED if is_running else tk.NORMAL)
         if hasattr(self, "chatbot_briefing_text"):
             self.chatbot_briefing_text.config(state=tk.DISABLED if is_running else tk.NORMAL)
         if "chatbot_focus_workspace" in self.collapsible_sections:
@@ -2312,10 +2486,64 @@ class LTXQueueManager:
             raise ValueError("The chatbot response did not contain a valid JSON object.")
 
         candidate = cleaned_text[start_index:end_index + 1]
-        parsed = json.loads(candidate)
+        try:
+            parsed = json.loads(candidate)
+            if not isinstance(parsed, dict):
+                raise ValueError("The chatbot response JSON must be an object.")
+            return parsed
+        except json.JSONDecodeError:
+            pass
+
+        truncated = cleaned_text[start_index:]
+        repaired = self._attempt_json_repair(truncated)
+        parsed = json.loads(repaired)
         if not isinstance(parsed, dict):
             raise ValueError("The chatbot response JSON must be an object.")
         return parsed
+
+    @staticmethod
+    def _attempt_json_repair(text):
+        """Try to close a truncated JSON object so it can be parsed."""
+        in_string = False
+        escape_next = False
+        brace_depth = 0
+        bracket_depth = 0
+        last_good = 0
+        for i, ch in enumerate(text):
+            if escape_next:
+                escape_next = False
+                continue
+            if ch == '\\':
+                if in_string:
+                    escape_next = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == '{':
+                brace_depth += 1
+            elif ch == '}':
+                brace_depth -= 1
+            elif ch == '[':
+                bracket_depth += 1
+            elif ch == ']':
+                bracket_depth -= 1
+            if brace_depth == 0 and bracket_depth == 0:
+                last_good = i
+                break
+            last_good = i
+        repaired = text[:last_good + 1]
+        if in_string:
+            repaired += '"'
+        while bracket_depth > 0:
+            repaired += ']'
+            bracket_depth -= 1
+        while brace_depth > 0:
+            repaired += '}'
+            brace_depth -= 1
+        return repaired
 
     def _get_chatbot_task_config(self, task_name):
         task_label = str(task_name or CHATBOT_TASK_T2I_OPTIMIZE).strip() or CHATBOT_TASK_T2I_OPTIMIZE
@@ -2384,6 +2612,56 @@ class LTXQueueManager:
                     "You are a music video planning assistant. "
                     "Return only a JSON object with no markdown fences, no prose outside JSON, and no extra keys. "
                     "Choose a strong scene count and write scene prompts that are visually specific and production-ready."
+                ),
+                "user_prompt_template": user_prompt_template,
+            }
+
+        if task_label == CHATBOT_TASK_SONG_BRAINSTORM:
+            schema_hint = {
+                "task": "song_brainstorm",
+                "title": "Short title for the song concept",
+                "lyrics": "Full song lyrics with [verse], [chorus], [bridge] section markers",
+                "style_tags": "Genre, mood, instrumentation, and texture descriptors for the style field",
+                "rationale": "Brief explanation of creative choices"
+            }
+            json_schema = {
+                "name": "prompt2mtv_song_brainstorm",
+                "schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "task": {"type": "string", "const": "song_brainstorm"},
+                        "title": {"type": "string"},
+                        "lyrics": {"type": "string"},
+                        "style_tags": {"type": "string"},
+                        "rationale": {"type": "string"}
+                    },
+                    "required": ["task", "title", "lyrics", "style_tags", "rationale"]
+                }
+            }
+            user_prompt_template = (
+                "Task: finalize the song lyrics and style tags based on our conversation.\n"
+                "Produce exactly this JSON schema:\n"
+                f"{json.dumps(schema_hint, indent=2)}\n\n"
+                "Requirements:\n"
+                "- lyrics must contain the full song text with section markers like [verse], [chorus], [bridge], [outro], [intro].\n"
+                "- style_tags must be a comma-separated string of genre, mood, instrumentation, and texture descriptors suitable for ACE-Step's tags/prompt field.\n"
+                "- Incorporate the best ideas from the conversation. Resolve any open questions with strong creative choices.\n"
+                "- If you reason internally, do not expose reasoning in the visible answer.\n"
+                "- Avoid markdown and avoid prose outside JSON.\n\n"
+                "User briefing:\n__BRIEFING_TEXT__"
+            )
+            return {
+                "label": CHATBOT_TASK_SONG_BRAINSTORM,
+                "output_task": "song_brainstorm",
+                "required_fields": ["task", "title", "lyrics", "style_tags", "rationale"],
+                "non_empty_fields": ["task", "title", "lyrics", "style_tags"],
+                "json_schema": json_schema,
+                "system_prompt": (
+                    "You are a songwriting assistant that finalizes lyrics and style tags from a brainstorming conversation. "
+                    "Return only a JSON object with no markdown fences, no prose outside JSON, and no extra keys. "
+                    "The lyrics must use section markers like [verse], [chorus], [bridge]. "
+                    "The style_tags must be a comma-separated list of genre, mood, instrumentation, and texture descriptors."
                 ),
                 "user_prompt_template": user_prompt_template,
             }
@@ -2680,9 +2958,150 @@ class LTXQueueManager:
             start_status="Scene planning started.",
             success_status="Scene plan ready.",
             failure_title="Failed to plan scenes",
+            phase_key_base="chatbot_scene_plan",
         )
 
-    def _handle_chatbot_structured_task(self, task_name, empty_message, loading_text, start_status, success_status, failure_title):
+    def _handle_chatbot_finalize_song(self):
+        if not self.ensure_chatbot_model_ready(interactive=True):
+            return
+        conversation_id = self._ensure_active_chatbot_conversation()
+        conversation_turns = self._get_chatbot_conversation_turns(conversation_id=conversation_id, limit=12)
+        if not conversation_turns:
+            messagebox.showwarning("Chatbot", "Chat about your song idea first, then click Finalize Song.")
+            return
+
+        task_config = self._get_chatbot_task_config(CHATBOT_TASK_SONG_BRAINSTORM)
+        briefing_summary = "Finalize the song lyrics and style tags from our brainstorming conversation."
+        self._append_chatbot_turn("user", briefing_summary, kind="chat", conversation_id=conversation_id)
+        self.chatbot_last_result = None
+        self.chatbot_output_show_raw = False
+        self.chatbot_pending_request_mode = "artifact"
+        self._set_chatbot_generation_state(True)
+        self._set_chatbot_output_preview("Finalizing song lyrics and style tags from the conversation...")
+        self.update_status("Song finalization started.", "blue")
+        is_cold = not self.chatbot_model_warm
+        phase_key = CHATBOT_PHASE_SONG_FINALIZE_COLD if is_cold else CHATBOT_PHASE_SONG_FINALIZE_WARM
+        preparing_status = "Starting chatbot backend & loading model..." if is_cold else "Finalizing song..."
+        self._set_tutorial_runtime_progress(phase_key, reset=True, status=preparing_status, current=0, total=1, item_label="Song finalize", stage="preparing")
+
+        def worker():
+            task_start = time.time()
+            try:
+                backend_result = self._ensure_chatbot_backend_ready_for_use(action_label="song finalization")
+                if not backend_result.get("ok"):
+                    raise RuntimeError(backend_result.get("detail") or backend_result.get("status") or "The chatbot backend is not ready.")
+                self.chatbot_model_warm = True
+                self._set_tutorial_runtime_progress(phase_key, status="Waiting for finalized song...", current=1, total=1, item_label="Song finalize", stage="running")
+                result = self._request_chatbot_song_finalization(task_config, conversation_id)
+            except Exception as exc:
+                error_message = str(exc)
+                self._set_tutorial_runtime_progress(phase_key, status="Song finalization failed.", current=1, total=1, item_label="Song finalize", stage="failed")
+
+                def on_error():
+                    self.chatbot_pending_request_mode = None
+                    self._append_chatbot_turn("assistant", error_message, kind="status", conversation_id=conversation_id)
+                    self._set_chatbot_generation_state(False)
+                    self._set_chatbot_output_preview(f"Failed to finalize song.\n\n{error_message}")
+                    self.update_status("Song finalization failed.", "red")
+                    messagebox.showerror("Chatbot", f"Failed to finalize song:\n{error_message}")
+
+                self.root.after(0, on_error)
+                return
+
+            self.record_tutorial_phase_timing(phase_key, time.time() - task_start)
+            self._set_tutorial_runtime_progress(phase_key, status="Song finalized.", current=1, total=1, item_label="Song finalize", stage="complete")
+
+            def on_success():
+                self.chatbot_pending_request_mode = None
+                self._record_chatbot_history_entry(CHATBOT_TASK_SONG_BRAINSTORM, briefing_summary, result)
+                self._refresh_chatbot_output_preview()
+                self._set_chatbot_generation_state(False)
+                self.update_status("Song lyrics and style tags finalized.", "green")
+
+            self.root.after(0, on_success)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _request_chatbot_song_finalization(self, task_config, conversation_id):
+        timeout_seconds = max(15, int(self.chatbot_request_timeout or DEFAULT_CHATBOT_REQUEST_TIMEOUT))
+        model_id = self._resolve_chatbot_generation_model_id(timeout_seconds=min(timeout_seconds, 10))
+        force_non_thinking = self._chatbot_should_force_non_thinking(model_id=model_id)
+        conversation_turns = self._get_chatbot_conversation_turns(conversation_id=conversation_id, limit=12)
+        finalize_instruction = task_config["user_prompt_template"].replace("__BRIEFING_TEXT__", "Finalize the song based on our brainstorming conversation above.")
+        messages = self._build_chatbot_request_messages(
+            [{"role": "system", "content": task_config["system_prompt"]}]
+            + conversation_turns
+            + [{"role": "user", "content": finalize_instruction}],
+            model_id=model_id,
+            force_non_thinking=force_non_thinking,
+        )
+        base_payload = {
+            "model": model_id,
+            "messages": messages,
+            "max_tokens": 4096,
+            "stream": False,
+        }
+        base_payload.update(self._build_chatbot_sampling_payload())
+        if force_non_thinking and self._chatbot_request_targets_gemma4(model_id=model_id):
+            base_payload["think"] = False
+        payload_variants = [
+            dict(base_payload, response_format={"type": "json_schema", "json_schema": task_config["json_schema"]}),
+            dict(base_payload, response_format={"type": "json_object"}),
+            dict(base_payload),
+        ]
+        response_payload = None
+        for payload_index, payload in enumerate(payload_variants):
+            try:
+                response_payload = self._post_chatbot_completion_payload(payload, timeout_seconds=timeout_seconds)
+                break
+            except Exception as exc:
+                if payload_index >= len(payload_variants) - 1 or not self._chatbot_supports_response_format_retry(str(exc)):
+                    raise
+        response_parts = self._extract_chatbot_response_parts(response_payload)
+        content = str(response_parts.get("content") or "").strip()
+        if not content:
+            raise ValueError("The chatbot reply was empty.")
+        parsed_output = self._extract_json_object_from_text(content)
+        validated_output = self._validate_chatbot_structured_output(task_config, parsed_output)
+        validated_output["task_label"] = CHATBOT_TASK_SONG_BRAINSTORM
+        validated_output["model_id"] = model_id
+        validated_output["raw_content"] = str(content or "")
+        validated_output["reasoning_content"] = str(response_parts.get("reasoning") or "").strip()
+        return validated_output
+
+    def apply_chatbot_result_to_music_tab(self):
+        if not self.chatbot_last_result:
+            messagebox.showwarning("Chatbot", "Finalize a song first.")
+            return
+        task_label = str(self.chatbot_last_result.get("task_label") or self.chatbot_last_result.get("task") or "").strip()
+        if task_label != CHATBOT_TASK_SONG_BRAINSTORM and task_label != "song_brainstorm":
+            messagebox.showwarning("Chatbot", "The current result is not a finalized song. Use Finalize Song first.")
+            return
+        lyrics = str(self.chatbot_last_result.get("lyrics") or "").strip()
+        style_tags = str(self.chatbot_last_result.get("style_tags") or "").strip()
+        if not lyrics and not style_tags:
+            messagebox.showwarning("Chatbot", "The finalized song has no lyrics or style tags.")
+            return
+        if hasattr(self, "music_lyrics_text"):
+            self.music_lyrics_text.delete("1.0", tk.END)
+            if lyrics:
+                self.music_lyrics_text.insert("1.0", lyrics)
+        if hasattr(self, "music_tags_text"):
+            self.music_tags_text.delete("1.0", tk.END)
+            if style_tags:
+                self.music_tags_text.insert("1.0", style_tags)
+        self._record_chatbot_artifact_apply(
+            target_type="music_lyrics_and_tags",
+            target_scope="replace_music_fields",
+            apply_mode="replace",
+            summary="Sent finalized lyrics and style tags to the Music tab.",
+        )
+        self.update_status("Song lyrics and style tags sent to the Music tab.", "green")
+        if hasattr(self, "notebook") and hasattr(self, "music_tab"):
+            self.notebook.select(self.music_tab)
+        messagebox.showinfo("Chatbot", "Lyrics and style tags were sent to the Music tab.")
+
+    def _handle_chatbot_structured_task(self, task_name, empty_message, loading_text, start_status, success_status, failure_title, phase_key_base="chatbot_task"):
         if not self.ensure_chatbot_model_ready(interactive=True):
             return
         briefing_text = self.chatbot_briefing_text.get("1.0", tk.END).strip() if hasattr(self, "chatbot_briefing_text") else ""
@@ -2695,10 +3114,13 @@ class LTXQueueManager:
         self.chatbot_last_result = None
         self.chatbot_output_show_raw = False
         self.chatbot_pending_request_mode = "artifact"
+        is_cold = not self.chatbot_model_warm
+        phase_key = f"{phase_key_base}_cold" if is_cold else f"{phase_key_base}_warm"
         self._set_chatbot_generation_state(True)
         self._set_chatbot_output_preview(loading_text)
         self.update_status(start_status, "blue")
-        self._set_tutorial_runtime_progress("chatbot_task", reset=True, status="Generating structured output...", current=0, total=1, item_label="Chatbot task", stage="preparing")
+        preparing_status = "Starting chatbot backend & loading model..." if is_cold else "Connecting to chatbot backend..."
+        self._set_tutorial_runtime_progress(phase_key, reset=True, status=preparing_status, current=0, total=1, item_label=PHASE_DISPLAY_NAMES.get(phase_key, "Chatbot task"), stage="preparing")
 
         def worker():
             task_start = time.time()
@@ -2706,11 +3128,12 @@ class LTXQueueManager:
                 backend_result = self._ensure_chatbot_backend_ready_for_use(action_label=str(task_name or "chatbot generation").lower())
                 if not backend_result.get("ok"):
                     raise RuntimeError(backend_result.get("detail") or backend_result.get("status") or "The chatbot backend is not ready.")
-                self._set_tutorial_runtime_progress("chatbot_task", status="Waiting for chatbot output...", current=1, total=1, item_label="Chatbot task", stage="running")
+                self.chatbot_model_warm = True
+                self._set_tutorial_runtime_progress(phase_key, status="Waiting for chatbot output...", current=1, total=1, item_label=PHASE_DISPLAY_NAMES.get(phase_key, "Chatbot task"), stage="running")
                 result = self._request_chatbot_structured_output(task_name, briefing_text)
             except Exception as exc:
                 error_message = str(exc)
-                self._set_tutorial_runtime_progress("chatbot_task", status="Chatbot task failed.", current=1, total=1, item_label="Chatbot task", stage="failed")
+                self._set_tutorial_runtime_progress(phase_key, status="Chatbot task failed.", current=1, total=1, item_label=PHASE_DISPLAY_NAMES.get(phase_key, "Chatbot task"), stage="failed")
 
                 def on_error():
                     self.chatbot_pending_request_mode = None
@@ -2723,8 +3146,8 @@ class LTXQueueManager:
                 self.root.after(0, on_error)
                 return
 
-            self.record_tutorial_phase_timing("chatbot_task", time.time() - task_start)
-            self._set_tutorial_runtime_progress("chatbot_task", status="Chatbot task complete.", current=1, total=1, item_label="Chatbot task", stage="complete")
+            self.record_tutorial_phase_timing(phase_key, time.time() - task_start)
+            self._set_tutorial_runtime_progress(phase_key, status="Chatbot task complete.", current=1, total=1, item_label=PHASE_DISPLAY_NAMES.get(phase_key, "Chatbot task"), stage="complete")
 
             def on_success():
                 self.chatbot_pending_request_mode = None
@@ -2750,13 +3173,18 @@ class LTXQueueManager:
 
         conversation_id = self._ensure_active_chatbot_conversation()
         self._append_chatbot_turn("user", message_text, kind="chat", conversation_id=conversation_id)
+        if hasattr(self, "chatbot_briefing_text"):
+            self.chatbot_briefing_text.delete("1.0", tk.END)
         self.chatbot_last_result = None
         self.chatbot_output_show_raw = False
         self.chatbot_pending_request_mode = "chat"
+        is_cold = not self.chatbot_model_warm
+        phase_key = CHATBOT_PHASE_CHAT_COLD if is_cold else CHATBOT_PHASE_CHAT_WARM
         self._set_chatbot_generation_state(True)
         self._set_chatbot_output_preview("The assistant is thinking about your latest message...")
         self.update_status("Chatbot reply started.", "blue")
-        self._set_tutorial_runtime_progress("chatbot_chat", reset=True, status="Chatbot is responding...", current=0, total=1, item_label="Chat reply", stage="preparing")
+        preparing_status = "Starting chatbot backend & loading model..." if is_cold else "Connecting to chatbot backend..."
+        self._set_tutorial_runtime_progress(phase_key, reset=True, status=preparing_status, current=0, total=1, item_label="Chat reply", stage="preparing")
 
         def worker():
             chat_start = time.time()
@@ -2764,11 +3192,12 @@ class LTXQueueManager:
                 backend_result = self._ensure_chatbot_backend_ready_for_use(action_label="chat reply")
                 if not backend_result.get("ok"):
                     raise RuntimeError(backend_result.get("detail") or backend_result.get("status") or "The chatbot backend is not ready.")
-                self._set_tutorial_runtime_progress("chatbot_chat", status="Waiting for chatbot reply...", current=1, total=1, item_label="Chat reply", stage="running")
+                self.chatbot_model_warm = True
+                self._set_tutorial_runtime_progress(phase_key, status="Waiting for chatbot reply...", current=1, total=1, item_label="Chat reply", stage="running")
                 reply = self._request_chatbot_chat_reply(conversation_id=conversation_id)
             except Exception as exc:
                 error_message = str(exc)
-                self._set_tutorial_runtime_progress("chatbot_chat", status="Chat reply failed.", current=1, total=1, item_label="Chat reply", stage="failed")
+                self._set_tutorial_runtime_progress(phase_key, status="Chat reply failed.", current=1, total=1, item_label="Chat reply", stage="failed")
 
                 def on_error():
                     self.chatbot_pending_request_mode = None
@@ -2781,8 +3210,8 @@ class LTXQueueManager:
                 self.root.after(0, on_error)
                 return
 
-            self.record_tutorial_phase_timing("chatbot_chat", time.time() - chat_start)
-            self._set_tutorial_runtime_progress("chatbot_chat", status="Chat reply ready.", current=1, total=1, item_label="Chat reply", stage="complete")
+            self.record_tutorial_phase_timing(phase_key, time.time() - chat_start)
+            self._set_tutorial_runtime_progress(phase_key, status="Chat reply ready.", current=1, total=1, item_label="Chat reply", stage="complete")
 
             def on_success():
                 self.chatbot_pending_request_mode = None
@@ -3669,6 +4098,7 @@ class LTXQueueManager:
             start_status="Prompt draft generation started.",
             success_status="Prompt draft generated.",
             failure_title="Failed to generate prompt draft",
+            phase_key_base="chatbot_t2i_optimize",
         )
 
     def _get_default_output_dir(self):
@@ -5001,17 +5431,30 @@ class LTXQueueManager:
             return candidate_roots[0]
         return None
 
-    def audit_required_models(self):
+    def audit_required_models(self, include_variant_ids=None):
         self._load_model_manifest()
 
         reports = []
         manifest_notes = []
+
+        active_music_manifest_id = None
+        if hasattr(self, "music_model_variant_var"):
+            active_music_manifest_id = self._get_active_music_manifest_id()
 
         for entry in self.model_manifest.get("models", []):
             if entry.get("required", True) is False:
                 continue
 
             entry_id = str(entry.get("id", "")).strip() or "unknown_model"
+
+            variant_group = entry.get("variant_group")
+            if variant_group and variant_group == "music_dit":
+                if include_variant_ids is not None:
+                    if entry_id not in include_variant_ids:
+                        continue
+                elif active_music_manifest_id and entry_id != active_music_manifest_id:
+                    continue
+
             workflow_key = str(entry.get("workflow", "")).strip().lower()
             label = str(entry.get("label", entry_id)).strip() or entry_id
             dest_subdir = str(entry.get("dest_subdir", "")).strip().replace("/", os.sep).replace("\\", os.sep)
@@ -5262,8 +5705,89 @@ class LTXQueueManager:
         except tk.TclError:
             pass
 
+    def _ask_music_variant_choice(self):
+        """Show a dialog asking which music model variant(s) to include for download.
+        Returns a list of manifest IDs, or None if cancelled."""
+        self._load_model_manifest()
+        variant_entries = [
+            e for e in self.model_manifest.get("models", [])
+            if e.get("variant_group") == "music_dit"
+        ]
+        if len(variant_entries) < 2:
+            return None
+
+        already_present = []
+        not_present = []
+        for e in variant_entries:
+            entry_id = str(e.get("id", "")).strip()
+            filename = str(e.get("filename", "")).strip()
+            if self._find_model_file(filename):
+                already_present.append(entry_id)
+            else:
+                not_present.append(entry_id)
+
+        if not not_present:
+            return None
+
+        labels = {str(e.get("id", "")).strip(): str(e.get("label", e.get("id", ""))).strip() for e in variant_entries}
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Music Model Selection")
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        dialog.transient(self.root)
+
+        frame = tk.Frame(dialog, padx=20, pady=16)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(frame, text="Which music model(s) would you like to download?", wraplength=350, justify=tk.LEFT).pack(anchor="w", pady=(0, 12))
+
+        selected_ids = {}
+        for e in variant_entries:
+            entry_id = str(e.get("id", "")).strip()
+            is_present = entry_id in already_present
+            var = tk.BooleanVar(value=not is_present)
+            suffix = " (already installed)" if is_present else ""
+            cb = tk.Checkbutton(frame, text=f"{labels.get(entry_id, entry_id)}{suffix}", variable=var)
+            cb.pack(anchor="w", pady=2)
+            if is_present:
+                cb.config(state=tk.DISABLED)
+                var.set(False)
+            selected_ids[entry_id] = var
+
+        result = {"ids": None}
+
+        def on_ok():
+            chosen = [eid for eid, var in selected_ids.items() if var.get()]
+            chosen.extend(already_present)
+            result["ids"] = chosen if chosen else None
+            dialog.destroy()
+
+        def on_cancel():
+            dialog.destroy()
+
+        btn_frame = tk.Frame(frame)
+        btn_frame.pack(fill=tk.X, pady=(16, 0))
+        tk.Button(btn_frame, text="Continue", width=10, command=on_ok).pack(side=tk.RIGHT, padx=(8, 0))
+        tk.Button(btn_frame, text="Cancel", width=10, command=on_cancel).pack(side=tk.RIGHT)
+
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_width()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_height()) // 2
+        dialog.geometry(f"+{x}+{y}")
+
+        dialog.wait_window()
+        return result["ids"]
+
     def install_missing_models(self, interactive=True, model_audit=None):
-        audit = model_audit or self.audit_required_models()
+        include_variant_ids = None
+        if interactive and model_audit is None:
+            include_variant_ids = self._ask_music_variant_choice()
+            if include_variant_ids is not None and not include_variant_ids:
+                self.update_status("Model installation cancelled.", "orange")
+                return False
+
+        audit = model_audit or self.audit_required_models(include_variant_ids=include_variant_ids)
         missing_reports = audit.get("missing", [])
         installable_reports = audit.get("installable_missing", [])
         known_total_bytes, unknown_size_count = self._estimate_download_sizes(installable_reports)
@@ -6896,6 +7420,7 @@ class LTXQueueManager:
             (self.chatbot_send_btn, "secondary"),
             (self.chatbot_scene_plan_btn, "secondary"),
             (self.chatbot_new_chat_btn, "ghost"),
+            (self.chatbot_clear_chat_btn, "ghost"),
             (self.chatbot_generate_btn, "primary")
         ]:
             self._style_button(button, variant)
@@ -6931,6 +7456,7 @@ class LTXQueueManager:
             (self.chatbot_send_btn, "secondary"),
             (self.chatbot_scene_plan_btn, "secondary"),
             (self.chatbot_new_chat_btn, "ghost"),
+            (self.chatbot_clear_chat_btn, "ghost"),
             (self.chatbot_apply_btn, "accent"),
             (self.chatbot_apply_scene_btn, "accent")
         ]:
@@ -7014,7 +7540,9 @@ class LTXQueueManager:
         self.debug_log_file = os.path.join(self.debug_dir, "wrapper_debug.log")
         self.log_debug("PROJECT_SET", project_dir=self.current_project_dir)
             
-        self.project_label.config(text=f"Current Project: {os.path.basename(self.current_project_dir)}")
+        project_name = os.path.basename(self.current_project_dir)
+        project_drive = os.path.splitdrive(self.current_project_dir)[0] or ""
+        self.project_label.config(text=f"Current Project: {project_name}  [{project_drive}]")
         self.load_project_state()
         self.refresh_gallery()
 
@@ -7045,12 +7573,8 @@ class LTXQueueManager:
             title="Select Project Folder"
         )
         if project_dir:
-            # Verify it's a valid project folder (or at least inside outputs)
-            if os.path.commonpath([os.path.abspath(project_dir), os.path.abspath(self.base_output_dir)]) == os.path.abspath(self.base_output_dir):
-                self.set_project(project_dir)
-                self.save_global_settings()
-            else:
-                messagebox.showerror("Error", "Please select a folder inside the 'outputs' directory.")
+            self.set_project(project_dir)
+            self.save_global_settings()
 
     def rename_current_project(self):
         if not self.current_project_dir:
@@ -8018,6 +8542,8 @@ class LTXQueueManager:
         self.music_bpm_var.trace_add("write", self._update_music_config_summary)
         self.music_key_var = tk.StringVar(value="C major")
         self.music_key_var.trace_add("write", self._update_music_config_summary)
+        self.music_model_variant_var = tk.StringVar(value=MUSIC_MODEL_VARIANT_DEFAULT)
+        self.music_model_variant_var.trace_add("write", self._on_music_model_variant_changed)
         self.music_steps_var = tk.IntVar(value=8)
         self.music_steps_var.trace_add("write", self._update_music_config_summary)
         self.music_cfg_var = tk.DoubleVar(value=1.0)
@@ -8038,6 +8564,15 @@ class LTXQueueManager:
         self.music_top_k_var = tk.IntVar(value=0)
         self.music_min_p_var = tk.DoubleVar(value=ACE_STEP_15_MIN_P_DEFAULT)
         self.music_quality_var = tk.StringVar(value="V0")
+
+        model_variant_frame = tk.Frame(self.music_main_frame, padx=16)
+        model_variant_frame.pack(fill=tk.X, pady=(0, 4))
+        model_variant_label = tk.Label(model_variant_frame, text="Music Model")
+        model_variant_label.pack(anchor="w")
+        self.music_model_variant_combo = ttk.Combobox(model_variant_frame, textvariable=self.music_model_variant_var, values=MUSIC_MODEL_VARIANT_OPTIONS, state="readonly")
+        self.music_model_variant_combo.pack(fill=tk.X, pady=(6, 0))
+        self.music_vram_warning_label = tk.Label(model_variant_frame, text="\u26a0 XL models require \u226512 GB VRAM (\u226520 GB recommended)", anchor="w", justify=tk.LEFT, fg="#b8860b", font=("", 8, "italic"))
+        self.music_vram_warning_label.pack(anchor="w", pady=(4, 0))
 
         self.music_playback_section = self._create_collapsible_section(
             self.music_main_frame,
@@ -8507,8 +9042,12 @@ class LTXQueueManager:
         self.chatbot_scene_plan_btn.pack(side=tk.LEFT, padx=(10, 0))
         self.chatbot_generate_btn = tk.Button(self.chatbot_task_actions_frame, text="Generate Prompt Draft", command=self._handle_chatbot_generate, state=tk.DISABLED)
         self.chatbot_generate_btn.pack(side=tk.LEFT, padx=(10, 0))
+        self.chatbot_finalize_song_btn = tk.Button(self.chatbot_task_actions_frame, text="Finalize Song", command=self._handle_chatbot_finalize_song, state=tk.DISABLED)
+        self.chatbot_finalize_song_btn.pack(side=tk.LEFT, padx=(10, 0))
         self.chatbot_new_chat_btn = tk.Button(self.chatbot_task_actions_frame, text="New Chat", command=self._start_new_chatbot_conversation)
         self.chatbot_new_chat_btn.pack(side=tk.LEFT, padx=(10, 0))
+        self.chatbot_clear_chat_btn = tk.Button(self.chatbot_task_actions_frame, text="Clear Chat", command=self._clear_chatbot_conversation)
+        self.chatbot_clear_chat_btn.pack(side=tk.LEFT, padx=(10, 0))
 
         self.chatbot_briefing_text = tk.Text(self.chatbot_briefing_card, height=10, wrap="word")
         self.chatbot_briefing_text.pack(fill=tk.BOTH, expand=True)
@@ -8560,6 +9099,8 @@ class LTXQueueManager:
         self.chatbot_apply_btn.pack(side=tk.LEFT, padx=(10, 0))
         self.chatbot_apply_scene_btn = tk.Button(self.chatbot_output_actions_frame, text="Add Prompt to Scene Timeline", command=self.apply_chatbot_result_to_scene_timeline, state=tk.DISABLED)
         self.chatbot_apply_scene_btn.pack(side=tk.LEFT, padx=(10, 0))
+        self.chatbot_apply_music_btn = tk.Button(self.chatbot_output_actions_frame, text="Send to Music Tab", command=self.apply_chatbot_result_to_music_tab, state=tk.DISABLED)
+        self.chatbot_apply_music_btn.pack(side=tk.LEFT, padx=(10, 0))
 
         self.chatbot_transcript_shell = tk.Frame(self.chatbot_output_card)
         self.chatbot_transcript_shell.pack(fill=tk.BOTH, expand=True)
@@ -9154,7 +9695,8 @@ class LTXQueueManager:
             "top_p": self.music_top_p_var.get(),
             "top_k": self.music_top_k_var.get(),
             "min_p": self.music_min_p_var.get(),
-            "quality": self.music_quality_var.get().strip()
+            "quality": self.music_quality_var.get().strip(),
+            "model_variant": self.music_model_variant_var.get().strip()
         }
 
     def _get_music_ui_state_snapshot(self):
@@ -9224,7 +9766,8 @@ class LTXQueueManager:
             self.music_top_p_var,
             self.music_top_k_var,
             self.music_min_p_var,
-            self.music_quality_var
+            self.music_quality_var,
+            self.music_model_variant_var
         ]:
             variable.trace_add("write", self._on_music_setting_changed)
 
@@ -9263,6 +9806,11 @@ class LTXQueueManager:
         self.music_top_k_var.set(self._coerce_music_int(resolved.get("top_k"), 0))
         self.music_min_p_var.set(self._coerce_music_float(resolved.get("min_p"), ACE_STEP_15_MIN_P_DEFAULT))
         self.music_quality_var.set(str(resolved.get("quality", "V0") or "V0"))
+        restored_variant = str(resolved.get("model_variant", MUSIC_MODEL_VARIANT_DEFAULT) or MUSIC_MODEL_VARIANT_DEFAULT)
+        if restored_variant in MUSIC_MODEL_VARIANT_MAP:
+            self.music_model_variant_var.set(restored_variant)
+        else:
+            self.music_model_variant_var.set(MUSIC_MODEL_VARIANT_DEFAULT)
         self._update_music_seed_entry_state()
 
     def _reset_music_settings_to_loaded_workflow(self):
@@ -9278,6 +9826,352 @@ class LTXQueueManager:
             self.music_seed_var.set(resolved_seed)
             return resolved_seed
         return self._coerce_music_int(self.music_seed_var.get(), 1)
+
+    def _on_music_model_variant_changed(self, *_args):
+        variant = self.music_model_variant_var.get()
+        info = MUSIC_MODEL_VARIANT_MAP.get(variant)
+        if info:
+            self.music_steps_var.set(info["steps"])
+        self._on_music_setting_changed()
+
+    def _get_active_music_model_filename(self):
+        variant = self.music_model_variant_var.get()
+        info = MUSIC_MODEL_VARIANT_MAP.get(variant, MUSIC_MODEL_VARIANT_MAP[MUSIC_MODEL_VARIANT_DEFAULT])
+        return info["filename"]
+
+    def _get_active_music_manifest_id(self):
+        variant = self.music_model_variant_var.get()
+        info = MUSIC_MODEL_VARIANT_MAP.get(variant, MUSIC_MODEL_VARIANT_MAP[MUSIC_MODEL_VARIANT_DEFAULT])
+        return info["manifest_id"]
+
+    def _is_xl_music_variant(self, variant_name=None):
+        if variant_name is None:
+            variant_name = self.music_model_variant_var.get()
+        info = MUSIC_MODEL_VARIANT_MAP.get(variant_name, {})
+        return info.get("backend") == "acestep_api"
+
+    def _check_acestep_api_health(self):
+        try:
+            req = urllib.request.Request(f"{ACESTEP_API_URL}/health")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status == 200:
+                    self.acestep_api_healthy = True
+                    return True
+        except Exception:
+            pass
+        self.acestep_api_healthy = False
+        return False
+
+    def _launch_acestep_api_server(self):
+        # Search for ACE-Step-1.5 in likely locations:
+        #   1) Inside ComfyUI root (D:\ComfyUI\ACE-Step-1.5)
+        #   2) Next to the app folder (sibling of LTX2_Custom_UI_Batch_Queue)
+        #   3) Next to ComfyUI root (D:\ACE-Step-1.5)
+        acestep_dir = None
+        search_bases = []
+        if self.comfyui_root:
+            search_bases.append(self.comfyui_root)               # e.g. D:\ComfyUI
+        search_bases.append(os.path.dirname(self.app_root_dir))  # e.g. D:\ComfyUI (parent of LTX2_Custom_UI_Batch_Queue)
+        if self.comfyui_root:
+            search_bases.append(os.path.dirname(self.comfyui_root))  # e.g. D:\
+        for base in search_bases:
+            candidate = os.path.join(base, "ACE-Step-1.5")
+            if os.path.isdir(candidate):
+                acestep_dir = candidate
+                break
+        if not acestep_dir:
+            searched = [os.path.join(b, "ACE-Step-1.5") for b in search_bases]
+            self.log_debug("ACESTEP_LAUNCH_SKIP", reason="repo_not_found", searched_paths=str(searched))
+            return False
+
+        if self._check_acestep_api_health():
+            self.log_debug("ACESTEP_LAUNCH_SKIP", reason="already_running")
+            return True
+
+        # Launch via uv directly (not via bat file, which overrides our env vars)
+        uv_exe = shutil.which("uv")
+        if not uv_exe:
+            # Fallback: try the bat file
+            bat_path = os.path.join(acestep_dir, "start_api_server.bat")
+            if not os.path.exists(bat_path):
+                self.log_debug("ACESTEP_LAUNCH_SKIP", reason="no_uv_or_bat")
+                return False
+            cmd = ["cmd", "/c", bat_path]
+        else:
+            cmd = [uv_exe, "run", "--no-sync", "acestep-api", "--host", "127.0.0.1", "--port", "8001"]
+
+        try:
+            env = os.environ.copy()
+            env["ACESTEP_INIT_LLM"] = "false"
+            env["CHECK_UPDATE"] = "false"
+            env["ACESTEP_NO_INIT"] = "true"
+            self.acestep_model_loaded = False
+            self.acestep_api_process = subprocess.Popen(
+                cmd,
+                cwd=acestep_dir,
+                env=env,
+                creationflags=subprocess.CREATE_NEW_CONSOLE,
+            )
+            self.log_debug("ACESTEP_API_SERVER_LAUNCHED", pid=self.acestep_api_process.pid, cwd=acestep_dir, cmd=str(cmd))
+            return True
+        except Exception as e:
+            self.log_debug("ACESTEP_LAUNCH_ERROR", details=str(e))
+            return False
+
+    def _wait_for_acestep_api(self, timeout=120):
+        start = time.time()
+        while time.time() - start < timeout:
+            if self._check_acestep_api_health():
+                self.log_debug("ACESTEP_API_READY", elapsed=f"{time.time() - start:.1f}s")
+                return True
+            time.sleep(3)
+        self.log_debug("ACESTEP_API_TIMEOUT", timeout=timeout)
+        return False
+
+    def _generate_music_xl(self, tags, lyrics, variant_info):
+        api_model_id = variant_info.get("api_model_id", "acestep-v15-xl-turbo")
+        music_seed = self._build_music_seed()
+        duration = self.music_duration_var.get()
+        try:
+            duration = float(duration)
+        except (TypeError, ValueError):
+            duration = 60.0
+
+        bpm_raw = self.music_bpm_var.get()
+        try:
+            bpm = int(bpm_raw)
+        except (TypeError, ValueError):
+            bpm = None
+
+        payload = {
+            "prompt": tags,
+            "lyrics": lyrics,
+            "model": api_model_id,
+            "audio_duration": duration,
+            "inference_steps": variant_info.get("steps", 8),
+            "guidance_scale": float(self.music_cfg_var.get() or 7.0),
+            "seed": music_seed,
+            "use_random_seed": False,
+            "audio_format": "wav",
+            "batch_size": 1,
+            "vocal_language": self.music_language_var.get() or "en",
+            "key_scale": self.music_key_var.get() or "",
+            "time_signature": self.music_timesignature_var.get() or "",
+            "sampler_name": self.music_sampler_var.get() or "euler",
+            "infer_method": "ode",
+        }
+        if bpm and bpm > 0:
+            payload["bpm"] = bpm
+
+        self.log_debug("ACESTEP_XL_REQUEST", model=api_model_id, duration=duration, steps=variant_info.get("steps"), seed=music_seed)
+
+        # -- Phase: Submitting --
+        is_cold = not self.acestep_model_loaded
+        self.xl_gen_phase = "submitting"
+        self.xl_gen_phase_start = time.time()
+        self.xl_gen_progress = 0.0
+        self.xl_gen_stage_text = ""
+
+        # Submit task — first request triggers lazy model loading which can block
+        # the server's event loop for several minutes while checkpoint shards load.
+        # Use ACESTEP_API_TIMEOUT as the HTTP timeout so first-run model loading
+        # (which can take 10+ minutes) doesn't cause a premature timeout.
+        if is_cold:
+            self.xl_gen_phase = "model_loading"
+            self.update_music_status("Submitting to XL server (first run loads models, please wait)...", "blue")
+        else:
+            self.update_music_status("Submitting to XL server...", "blue")
+
+        t_submit_start = time.time()
+        result = None
+        try:
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(f"{ACESTEP_API_URL}/release_task", data=data)
+            req.add_header("Content-Type", "application/json")
+            with urllib.request.urlopen(req, timeout=ACESTEP_API_TIMEOUT) as resp:
+                result = json.loads(resp.read().decode())
+        except Exception as e:
+            self.log_debug("ACESTEP_XL_SUBMIT_ERROR", details=str(e))
+            self.xl_gen_phase = None
+            return None
+
+        t_submit_done = time.time()
+        submit_elapsed = t_submit_done - t_submit_start
+        submit_phase_key = XL_PHASE_SUBMIT_COLD if is_cold else XL_PHASE_SUBMIT_WARM
+        self.record_tutorial_phase_timing(submit_phase_key, submit_elapsed)
+        self.log_debug("ACESTEP_XL_SUBMIT_PHASE", phase=submit_phase_key, elapsed=f"{submit_elapsed:.1f}s")
+
+        task_id = None
+        result_data = result.get("data")
+        if isinstance(result_data, dict):
+            task_id = result_data.get("task_id")
+        elif isinstance(result_data, str):
+            task_id = result_data
+        if not task_id:
+            self.log_debug("ACESTEP_XL_NO_TASK_ID", response=str(result)[:500])
+            self.xl_gen_phase = None
+            return None
+
+        self.log_debug("ACESTEP_XL_TASK_SUBMITTED", task_id=task_id)
+
+        # -- Phase: Generating (polling) --
+        self.xl_gen_phase = "generating"
+        self.xl_gen_phase_start = time.time()
+        self.xl_gen_progress = 0.0
+        self.xl_gen_stage_text = ""
+        self.update_music_status("XL model generating...", "blue")
+
+        # Poll for result
+        t_gen_start = time.time()
+        start_time = t_gen_start
+        last_status_update = 0
+        while time.time() - start_time < ACESTEP_API_TIMEOUT:
+            time.sleep(ACESTEP_API_POLL_INTERVAL)
+            elapsed = time.time() - start_time
+            try:
+                query_payload = json.dumps({"task_id_list": json.dumps([task_id])}).encode("utf-8")
+                req = urllib.request.Request(f"{ACESTEP_API_URL}/query_result", data=query_payload)
+                req.add_header("Content-Type", "application/json")
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    poll_result = json.loads(resp.read().decode())
+            except Exception as e:
+                self.log_debug("ACESTEP_XL_POLL_ERROR", elapsed=f"{elapsed:.0f}s", details=str(e))
+                # Server might be busy loading models — show a helpful status
+                if elapsed - last_status_update > 10:
+                    self.update_music_status(
+                        f"XL: Waiting for server (models may be downloading/loading)... {self._format_elapsed_display(elapsed)}",
+                        "blue",
+                    )
+                    last_status_update = elapsed
+                continue
+
+            data_list = poll_result.get("data", [])
+            if not data_list:
+                # Server responded but no task data yet — models likely still loading
+                if elapsed - last_status_update > 10:
+                    self.update_music_status(
+                        f"XL: Server is initializing models (first run downloads ~20GB)... {self._format_elapsed_display(elapsed)}",
+                        "blue",
+                    )
+                    last_status_update = elapsed
+                continue
+
+            item = data_list[0] if isinstance(data_list, list) else data_list
+            status = item.get("status")
+            progress_text = item.get("progress_text", "")
+
+            # Extract progress/stage from the result items when running
+            try:
+                result_json = json.loads(item.get("result", "[]")) if isinstance(item.get("result"), str) else (item.get("result") or [])
+                if isinstance(result_json, list) and result_json and isinstance(result_json[0], dict):
+                    server_progress = float(result_json[0].get("progress", 0.0))
+                    server_stage = str(result_json[0].get("stage", ""))
+                else:
+                    server_progress = 0.0
+                    server_stage = ""
+            except (json.JSONDecodeError, TypeError, ValueError):
+                server_progress = 0.0
+                server_stage = ""
+
+            # Update live phase state for the tick callback
+            self.xl_gen_progress = server_progress
+            self.xl_gen_stage_text = progress_text or server_stage
+
+            if progress_text:
+                last_status_update = elapsed
+            elif status == 0 and elapsed - last_status_update > 10:
+                last_status_update = elapsed
+
+            self.log_debug("ACESTEP_XL_POLL", status=status, elapsed=f"{elapsed:.0f}s", progress=progress_text[:100] if progress_text else "", raw_item=str(item)[:300])
+
+            # status 1 = succeeded, status 0 = running, status 2 = failed
+            if status == 1:
+                # Record generation phase timing
+                gen_elapsed = time.time() - t_gen_start
+                self.record_tutorial_phase_timing(XL_PHASE_GENERATION, gen_elapsed)
+                self.log_debug("ACESTEP_XL_GEN_PHASE", elapsed=f"{gen_elapsed:.1f}s")
+                self.acestep_model_loaded = True
+
+                # Parse the result to get audio path
+                result_str = item.get("result", "")
+                try:
+                    result_list = json.loads(result_str) if isinstance(result_str, str) else result_str
+                except (json.JSONDecodeError, TypeError):
+                    result_list = result_str
+
+                audio_url = None
+                if isinstance(result_list, list) and result_list:
+                    first = result_list[0] if isinstance(result_list[0], dict) else {}
+                    audio_url = first.get("file", "")
+
+                self.log_debug("ACESTEP_XL_RESULT", audio_url=str(audio_url)[:200], result_sample=str(result_list)[:300])
+                if audio_url:
+                    # -- Phase: Downloading --
+                    self.xl_gen_phase = "downloading"
+                    self.xl_gen_phase_start = time.time()
+                    self.xl_gen_progress = 0.0
+                    t_dl_start = time.time()
+                    result_path = self._download_acestep_audio(audio_url, task_id)
+                    dl_elapsed = time.time() - t_dl_start
+                    self.record_tutorial_phase_timing(XL_PHASE_DOWNLOAD, dl_elapsed)
+                    self.log_debug("ACESTEP_XL_DL_PHASE", elapsed=f"{dl_elapsed:.1f}s")
+                    self.xl_gen_phase = None
+                    return result_path
+                else:
+                    self.log_debug("ACESTEP_XL_NO_AUDIO", result=str(result_list)[:500])
+                    self.xl_gen_phase = None
+                    return None
+            elif status == 2:
+                # During model loading, the cache can briefly return status=2 with empty data.
+                # Only treat as a real failure if we've been running long enough for models to load.
+                if elapsed < 60:
+                    self.log_debug("ACESTEP_XL_STATUS2_EARLY", elapsed=f"{elapsed:.0f}s", item=str(item)[:300])
+                    continue  # Keep polling — models may still be loading
+                self.log_debug("ACESTEP_XL_FAILED", task_id=task_id, result=str(item)[:500])
+                self.xl_gen_phase = None
+                return None
+
+        self.log_debug("ACESTEP_XL_TIMEOUT", task_id=task_id, elapsed=f"{time.time() - start_time:.0f}s")
+        self.xl_gen_phase = None
+        return None
+
+    def _download_acestep_audio(self, audio_path_or_url, task_id):
+        try:
+            dest_filename = f"ACE_XL_{int(time.time())}_{task_id[:8]}.wav"
+            dest_path = os.path.join(self.audio_dir, dest_filename)
+            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+
+            # The API result "file" field can be:
+            #   1) A relative URL: /v1/audio?path=<encoded_path>
+            #   2) A full URL: http://...
+            #   3) A local filesystem path: D:\...\file.wav
+            if audio_path_or_url.startswith("http://") or audio_path_or_url.startswith("https://"):
+                download_url = audio_path_or_url
+            elif audio_path_or_url.startswith("/v1/audio"):
+                # Relative URL from API — prepend base URL
+                download_url = f"{ACESTEP_API_URL}{audio_path_or_url}"
+            elif os.path.isfile(audio_path_or_url):
+                # Local filesystem path — just copy the file directly
+                shutil.copy2(audio_path_or_url, dest_path)
+                self.log_debug("ACESTEP_XL_AUDIO_COPIED", src=audio_path_or_url, dest=dest_path)
+                return dest_path
+            else:
+                # Assume it's a path that needs URL-encoding for the /v1/audio endpoint
+                encoded = urllib.parse.quote(audio_path_or_url, safe="")
+                download_url = f"{ACESTEP_API_URL}/v1/audio?path={encoded}"
+
+            self.log_debug("ACESTEP_XL_DOWNLOADING", url=download_url[:200])
+            urllib.request.urlretrieve(download_url, dest_path)
+
+            if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+                self.log_debug("ACESTEP_XL_AUDIO_DOWNLOADED", dest_path=dest_path, size=os.path.getsize(dest_path))
+                return dest_path
+            else:
+                self.log_debug("ACESTEP_XL_DOWNLOAD_EMPTY", dest_path=dest_path)
+                return None
+        except Exception as e:
+            self.log_debug("ACESTEP_XL_DOWNLOAD_ERROR", details=str(e))
+            return None
 
     def _sync_video_settings_from_workflow(self, force=False):
         if not self.workflow:
@@ -10589,6 +11483,16 @@ class LTXQueueManager:
             self._refresh_chatbot_runtime_ui()
             self.load_tutorial_phase_history()
 
+            # On first launch, let the user choose where to store projects
+            if self.is_first_launch and not settings.get("output_root"):
+                chosen = filedialog.askdirectory(
+                    title="Choose Output Folder — Where should Prompt2MTV store your projects?",
+                    initialdir=self.base_output_dir,
+                )
+                if chosen:
+                    self.base_output_dir = self._normalize_path(chosen)
+                    os.makedirs(self.base_output_dir, exist_ok=True)
+
             last_project = self._normalize_path(settings.get("last_project_dir"))
             if last_project and os.path.exists(last_project):
                 self.set_project(last_project)
@@ -10830,6 +11734,7 @@ class LTXQueueManager:
             self.eta_active_phase = None
             self.eta_item_start_time = None
             self.eta_phase_start_time = None
+            self.eta_variant_timing_key = None
             self._stop_eta_tick()
             try:
                 self.eta_panel_frame.pack_forget()
@@ -10869,6 +11774,10 @@ class LTXQueueManager:
             self.eta_countdown_label.config(text=f"ETA: {self._format_eta_display(eta_seconds)}")
             if total > 1:
                 self.eta_item_label.config(text=f"Item {current} of {total}")
+            elif self.ws_progress.get("total", 0) > 0:
+                ws_step = self.ws_progress.get("step", 0)
+                ws_total = self.ws_progress["total"]
+                self.eta_item_label.config(text=f"Step {ws_step} of {ws_total}")
             else:
                 self.eta_item_label.config(text="Processing...")
         except tk.TclError:
@@ -10884,13 +11793,147 @@ class LTXQueueManager:
         stage = progress_state.get("stage", "")
         if stage in ("complete", "failed"):
             return
-        completed = current - 1 if stage not in ("item_complete",) else current
-        eta_seconds = self._calculate_phase_eta(self.eta_active_phase, max(completed, 0), total)
-        try:
-            self.eta_elapsed_label.config(text=f"Elapsed: {self._format_elapsed_display(elapsed)}")
-            self.eta_countdown_label.config(text=f"ETA: {self._format_eta_display(eta_seconds)}")
-        except tk.TclError:
-            pass
+
+        # XL generation: phase-aware ETA using server progress and historical averages
+        if self.eta_active_phase == "music_generate_xl" and self.xl_gen_phase:
+            phase = self.xl_gen_phase
+            phase_elapsed = (time.time() - self.xl_gen_phase_start) if self.xl_gen_phase_start else elapsed
+            server_progress = self.xl_gen_progress
+            stage_text = self.xl_gen_stage_text
+
+            if phase in ("submitting", "model_loading"):
+                # Use historical cold/warm submit average for ETA
+                if phase == "model_loading" or not self.acestep_model_loaded:
+                    avg = self.get_tutorial_phase_average_seconds(XL_PHASE_SUBMIT_COLD, fallback_seconds=XL_COLD_START_DEFAULT_SECONDS)
+                    phase_label = "Loading XL model (first run ~7 min)..."
+                else:
+                    avg = self.get_tutorial_phase_average_seconds(XL_PHASE_SUBMIT_WARM, fallback_seconds=XL_WARM_SUBMIT_DEFAULT_SECONDS)
+                    phase_label = "Submitting..."
+                eta_seconds = max(0.0, avg - phase_elapsed) if avg else None
+                pct = min(95, int((phase_elapsed / avg) * 100)) if avg and avg > 0 else 0
+                try:
+                    self.eta_progress_bar["value"] = pct
+                    self.eta_percent_label.config(text=f"{pct}%")
+                    self.eta_elapsed_label.config(text=f"Elapsed: {self._format_elapsed_display(elapsed)}")
+                    self.eta_countdown_label.config(text=f"ETA: {self._format_eta_display(eta_seconds)}")
+                    self.eta_item_label.config(text=phase_label)
+                    self.music_status_label.config(
+                        text=f"Status: {phase_label} ({self._format_elapsed_display(elapsed)}, ETA: {self._format_eta_display(eta_seconds)})",
+                        fg="blue",
+                    )
+                    self._update_collapsible_section_meta("music_actions", f"XL: {phase_label}")
+                except tk.TclError:
+                    pass
+            elif phase == "generating":
+                # Use server progress for real-time ETA when available
+                if server_progress > 0.01 and phase_elapsed > 0:
+                    eta_seconds = (phase_elapsed / server_progress) * (1.0 - server_progress)
+                    pct = int(server_progress * 100)
+                else:
+                    avg = self.get_tutorial_phase_average_seconds(XL_PHASE_GENERATION, fallback_seconds=XL_GENERATION_DEFAULT_SECONDS)
+                    eta_seconds = max(0.0, avg - phase_elapsed) if avg else None
+                    pct = min(95, int((phase_elapsed / avg) * 100)) if avg and avg > 0 else 0
+                progress_label = f"Generating audio — {pct}%"
+                if stage_text:
+                    progress_label = f"Generating — {stage_text}"
+                try:
+                    self.eta_progress_bar["value"] = pct
+                    self.eta_percent_label.config(text=f"{pct}%")
+                    self.eta_elapsed_label.config(text=f"Elapsed: {self._format_elapsed_display(elapsed)}")
+                    self.eta_countdown_label.config(text=f"ETA: {self._format_eta_display(eta_seconds)}")
+                    self.eta_item_label.config(text=progress_label)
+                    self.music_status_label.config(
+                        text=f"Status: {progress_label} ({self._format_elapsed_display(elapsed)}, ETA: {self._format_eta_display(eta_seconds)})",
+                        fg="blue",
+                    )
+                    self._update_collapsible_section_meta("music_actions", f"XL: {progress_label}")
+                except tk.TclError:
+                    pass
+            elif phase == "downloading":
+                avg = self.get_tutorial_phase_average_seconds(XL_PHASE_DOWNLOAD, fallback_seconds=XL_DOWNLOAD_DEFAULT_SECONDS)
+                eta_seconds = max(0.0, avg - phase_elapsed) if avg else None
+                try:
+                    self.eta_progress_bar["value"] = 95
+                    self.eta_percent_label.config(text="95%")
+                    self.eta_elapsed_label.config(text=f"Elapsed: {self._format_elapsed_display(elapsed)}")
+                    self.eta_countdown_label.config(text=f"ETA: {self._format_eta_display(eta_seconds)}")
+                    self.eta_item_label.config(text="Downloading audio...")
+                    self.music_status_label.config(
+                        text=f"Status: Downloading audio... ({self._format_elapsed_display(elapsed)})",
+                        fg="blue",
+                    )
+                except tk.TclError:
+                    pass
+            self.eta_tick_id = self.root.after(1000, self._tick_eta_display)
+            return
+
+        # Chatbot phases: use historical cold/warm averages for ETA
+        if str(self.eta_active_phase or "").startswith("chatbot_"):
+            is_cold = str(self.eta_active_phase or "").endswith("_cold")
+            fallback = CHATBOT_COLD_START_DEFAULT_SECONDS if is_cold else CHATBOT_WARM_DEFAULT_SECONDS
+            avg = self.get_tutorial_phase_average_seconds(self.eta_active_phase, fallback_seconds=fallback)
+            eta_seconds = max(0.0, avg - elapsed) if avg else None
+            pct = min(95, int((elapsed / avg) * 100)) if avg and avg > 0 else 0
+            status_text = progress_state.get("status", "")
+            display_name = PHASE_DISPLAY_NAMES.get(self.eta_active_phase, "Chatbot")
+            elapsed_str = self._format_elapsed_display(elapsed)
+            eta_str = self._format_eta_display(eta_seconds) if eta_seconds is not None else "Estimating..."
+            try:
+                self.eta_progress_bar["value"] = pct
+                self.eta_percent_label.config(text=f"{pct}%")
+                self.eta_elapsed_label.config(text=f"Elapsed: {elapsed_str}")
+                self.eta_countdown_label.config(text=f"ETA: {eta_str}")
+                self.eta_item_label.config(text=status_text or display_name)
+                # Update chatbot in-tab status label with live elapsed/ETA
+                if hasattr(self, "chatbot_result_status_label") and self.chatbot_generation_in_progress:
+                    inline_text = f"{status_text or display_name}  ({elapsed_str}, ETA: {eta_str})"
+                    self.chatbot_result_status_label.config(text=inline_text)
+            except tk.TclError:
+                pass
+            self.eta_tick_id = self.root.after(1000, self._tick_eta_display)
+            return
+
+        # Use WebSocket step-level progress when available
+        ws_step = self.ws_progress.get("step", 0)
+        ws_total = self.ws_progress.get("total", 0)
+        if ws_total > 0 and ws_step > 0:
+            pct = int((ws_step / ws_total) * 100)
+            if elapsed > 0 and ws_step > 0:
+                secs_per_step = elapsed / ws_step
+                remaining_steps = ws_total - ws_step
+                eta_seconds = remaining_steps * secs_per_step
+            else:
+                eta_seconds = self._calculate_phase_eta(self.eta_active_phase, max(current - 1, 0), total)
+            step_label = f"Step {ws_step} of {ws_total}"
+            try:
+                self.eta_progress_bar["value"] = pct
+                self.eta_percent_label.config(text=f"{pct}%")
+                self.eta_elapsed_label.config(text=f"Elapsed: {self._format_elapsed_display(elapsed)}")
+                self.eta_countdown_label.config(text=f"ETA: {self._format_eta_display(eta_seconds)}")
+                self.eta_item_label.config(text=step_label)
+                # Update music status label with step progress
+                if self.eta_active_phase == "music_generate":
+                    self.music_status_label.config(text=f"Status: Generating Music... {step_label} ({pct}%)", fg="blue")
+                    self._update_collapsible_section_meta("music_actions", f"Generating... {step_label} ({pct}%)")
+            except tk.TclError:
+                pass
+        else:
+            # Fallback to historical ETA when no WS data
+            # Prefer variant-specific timing key for music generation
+            eta_phase_key = self.eta_variant_timing_key or self.eta_active_phase
+            completed = current - 1 if stage not in ("item_complete",) else current
+            eta_seconds = self._calculate_phase_eta(eta_phase_key, max(completed, 0), total)
+            try:
+                self.eta_elapsed_label.config(text=f"Elapsed: {self._format_elapsed_display(elapsed)}")
+                self.eta_countdown_label.config(text=f"ETA: {self._format_eta_display(eta_seconds)}")
+                # Show elapsed time in music status even without WS step data
+                if self.eta_active_phase == "music_generate" and stage in ("running", "queued", "submitting"):
+                    elapsed_str = self._format_elapsed_display(elapsed)
+                    eta_str = self._format_eta_display(eta_seconds) if eta_seconds is not None else "Estimating..."
+                    self.music_status_label.config(text=f"Status: Generating Music... ({elapsed_str}, ETA: {eta_str})", fg="blue")
+                    self._update_collapsible_section_meta("music_actions", f"Generating... ({elapsed_str})")
+            except tk.TclError:
+                pass
         self.eta_tick_id = self.root.after(1000, self._tick_eta_display)
 
     def _start_eta_tick(self):
@@ -12075,7 +13118,7 @@ class LTXQueueManager:
             prompt_preview=self._truncate_text(prompt_preview, 160)
         )
 
-        p = {"prompt": workflow}
+        p = {"prompt": workflow, "client_id": self.comfyui_client_id}
         data = json.dumps(p).encode('utf-8')
         req = urllib.request.Request("http://127.0.0.1:8188/prompt", data=data)
         req.add_header('Content-Type', 'application/json')
@@ -12094,8 +13137,31 @@ class LTXQueueManager:
                     return response_data.get("prompt_id")
             except urllib.error.HTTPError as e:
                 if e.code == 400:
-                    self.update_status("Error: 400 Bad Request (Invalid JSON workflow).", "red")
-                    self.log_debug("QUEUE_PROMPT_ERROR", reason="http_400", details=str(e))
+                    error_body = ""
+                    try:
+                        error_body = e.read().decode('utf-8', errors='replace')
+                        error_detail = json.loads(error_body)
+                        node_errors = error_detail.get("node_errors", {})
+                        error_msg = error_detail.get("error", {}).get("message", "")
+                        if node_errors:
+                            first_node_id = next(iter(node_errors), "")
+                            first_node = node_errors[first_node_id]
+                            node_errors_list = first_node.get("errors", [])
+                            if node_errors_list:
+                                raw_msg = node_errors_list[0].get("message", error_msg)
+                                # Provide a human-readable message for common errors
+                                if raw_msg == "Value not in list" and first_node.get("class_type") == "UNETLoader":
+                                    bad_value = node_errors_list[0].get("details", "")
+                                    error_msg = f"Model file not found in ComfyUI: {bad_value}" if bad_value else "Selected model file not found in ComfyUI. Download it or switch variants."
+                                else:
+                                    error_msg = raw_msg
+                        if error_msg:
+                            self.update_status(f"ComfyUI Error: {error_msg}", "red")
+                        else:
+                            self.update_status("Error: 400 Bad Request (Invalid JSON workflow).", "red")
+                    except Exception:
+                        self.update_status("Error: 400 Bad Request (Invalid JSON workflow).", "red")
+                    self.log_debug("QUEUE_PROMPT_ERROR", reason="http_400", details=str(e), body=error_body[:500])
                     return None
                 if attempt < max_retries - 1:
                     self.update_status(f"Server booting, retrying ({attempt+1}/{max_retries})...", "orange")
@@ -12146,12 +13212,76 @@ class LTXQueueManager:
     def download_comfyui_video(self, filename, subfolder, folder_type, dest_path):
         return self.download_comfyui_media(filename, subfolder, folder_type, dest_path)
 
+    def _start_ws_progress_listener(self, prompt_id):
+        """Start a background WebSocket listener that captures per-step KSampler progress from ComfyUI."""
+        if not WS_AVAILABLE:
+            return
+        self.ws_progress = {"step": 0, "total": 0, "active": False}
+
+        def _ws_listener():
+            ws = None
+            try:
+                ws_url = f"ws://127.0.0.1:8188/ws?clientId={self.comfyui_client_id}"
+                ws = _ws_mod.create_connection(ws_url, timeout=10)
+                ws.settimeout(2.0)
+                self.ws_progress["active"] = True
+                while self.ws_progress.get("active", False):
+                    try:
+                        raw = ws.recv()
+                    except _ws_mod.WebSocketTimeoutException:
+                        continue
+                    except Exception:
+                        break
+                    if isinstance(raw, bytes):
+                        continue
+                    try:
+                        msg = json.loads(raw)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    msg_type = msg.get("type", "")
+                    data = msg.get("data", {})
+                    if msg_type == "progress":
+                        self.ws_progress["step"] = data.get("value", 0)
+                        self.ws_progress["total"] = data.get("max", 0)
+                    elif msg_type == "executing" and data.get("node") is None:
+                        # Execution finished for this prompt
+                        if data.get("prompt_id") == prompt_id:
+                            break
+                    elif msg_type == "execution_complete":
+                        if data.get("prompt_id") == prompt_id:
+                            break
+            except Exception as e:
+                self.log_debug("WS_PROGRESS_LISTENER_ERROR", details=str(e))
+            finally:
+                self.ws_progress["active"] = False
+                if ws is not None:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+
+        self.ws_thread = threading.Thread(target=_ws_listener, daemon=True)
+        self.ws_thread.start()
+
+    def _stop_ws_progress_listener(self):
+        """Signal the WebSocket listener to stop."""
+        self.ws_progress["active"] = False
+        self.ws_thread = None
+
     def wait_for_completion(self, prompt_id, is_music=False, output_kind=None, destination_dir=None, prompt_text="", tutorial_progress_phase=None, tutorial_progress_current=None, tutorial_progress_total=None, tutorial_progress_label=""):
         resolved_output_kind = output_kind or ("audio" if is_music else "video")
         resolved_destination_dir = destination_dir or self._get_output_directory_for_kind(resolved_output_kind)
         progress_label = tutorial_progress_label or resolved_output_kind.title()
         progress_current = tutorial_progress_current if tutorial_progress_current is not None else 1
         progress_total = tutorial_progress_total if tutorial_progress_total is not None else 1
+        error_count = 0
+        self._start_ws_progress_listener(prompt_id)
+        try:
+            return self._poll_for_completion(prompt_id, is_music, resolved_output_kind, resolved_destination_dir, prompt_text, tutorial_progress_phase, progress_current, progress_total, progress_label)
+        finally:
+            self._stop_ws_progress_listener()
+
+    def _poll_for_completion(self, prompt_id, is_music, resolved_output_kind, resolved_destination_dir, prompt_text, tutorial_progress_phase, progress_current, progress_total, progress_label):
         error_count = 0
         if tutorial_progress_phase:
             self._set_tutorial_runtime_progress(
@@ -12342,10 +13472,6 @@ class LTXQueueManager:
             messagebox.showwarning("Warning", "Music workflow JSON not loaded.")
             return
             
-        if not self.selected_video_for_music:
-            messagebox.showwarning("Warning", "Please select a video from the Video Generation tab first.")
-            return
-            
         tags = self.music_tags_text.get("1.0", tk.END).strip()
         lyrics = self.music_lyrics_text.get("1.0", tk.END).strip()
         
@@ -12362,6 +13488,41 @@ class LTXQueueManager:
         thread.start()
 
     def run_music_generation(self, tags, lyrics):
+        # Determine variant-specific timing key for accurate ETA
+        variant_info = MUSIC_MODEL_VARIANT_MAP.get(self.music_model_variant_var.get(), MUSIC_MODEL_VARIANT_MAP[MUSIC_MODEL_VARIANT_DEFAULT])
+        variant_suffix = variant_info.get("filename", "").replace("acestep_v1.5_", "").replace("_bf16", "").replace(".safetensors", "")
+        if not variant_suffix:
+            variant_suffix = "turbo"
+        timing_key = f"music_generate_{variant_suffix}"
+        # Reset WS progress state
+        self.ws_progress = {"step": 0, "total": 0, "active": False}
+        self.eta_variant_timing_key = timing_key
+
+        # Route XL variants to ACE-Step REST API instead of ComfyUI
+        if self._is_xl_music_variant():
+            self._run_music_generation_xl(tags, lyrics, variant_info, timing_key)
+            return
+
+        # Pre-flight: verify the selected model file exists in ComfyUI
+        model_filename = variant_info["filename"]
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:8188/object_info/UNETLoader")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                info = json.loads(resp.read().decode())
+            available_models = info.get("UNETLoader", {}).get("input", {}).get("required", {}).get("unet_name", [[]])[0]
+            if model_filename not in available_models:
+                display_name = self.music_model_variant_var.get()
+                self.update_music_status(
+                    f"Model '{model_filename}' not found in ComfyUI. "
+                    f"Download it via 'Install Missing Models' or switch to a different variant.",
+                    "red",
+                )
+                self.log_debug("MUSIC_MODEL_MISSING", model=model_filename, variant=display_name, available=str(available_models))
+                self.root.after(0, lambda: self.gen_music_btn.config(state=tk.NORMAL))
+                return
+        except Exception:
+            pass  # If the check fails, proceed anyway and let ComfyUI report the error
+
         self._set_tutorial_runtime_progress(
             "music_generate",
             reset=True,
@@ -12376,6 +13537,9 @@ class LTXQueueManager:
         try:
             self._normalize_music_workflow(self.music_workflow)
             music_seed = self._build_music_seed()
+            # Set the selected XL model variant on the UNETLoader node
+            variant_info = MUSIC_MODEL_VARIANT_MAP.get(self.music_model_variant_var.get(), MUSIC_MODEL_VARIANT_MAP[MUSIC_MODEL_VARIANT_DEFAULT])
+            self.music_workflow["104"]["inputs"]["unet_name"] = variant_info["filename"]
             # Update workflow
             self.music_workflow["94"]["inputs"]["tags"] = tags
             self.music_workflow["94"]["inputs"]["lyrics"] = lyrics
@@ -12409,6 +13573,7 @@ class LTXQueueManager:
             
         prompt_id = self.queue_prompt(self.music_workflow)
         if not prompt_id:
+            self.update_music_status("Failed to submit workflow to ComfyUI.", "red")
             self._set_tutorial_runtime_progress("music_generate", status="Failed to submit soundtrack workflow.", current=1, total=1, item_label="Soundtrack", stage="failed")
             self.root.after(0, lambda: self.gen_music_btn.config(state=tk.NORMAL))
             return
@@ -12425,17 +13590,94 @@ class LTXQueueManager:
         )
         
         if success and self.current_generated_audio:
-            self.record_tutorial_phase_timing("music_generate", time.time() - item_start)
+            elapsed = time.time() - item_start
+            self.record_tutorial_phase_timing(timing_key, elapsed)
+            # Also record under the generic key for fallback ETA
+            self.record_tutorial_phase_timing("music_generate", elapsed)
             self.update_music_status("Music Generation Complete! Ready to preview or merge.", "green")
             self._set_tutorial_runtime_progress("music_generate", status="Soundtrack generation complete.", current=1, total=1, item_label="Soundtrack", stage="complete", output_path=self.current_generated_audio)
             self.root.after(0, lambda: self.preview_music_btn.config(state=tk.NORMAL))
-            self.root.after(0, lambda: self.merge_music_btn.config(state=tk.NORMAL))
+            if self.selected_video_for_music:
+                self.root.after(0, lambda: self.merge_music_btn.config(state=tk.NORMAL))
             self.root.after(0, self._refresh_music_sidebar_state)
         else:
             self.update_music_status("Music Generation Failed.", "red")
             self._set_tutorial_runtime_progress("music_generate", status="Soundtrack generation failed.", current=1, total=1, item_label="Soundtrack", stage="failed")
             self.root.after(0, self._refresh_music_sidebar_state)
             
+        self.root.after(0, lambda: self.gen_music_btn.config(state=tk.NORMAL))
+
+    def _run_music_generation_xl(self, tags, lyrics, variant_info, timing_key):
+        self._set_tutorial_runtime_progress(
+            "music_generate",
+            reset=True,
+            status="Checking ACE-Step API server...",
+            current=0,
+            total=1,
+            item_label="Soundtrack (XL)",
+            stage="preparing",
+        )
+
+        # Check API health; try to launch if not running
+        if not self._check_acestep_api_health():
+            self.update_music_status("ACE-Step API not running. Attempting to launch...", "orange")
+            launched = self._launch_acestep_api_server()
+            if launched:
+                self.update_music_status("Waiting for ACE-Step API server to start...", "blue")
+                if not self._wait_for_acestep_api(timeout=180):
+                    self.update_music_status(
+                        "ACE-Step API server did not become ready. "
+                        "Start it manually with start_api_server.bat in ACE-Step-1.5, or switch to the Turbo variant.",
+                        "red",
+                    )
+                    self._set_tutorial_runtime_progress("music_generate", status="ACE-Step API server not available.", current=1, total=1, item_label="Soundtrack (XL)", stage="failed")
+                    self.root.after(0, lambda: self.gen_music_btn.config(state=tk.NORMAL))
+                    return
+            else:
+                self.update_music_status(
+                    "ACE-Step API server not found. Install ACE-Step-1.5 next to your ComfyUI folder, "
+                    "or start the API server manually, then retry.",
+                    "red",
+                )
+                self._set_tutorial_runtime_progress("music_generate", status="ACE-Step API not available.", current=1, total=1, item_label="Soundtrack (XL)", stage="failed")
+                self.root.after(0, lambda: self.gen_music_btn.config(state=tk.NORMAL))
+                return
+
+        self.update_music_status("Generating Music (XL model via ACE-Step API)...", "blue")
+        self._set_tutorial_runtime_progress("music_generate", status="Submitting XL generation to ACE-Step API...", current=1, total=1, item_label="Soundtrack (XL)", stage="submitting")
+
+        # Show the ETA panel for XL generation
+        self.root.after(0, lambda: self._show_eta_panel("music_generate_xl", total=1, current=0))
+
+        item_start = time.time()
+        self.eta_item_start_time = item_start
+
+        audio_path = self._generate_music_xl(tags, lyrics, variant_info)
+
+        if audio_path and os.path.exists(audio_path):
+            self.current_generated_audio = audio_path
+            self.current_audio_source = "generated"
+            elapsed = time.time() - item_start
+            self.record_tutorial_phase_timing(timing_key, elapsed)
+            self.record_tutorial_phase_timing("music_generate", elapsed)
+            self.update_music_status("XL Music Generation Complete! Ready to preview or merge.", "green")
+            self._set_tutorial_runtime_progress("music_generate", status="Soundtrack generation complete (XL).", current=1, total=1, item_label="Soundtrack (XL)", stage="complete", output_path=audio_path)
+            self.root.after(0, lambda: self._update_eta_display("music_generate_xl", 1, 1, stage="complete"))
+            self.root.after(0, lambda: self.preview_music_btn.config(state=tk.NORMAL))
+            if self.selected_video_for_music:
+                self.root.after(0, lambda: self.merge_music_btn.config(state=tk.NORMAL))
+            self.root.after(0, self._refresh_music_sidebar_state)
+        else:
+            self.update_music_status("XL Music Generation Failed. Check the ACE-Step API server console for details.", "red")
+            self._set_tutorial_runtime_progress("music_generate", status="Soundtrack generation failed (XL).", current=1, total=1, item_label="Soundtrack (XL)", stage="failed")
+            self.root.after(0, lambda: self._update_eta_display("music_generate_xl", 0, 1, stage="failed"))
+            self.root.after(0, self._refresh_music_sidebar_state)
+
+        # Clean up XL phase state
+        self.xl_gen_phase = None
+        self.xl_gen_phase_start = None
+        self.xl_gen_progress = 0.0
+        self.xl_gen_stage_text = ""
         self.root.after(0, lambda: self.gen_music_btn.config(state=tk.NORMAL))
 
     def preview_audio(self):

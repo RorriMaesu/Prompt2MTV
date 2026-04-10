@@ -2,3 +2,4 @@ pillow
 ttkbootstrap
 imageio-ffmpeg
 tkinterdnd2
+websocket-client
