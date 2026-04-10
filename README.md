@@ -12,6 +12,23 @@
 - **One-click merge** — Stitch clips, sync audio, and export final music videos
 - **Project management** — Batch prompt queue, media gallery, drag-and-drop import, per-project settings
 
+## Screenshots
+
+### Chatbot — AI Creative Assistant
+![Chatbot tab](screenshots/01_chatbot.png)
+
+### Image Phase — Batch Prompt Queue
+![Image Phase tab](screenshots/02_image_phase.png)
+
+### Video Generation — Scene Timeline & Workflow
+![Video Generation tab](screenshots/03_video_generation.png)
+
+### Gallery — Media Browser
+![Gallery tab](screenshots/04_gallery.png)
+
+### Music Studio — AI Score Composer
+![Music Studio tab](screenshots/05_music_studio.png)
+
 ## Quick Start
 
 ### 1. Install ComfyUI
