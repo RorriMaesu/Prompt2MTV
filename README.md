@@ -9,6 +9,7 @@
 - **AI Video** — Generate scenes with LTX 2.3 (text-to-video and image-to-video)
 - **AI Music** — Compose original tracks with ACE-Step 1.5-XL (Turbo or SFT variants)
 - **AI Chatbot** — Plan and refine scene prompts, brainstorm song concepts, and generate structured lyrics with a local Qwen 3 or Gemma 4 assistant
+- **Autonomous Mode** — One-click pipeline that takes a creative brief and automatically generates all scenes, composes music, and merges the final video
 - **One-click merge** — Stitch clips, sync audio, and export final music videos
 - **Project management** — Batch prompt queue, media gallery, drag-and-drop import, per-project settings
 
@@ -88,12 +89,20 @@ If ComfyUI is in a non-default location, use **Project → Configure Runtime Pat
 
 1. Create or open a project
 2. *(Optional)* Use the AI chatbot to brainstorm and structure scene prompts or song lyrics
-3. Add prompts to the batch queue
-4. Generate video scenes through ComfyUI
-5. Review clips in the gallery (or import your own)
-6. Stitch selected clips together
-7. Generate a music track with ACE-Step (or import your own audio)
-8. Merge audio and video into the final music video
+3. **Autonomous mode** — Enter a creative brief, set the target duration, and click Start. The app handles everything from scene generation through final merge.
+4. **Or go manual** — Add prompts to the batch queue, generate scenes, review in the gallery, stitch clips, generate music, and merge manually.
+
+### Autonomous Mode
+
+Autonomous mode lives in the Chatbot tab under the collapsible **Autonomous Mode** section. Write a short creative brief describing the music video you want, set the target duration in seconds, and click **Start**. The app will:
+
+1. Expand your brief into a full scene plan using the AI chatbot
+2. Generate video scenes through ComfyUI
+3. Stitch them together
+4. Compose a matching soundtrack with ACE-Step
+5. Merge audio and video into the final music video
+
+A readiness indicator shows when ComfyUI is online. If you click Start before it's ready, the status label flashes to let you know. Once ComfyUI history is available, an ETA countdown appears during startup based on previous launch times.
 
 ## Required Models (~62 GB)
 
@@ -160,7 +169,7 @@ python ltx_queue_manager.py
 
 ```powershell
 .\build_exe.bat              # → dist\Prompt2MTV\Prompt2MTV.exe
-.\build_installer.bat        # → dist_installer\Prompt2MTV-Setup-1.2.0.exe
+.\.build_installer.bat        # → dist_installer\Prompt2MTV-Setup-1.5.0.exe
 ```
 
 ### Upgrade helper

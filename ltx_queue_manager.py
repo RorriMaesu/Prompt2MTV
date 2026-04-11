@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, simpledialog
 import copy
 import json
+import math
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -146,6 +147,51 @@ CHATBOT_PHASE_SONG_FINALIZE_COLD = "chatbot_song_finalize_cold"
 CHATBOT_PHASE_SONG_FINALIZE_WARM = "chatbot_song_finalize_warm"
 CHATBOT_COLD_START_DEFAULT_SECONDS = 45
 CHATBOT_WARM_DEFAULT_SECONDS = 10
+AUTONOMOUS_STATE_IDLE = "idle"
+AUTONOMOUS_STATE_EXPANDING_CONCEPT = "expanding_concept"
+AUTONOMOUS_STATE_PLANNING_SCENES = "planning_scenes"
+AUTONOMOUS_STATE_PLANNING_SONG = "planning_song"
+AUTONOMOUS_STATE_GENERATING_IMAGES = "generating_images"
+AUTONOMOUS_STATE_BUILDING_TIMELINE = "building_timeline"
+AUTONOMOUS_STATE_RENDERING = "rendering"
+AUTONOMOUS_STATE_STITCHING = "stitching"
+AUTONOMOUS_STATE_GENERATING_MUSIC = "generating_music"
+AUTONOMOUS_STATE_MERGING = "merging"
+AUTONOMOUS_STATE_COMPLETE = "complete"
+AUTONOMOUS_STATE_FAILED = "failed"
+AUTONOMOUS_PHASE_LABELS = {
+    AUTONOMOUS_STATE_EXPANDING_CONCEPT: "Expanding Concept",
+    AUTONOMOUS_STATE_PLANNING_SCENES: "Planning Scenes",
+    AUTONOMOUS_STATE_PLANNING_SONG: "Writing Song",
+    AUTONOMOUS_STATE_GENERATING_IMAGES: "Generating Images",
+    AUTONOMOUS_STATE_BUILDING_TIMELINE: "Building Timeline",
+    AUTONOMOUS_STATE_RENDERING: "Rendering Videos",
+    AUTONOMOUS_STATE_STITCHING: "Stitching Clips",
+    AUTONOMOUS_STATE_GENERATING_MUSIC: "Generating Music",
+    AUTONOMOUS_STATE_MERGING: "Final Merge",
+}
+AUTONOMOUS_PHASE_ORDER = [
+    AUTONOMOUS_STATE_EXPANDING_CONCEPT,
+    AUTONOMOUS_STATE_PLANNING_SCENES,
+    AUTONOMOUS_STATE_PLANNING_SONG,
+    AUTONOMOUS_STATE_GENERATING_IMAGES,
+    AUTONOMOUS_STATE_BUILDING_TIMELINE,
+    AUTONOMOUS_STATE_RENDERING,
+    AUTONOMOUS_STATE_STITCHING,
+    AUTONOMOUS_STATE_GENERATING_MUSIC,
+    AUTONOMOUS_STATE_MERGING,
+]
+AUTONOMOUS_PHASE_WEIGHTS = {
+    AUTONOMOUS_STATE_EXPANDING_CONCEPT: 0.03,
+    AUTONOMOUS_STATE_PLANNING_SCENES: 0.04,
+    AUTONOMOUS_STATE_PLANNING_SONG: 0.03,
+    AUTONOMOUS_STATE_GENERATING_IMAGES: 0.25,
+    AUTONOMOUS_STATE_BUILDING_TIMELINE: 0.01,
+    AUTONOMOUS_STATE_RENDERING: 0.40,
+    AUTONOMOUS_STATE_STITCHING: 0.04,
+    AUTONOMOUS_STATE_GENERATING_MUSIC: 0.15,
+    AUTONOMOUS_STATE_MERGING: 0.05,
+}
 PERSISTED_MUSIC_SECTION_KEYS = [
     "music_prompt",
     "music_lyrics",
@@ -160,7 +206,7 @@ WINDOWS_HIDE = 0
 WINDOWS_SHOW = 5
 WINDOWS_RESTORE = 9
 APP_NAME = "Prompt2MTV"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.5.0"
 APP_PUBLISHER = "Prompt2MTV"
 APP_TAGLINE = "Local AI Music Video Studio"
 ENV_COMFYUI_ROOT_KEYS = ("PROMPT2MTV_COMFYUI_ROOT", "COMFYUI_ROOT")
@@ -219,6 +265,7 @@ PHASE_DISPLAY_NAMES = {
     "chatbot_t2i_optimize_warm": "Generating Prompt Draft",
     "chatbot_song_finalize_cold": "Finalizing Song (loading model)",
     "chatbot_song_finalize_warm": "Finalizing Song",
+    "autonomous_pipeline": "Autonomous Music Video Pipeline",
 }
 CHATBOT_BACKEND_MODE_CONNECT = "connect"
 CHATBOT_BACKEND_MODE_MANAGED = "managed"
@@ -226,7 +273,11 @@ CHATBOT_BACKEND_MODE_OLLAMA = "ollama"
 CHATBOT_TASK_CHAT = "Chat / Explore"
 CHATBOT_TASK_T2I_OPTIMIZE = "Optimize Image Prompt (T2I)"
 CHATBOT_TASK_SCENE_PLAN = "Plan Scenes"
+CHATBOT_TASK_SCENE_OUTLINE = "Plan Scene Outline"
+CHATBOT_TASK_JIT_IMAGE_PROMPT = "Generate Image Prompt (JIT)"
+CHATBOT_TASK_JIT_VIDEO_PROMPT = "Generate Video Prompt (JIT)"
 CHATBOT_TASK_SONG_BRAINSTORM = "Brainstorm Song (Lyrics & Style)"
+CHATBOT_TASK_CONCEPT_EXPAND = "Expand Creative Concept"
 BUNDLED_MODEL_DIR = "bundled_models"
 MODEL_SUBDIRECTORIES = {
     "checkpoint_name": "checkpoints",
@@ -394,6 +445,7 @@ class LTXQueueManager:
         self.global_settings_file = os.path.join(self.user_data_dir, "app_settings.json")
         self.legacy_global_settings_file = os.path.join(self.app_root_dir, "app_settings.json")
         self.tutorial_phase_history_file = os.path.join(self.user_data_dir, "tutorial_phase_history.json")
+        self.comfyui_readiness_history_file = os.path.join(self.user_data_dir, "comfyui_readiness_history.json")
         self.is_first_launch = False
         self.selected_videos = set()
         self.video_checkbox_vars = []
@@ -407,6 +459,12 @@ class LTXQueueManager:
         self.comfyui_console_title = None
         self.comfyui_console_poll_after_id = None
         self.comfyui_console_pending_visibility = None
+        self.comfyui_ready = False
+        self.comfyui_ready_poll_id = None
+        self.comfyui_readiness_history = {"samples": [], "average_seconds": 0.0}
+        self.comfyui_poll_started_at = None
+        self.comfyui_readiness_eta_job = None
+        self.comfyui_readiness_flash_job = None
         self.debug_lock = threading.Lock()
         self.debug_log_file = None
         self.comfyui_root = None
@@ -462,6 +520,23 @@ class LTXQueueManager:
         self.chatbot_pending_request_mode = None
         self.chatbot_download_cancel_requested = False
         self.chatbot_setup_prompted_this_session = False
+        self.autonomous_active = False
+        self.autonomous_state = AUTONOMOUS_STATE_IDLE
+        self.autonomous_target_duration = 120
+        self.autonomous_cancel_requested = False
+        self.autonomous_scene_count = 0
+        self.autonomous_actual_duration = 0
+        self.autonomous_creative_brief = ""
+        self.autonomous_completed_phases = set()
+        self.autonomous_rendered_scene_paths = []
+        self.autonomous_music_tags = ""
+        self.autonomous_music_lyrics = ""
+        self.autonomous_expanded_concept = ""
+        self.autonomous_scene_outline = []
+        self.autonomous_image_prompts = []
+        self.autonomous_video_prompts = []
+        self.autonomous_i2v_prompts = []
+        self.autonomous_image_asset_map = {}
         self.tutorial_runtime_progress = {}
         self.tutorial_phase_history = self._create_empty_tutorial_phase_history()
         self.eta_active_phase = None
@@ -498,6 +573,7 @@ class LTXQueueManager:
         self.load_global_settings() # Load global settings after workflows are available so project state restoration wins
         self.run_startup_preflight(interactive=True)
         self.launch_comfyui()
+        self._start_comfyui_readiness_poll()
 
     def _get_app_root_dir(self):
         if getattr(sys, "frozen", False):
@@ -1818,7 +1894,7 @@ class LTXQueueManager:
         payload = {
             "model": model_id,
             "messages": messages,
-            "max_tokens": 2048 if is_song_mode else 900,
+            "max_tokens": 4096,
             "stream": False,
         }
         payload.update(self._build_chatbot_sampling_payload())
@@ -2228,7 +2304,7 @@ class LTXQueueManager:
         preview_text = self._build_chatbot_artifact_preview_text(selected_artifact, show_raw=self.chatbot_output_show_raw) or "Select a result to review its structured output here."
 
         if not self.chatbot_artifact_review_card.winfo_manager():
-            self.chatbot_artifact_review_card.pack(fill=tk.X, pady=(0, 10))
+            self.chatbot_artifact_review_card.pack(fill=tk.X, pady=(0, 10), before=self.chatbot_transcript_shell)
 
         self.chatbot_artifact_review_eyebrow_label.config(text="Selected Result")
         self.chatbot_artifact_review_title_label.config(text=artifact_title)
@@ -2426,7 +2502,7 @@ class LTXQueueManager:
                     or (
                         (task_label == CHATBOT_TASK_SCENE_PLAN or task_label == "scene_plan")
                         and isinstance(self.chatbot_last_result.get("scenes"), list)
-                        and any(str((scene or {}).get("prompt") or "").strip() for scene in self.chatbot_last_result.get("scenes") or [])
+                        and any(str((scene or {}).get("video_prompt") or (scene or {}).get("image_prompt") or (scene or {}).get("prompt") or "").strip() for scene in self.chatbot_last_result.get("scenes") or [])
                     )
                 )
             )
@@ -2547,6 +2623,78 @@ class LTXQueueManager:
 
     def _get_chatbot_task_config(self, task_name):
         task_label = str(task_name or CHATBOT_TASK_T2I_OPTIMIZE).strip() or CHATBOT_TASK_T2I_OPTIMIZE
+
+        if task_label == CHATBOT_TASK_CONCEPT_EXPAND:
+            schema_hint = {
+                "task": "concept_expand",
+                "title": "Short creative title for the music video",
+                "mood": "Primary emotional tone and atmosphere",
+                "color_palette": "3-5 dominant colors/tones that define the visual feel",
+                "visual_style": "Art direction / aesthetic reference",
+                "narrative_arc": "Brief story arc: opening -> development -> climax -> resolution",
+                "genre_direction": "Musical genre and sub-genre",
+                "tempo_energy": "BPM range and energy curve",
+                "visual_motifs": "2-4 recurring visual elements that tie scenes together",
+                "camera_style": "Dominant camera language",
+                "expanded_brief": "Rich 2-3 sentence paragraph synthesizing all the above into a cohesive vision"
+            }
+            json_schema = {
+                "name": "prompt2mtv_concept_expand",
+                "schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "task": {"type": "string", "const": "concept_expand"},
+                        "title": {"type": "string"},
+                        "mood": {"type": "string"},
+                        "color_palette": {"type": "string"},
+                        "visual_style": {"type": "string"},
+                        "narrative_arc": {"type": "string"},
+                        "genre_direction": {"type": "string"},
+                        "tempo_energy": {"type": "string"},
+                        "visual_motifs": {"type": "string"},
+                        "camera_style": {"type": "string"},
+                        "expanded_brief": {"type": "string"}
+                    },
+                    "required": ["task", "title", "mood", "color_palette", "visual_style",
+                                 "narrative_arc", "genre_direction", "tempo_energy",
+                                 "visual_motifs", "camera_style", "expanded_brief"]
+                }
+            }
+            user_prompt_template = (
+                "Task: expand a brief music video idea into a rich creative concept.\n"
+                "The user's raw idea:\n__BRIEFING_TEXT__\n\n"
+                "Produce exactly this JSON schema:\n"
+                f"{json.dumps(schema_hint, indent=2)}\n\n"
+                "Requirements:\n"
+                "- Transform even a vague idea into a specific, producible vision.\n"
+                "- The expanded_brief must synthesize all fields into a cohesive 2-3 sentence paragraph.\n"
+                "- color_palette should name specific colors (e.g. 'deep indigo, electric cyan, warm amber').\n"
+                "- visual_motifs should be concrete recurring elements (e.g. 'floating jellyfish, cracking glass, neon rain').\n"
+                "- camera_style should use real cinematography terms (dolly, tracking, whip pan, crane, handheld).\n"
+                "- genre_direction and tempo_energy should be specific enough to guide song creation.\n"
+                "- If the idea is vague, make bold creative choices — do not hedge or stay generic.\n"
+                "- Avoid markdown, avoid prose outside JSON.\n"
+            )
+            return {
+                "label": CHATBOT_TASK_CONCEPT_EXPAND,
+                "output_task": "concept_expand",
+                "required_fields": ["task", "title", "mood", "color_palette", "visual_style",
+                                    "narrative_arc", "genre_direction", "tempo_energy",
+                                    "visual_motifs", "camera_style", "expanded_brief"],
+                "non_empty_fields": ["task", "title", "mood", "color_palette", "visual_style",
+                                     "narrative_arc", "genre_direction", "expanded_brief"],
+                "json_schema": json_schema,
+                "system_prompt": (
+                    "You are a music video creative director with a strong visual imagination. "
+                    "Your job is to take a brief idea — even a single phrase — and expand it into a rich, specific creative concept "
+                    "that will guide scene planning, image generation, and songwriting. "
+                    "Be bold and specific. Never return vague or generic descriptions. "
+                    "Return only a JSON object with no markdown fences, no prose outside JSON, and no extra keys."
+                ),
+                "user_prompt_template": user_prompt_template,
+            }
+
         if task_label == CHATBOT_TASK_SCENE_PLAN:
             schema_hint = {
                 "task": "scene_plan",
@@ -2556,7 +2704,8 @@ class LTXQueueManager:
                     {
                         "scene_number": 1,
                         "title": "Short scene title",
-                        "prompt": "Prompt-ready visual description for the shot",
+                        "image_prompt": "Detailed text-to-image prompt for generating a still frame",
+                        "video_prompt": "Motion description for animating the still image into video",
                         "notes": "Optional story beat, pacing, or transition note"
                     }
                 ]
@@ -2579,10 +2728,11 @@ class LTXQueueManager:
                                 "properties": {
                                     "scene_number": {"type": "integer"},
                                     "title": {"type": "string"},
-                                    "prompt": {"type": "string"},
+                                    "image_prompt": {"type": "string"},
+                                    "video_prompt": {"type": "string"},
                                     "notes": {"type": "string"}
                                 },
-                                "required": ["scene_number", "title", "prompt", "notes"]
+                                "required": ["scene_number", "title", "image_prompt", "video_prompt", "notes"]
                             }
                         }
                     },
@@ -2590,17 +2740,32 @@ class LTXQueueManager:
                 }
             }
             user_prompt_template = (
-                "Task: plan the number of text-to-video scenes needed for Prompt2MTV based on the conversation direction.\n"
-                "Use the user's briefing and return exactly this JSON schema:\n"
+                "Task: plan scenes for a music video. Each scene will be produced in two steps:\n"
+                "1. A still image is generated from the image_prompt (using text-to-image)\n"
+                "2. The still image is animated using the video_prompt (using image-to-video)\n\n"
+                "Creative concept:\n__BRIEFING_TEXT__\n\n"
+                "Produce exactly this JSON schema:\n"
                 f"{json.dumps(schema_hint, indent=2)}\n\n"
-                "Requirements:\n"
-                "- Decide a practical scene count for a music video concept.\n"
-                "- Each prompt must be directly usable as a cinematic scene draft.\n"
-                "- Keep scene progression coherent and varied.\n"
-                "- notes may mention pacing, lyric beat, or transitions.\n"
+                "IMAGE PROMPT GUIDELINES (for text-to-image generation):\n"
+                "- Describe a single, striking still frame — think of it as a photograph or painting.\n"
+                "- Include: subject, composition, lighting, color palette, medium/style, atmosphere.\n"
+                "- Be visually specific: 'a lone astronaut on a crimson dune under a violet sky with two moons' not 'a space scene'.\n"
+                "- Example: 'Close-up portrait of a woman with electric blue tears, neon pink backlighting, shallow depth of field, cyberpunk aesthetic, rain on glass in foreground'\n"
+                "- Example: 'Wide aerial shot of a bioluminescent forest at night, turquoise and magenta mushrooms glowing, mist between ancient trees, cinematic color grading'\n\n"
+                "VIDEO PROMPT GUIDELINES (for image-to-video animation):\n"
+                "- Describe how the still image comes alive — what moves and how the camera behaves.\n"
+                "- Focus on: camera movement (dolly in, slow pan, crane up, tracking shot), subject motion, atmospheric effects.\n"
+                "- Each scene is ~5 seconds. Keep motion achievable for that duration.\n"
+                "- Example: 'Slow dolly in toward the astronaut as sand particles drift upward in low gravity, subtle camera shake, sky shifts from violet to crimson'\n"
+                "- Example: 'Gentle crane shot rising through the canopy, mushrooms pulse with light in a breathing rhythm, firefly particles drift across frame'\n\n"
+                "SCENE PLANNING RULES:\n"
+                "- Choose a scene count that fits the concept (typically 3-8 for a music video).\n"
+                "- Maintain a narrative arc: establish the world -> build tension -> peak moment -> resolution.\n"
+                "- Vary shot types: mix wide/medium/close-up, vary camera movements.\n"
+                "- Each scene must be visually distinct but thematically connected.\n"
+                "- notes should mention pacing, lyric alignment, or transition style.\n"
                 "- If you reason internally, do not expose reasoning in the visible answer.\n"
-                "- Avoid markdown and avoid prose outside JSON.\n\n"
-                "User briefing:\n__BRIEFING_TEXT__"
+                "- Avoid markdown and avoid prose outside JSON.\n"
             )
             return {
                 "label": CHATBOT_TASK_SCENE_PLAN,
@@ -2609,9 +2774,13 @@ class LTXQueueManager:
                 "non_empty_fields": ["task", "title", "planning_rationale"],
                 "json_schema": json_schema,
                 "system_prompt": (
-                    "You are a music video planning assistant. "
-                    "Return only a JSON object with no markdown fences, no prose outside JSON, and no extra keys. "
-                    "Choose a strong scene count and write scene prompts that are visually specific and production-ready."
+                    "You are an expert music video director and cinematographer. "
+                    "You plan scenes with two prompts each: an image_prompt for generating a still frame "
+                    "(composition, lighting, color, subject) and a video_prompt for animating that frame "
+                    "(camera movement, subject motion, atmospheric effects). "
+                    "Your image prompts are visually rich art direction briefs. "
+                    "Your video prompts are focused camera direction notes about motion and timing. "
+                    "Return only a JSON object with no markdown fences, no prose outside JSON, and no extra keys."
                 ),
                 "user_prompt_template": user_prompt_template,
             }
@@ -2619,10 +2788,10 @@ class LTXQueueManager:
         if task_label == CHATBOT_TASK_SONG_BRAINSTORM:
             schema_hint = {
                 "task": "song_brainstorm",
-                "title": "Short title for the song concept",
-                "lyrics": "Full song lyrics with [verse], [chorus], [bridge] section markers",
-                "style_tags": "Genre, mood, instrumentation, and texture descriptors for the style field",
-                "rationale": "Brief explanation of creative choices"
+                "title": "Short title for the song",
+                "lyrics": "Full song lyrics with [verse], [chorus], [bridge], [outro] section markers",
+                "style_tags": "Comma-separated ACE-Step descriptors: genre, mood, instrumentation, texture, vocal style, BPM",
+                "rationale": "Brief explanation of creative choices and how lyrics connect to the visuals"
             }
             json_schema = {
                 "name": "prompt2mtv_song_brainstorm",
@@ -2640,16 +2809,27 @@ class LTXQueueManager:
                 }
             }
             user_prompt_template = (
-                "Task: finalize the song lyrics and style tags based on our conversation.\n"
+                "Task: write original song lyrics and style tags for a music video.\n\n"
+                "Creative concept:\n__BRIEFING_TEXT__\n\n"
                 "Produce exactly this JSON schema:\n"
                 f"{json.dumps(schema_hint, indent=2)}\n\n"
+                "LYRICS GUIDELINES:\n"
+                "- Write complete lyrics with section markers: [intro], [verse], [chorus], [bridge], [outro].\n"
+                "- Lyrics should complement the visual narrative — reference imagery, emotions, and themes from the concept.\n"
+                "- Use vivid, evocative language. Avoid cliches.\n"
+                "- Structure: verses tell the story, choruses deliver the hook, bridges provide contrast.\n\n"
+                "STYLE TAGS GUIDELINES (for ACE-Step music generation):\n"
+                "- Provide a comma-separated list covering: genre, sub-genre, mood, instrumentation, texture, vocal style, tempo.\n"
+                "- Be specific and layered. Examples of good style tags:\n"
+                "  'ethereal synth-pop, reverb-heavy female vocals, pulsing bass, ambient pads, 95 BPM, dreamy'\n"
+                "  'dark trap, distorted 808s, whispering male vocals, haunting bells, lo-fi texture, 140 BPM'\n"
+                "  'cinematic orchestral rock, soaring strings, driving drums, powerful choir, epic crescendo, 120 BPM'\n"
+                "  'lo-fi chillhop, vinyl crackle, mellow piano, soft Rhodes, jazzy chords, 80 BPM, nostalgic'\n"
+                "- Always include a BPM estimate.\n\n"
                 "Requirements:\n"
-                "- lyrics must contain the full song text with section markers like [verse], [chorus], [bridge], [outro], [intro].\n"
-                "- style_tags must be a comma-separated string of genre, mood, instrumentation, and texture descriptors suitable for ACE-Step's tags/prompt field.\n"
-                "- Incorporate the best ideas from the conversation. Resolve any open questions with strong creative choices.\n"
+                "- Make bold creative choices — write a complete, original song.\n"
                 "- If you reason internally, do not expose reasoning in the visible answer.\n"
-                "- Avoid markdown and avoid prose outside JSON.\n\n"
-                "User briefing:\n__BRIEFING_TEXT__"
+                "- Avoid markdown and avoid prose outside JSON.\n"
             )
             return {
                 "label": CHATBOT_TASK_SONG_BRAINSTORM,
@@ -2658,10 +2838,182 @@ class LTXQueueManager:
                 "non_empty_fields": ["task", "title", "lyrics", "style_tags"],
                 "json_schema": json_schema,
                 "system_prompt": (
-                    "You are a songwriting assistant that finalizes lyrics and style tags from a brainstorming conversation. "
-                    "Return only a JSON object with no markdown fences, no prose outside JSON, and no extra keys. "
-                    "The lyrics must use section markers like [verse], [chorus], [bridge]. "
-                    "The style_tags must be a comma-separated list of genre, mood, instrumentation, and texture descriptors."
+                    "You are a talented songwriter creating original music for a music video. "
+                    "You write lyrics that complement visual storytelling — vivid, emotional, and rhythmically strong. "
+                    "You craft precise ACE-Step style tags covering genre, mood, instrumentation, texture, and tempo. "
+                    "Return only a JSON object with no markdown fences, no prose outside JSON, and no extra keys."
+                ),
+                "user_prompt_template": user_prompt_template,
+            }
+
+        if task_label == CHATBOT_TASK_SCENE_OUTLINE:
+            schema_hint = {
+                "task": "scene_outline",
+                "title": "Short title for the music video",
+                "planning_rationale": "Why this progression fits the concept",
+                "scenes": [
+                    {
+                        "scene_number": 1,
+                        "title": "Short scene title",
+                        "shot_type": "wide / medium / close-up / aerial / POV",
+                        "mood": "Dominant mood or emotion",
+                        "visual_hook": "One-sentence visual centerpiece",
+                        "notes": "Pacing, transition, or lyric-alignment note"
+                    }
+                ]
+            }
+            json_schema = {
+                "name": "prompt2mtv_scene_outline",
+                "schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "task": {"type": "string", "const": "scene_outline"},
+                        "title": {"type": "string"},
+                        "planning_rationale": {"type": "string"},
+                        "scenes": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "scene_number": {"type": "integer"},
+                                    "title": {"type": "string"},
+                                    "shot_type": {"type": "string"},
+                                    "mood": {"type": "string"},
+                                    "visual_hook": {"type": "string"},
+                                    "notes": {"type": "string"}
+                                },
+                                "required": ["scene_number", "title", "shot_type", "mood", "visual_hook", "notes"]
+                            }
+                        }
+                    },
+                    "required": ["task", "title", "planning_rationale", "scenes"]
+                }
+            }
+            user_prompt_template = (
+                "Task: plan a lightweight scene outline for a music video.\n"
+                "Do NOT write detailed image or video prompts — only a brief outline per scene.\n\n"
+                "Creative concept:\n__BRIEFING_TEXT__\n\n"
+                "Produce exactly this JSON schema:\n"
+                f"{json.dumps(schema_hint, indent=2)}\n\n"
+                "SCENE OUTLINE RULES:\n"
+                "- Each scene entry must be SHORT: title (3-6 words), shot_type, mood (1-3 words), "
+                "visual_hook (one vivid sentence), and notes (one sentence).\n"
+                "- Maintain a narrative arc: establish the world -> build tension -> peak moment -> resolution.\n"
+                "- Vary shot types: mix wide/medium/close-up, vary camera movements.\n"
+                "- Each scene must be visually distinct but thematically connected.\n"
+                "- notes should mention pacing, lyric alignment, or transition style.\n"
+                "- If you reason internally, do not expose reasoning in the visible answer.\n"
+                "- Avoid markdown and avoid prose outside JSON.\n"
+            )
+            return {
+                "label": CHATBOT_TASK_SCENE_OUTLINE,
+                "output_task": "scene_outline",
+                "required_fields": ["task", "title", "planning_rationale", "scenes"],
+                "non_empty_fields": ["task", "title", "planning_rationale"],
+                "max_tokens": 4096,
+                "json_schema": json_schema,
+                "system_prompt": (
+                    "You are an expert music video director. "
+                    "You plan concise scene outlines — short titles, shot types, moods, and one visual hook per scene. "
+                    "Do NOT write full image prompts or motion descriptions yet. Keep each scene entry brief. "
+                    "Return only a JSON object with no markdown fences, no prose outside JSON, and no extra keys."
+                ),
+                "user_prompt_template": user_prompt_template,
+            }
+
+        if task_label == CHATBOT_TASK_JIT_IMAGE_PROMPT:
+            schema_hint = {
+                "task": "jit_image_prompt",
+                "image_prompt": "Detailed text-to-image prompt for generating a still frame",
+                "negative_prompt": "Optional negative prompt, can be empty"
+            }
+            json_schema = {
+                "name": "prompt2mtv_jit_image_prompt",
+                "schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "task": {"type": "string", "const": "jit_image_prompt"},
+                        "image_prompt": {"type": "string"},
+                        "negative_prompt": {"type": "string"}
+                    },
+                    "required": ["task", "image_prompt", "negative_prompt"]
+                }
+            }
+            user_prompt_template = (
+                "Task: write a detailed text-to-image prompt for ONE scene in a music video.\n\n"
+                "__BRIEFING_TEXT__\n\n"
+                "Produce exactly this JSON schema:\n"
+                f"{json.dumps(schema_hint, indent=2)}\n\n"
+                "IMAGE PROMPT GUIDELINES:\n"
+                "- Describe a single, striking still frame — think of it as a photograph or painting.\n"
+                "- Include: subject, composition, lighting, color palette, medium/style, atmosphere.\n"
+                "- Be visually specific: 'a lone astronaut on a crimson dune under a violet sky with two moons' "
+                "not 'a space scene'.\n"
+                "- The prompt should be 2-4 sentences of vivid visual direction.\n"
+                "- If you reason internally, do not expose reasoning in the visible answer.\n"
+                "- Avoid markdown and avoid prose outside JSON.\n"
+            )
+            return {
+                "label": CHATBOT_TASK_JIT_IMAGE_PROMPT,
+                "output_task": "jit_image_prompt",
+                "required_fields": ["task", "image_prompt", "negative_prompt"],
+                "non_empty_fields": ["task", "image_prompt"],
+                "max_tokens": 1024,
+                "json_schema": json_schema,
+                "system_prompt": (
+                    "You are a cinematographer writing a text-to-image prompt for one scene of a music video. "
+                    "Write a visually rich, specific prompt describing composition, lighting, color, subject, and mood. "
+                    "Return only a JSON object with no markdown fences, no prose outside JSON, and no extra keys."
+                ),
+                "user_prompt_template": user_prompt_template,
+            }
+
+        if task_label == CHATBOT_TASK_JIT_VIDEO_PROMPT:
+            schema_hint = {
+                "task": "jit_video_prompt",
+                "video_prompt": "Motion description for animating the still image into video"
+            }
+            json_schema = {
+                "name": "prompt2mtv_jit_video_prompt",
+                "schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "task": {"type": "string", "const": "jit_video_prompt"},
+                        "video_prompt": {"type": "string"}
+                    },
+                    "required": ["task", "video_prompt"]
+                }
+            }
+            user_prompt_template = (
+                "Task: write a motion description for animating a still image into a ~5 second video clip.\n\n"
+                "__BRIEFING_TEXT__\n\n"
+                "Produce exactly this JSON schema:\n"
+                f"{json.dumps(schema_hint, indent=2)}\n\n"
+                "VIDEO PROMPT GUIDELINES:\n"
+                "- Describe how the still image comes alive — what moves and how the camera behaves.\n"
+                "- Focus on: camera movement (dolly in, slow pan, crane up, tracking shot), "
+                "subject motion, atmospheric effects.\n"
+                "- The scene is ~5 seconds. Keep motion achievable for that duration.\n"
+                "- 1-3 sentences of focused camera direction.\n"
+                "- If you reason internally, do not expose reasoning in the visible answer.\n"
+                "- Avoid markdown and avoid prose outside JSON.\n"
+            )
+            return {
+                "label": CHATBOT_TASK_JIT_VIDEO_PROMPT,
+                "output_task": "jit_video_prompt",
+                "required_fields": ["task", "video_prompt"],
+                "non_empty_fields": ["task", "video_prompt"],
+                "max_tokens": 512,
+                "json_schema": json_schema,
+                "system_prompt": (
+                    "You are a camera director writing motion instructions for animating a still image into video. "
+                    "Focus on camera movement, subject motion, and atmospheric effects. "
+                    "Return only a JSON object with no markdown fences, no prose outside JSON, and no extra keys."
                 ),
                 "user_prompt_template": user_prompt_template,
             }
@@ -2721,7 +3073,9 @@ class LTXQueueManager:
         if not isinstance(parsed_output, dict):
             raise ValueError("The chatbot response JSON must be an object.")
 
-        if str(task_config.get("output_task") or "").strip() == "scene_plan":
+        if str(task_config.get("output_task") or "").strip() in ("scene_plan", "scene_outline"):
+            is_outline = str(task_config.get("output_task") or "").strip() == "scene_outline"
+            expected_task_name = "scene_outline" if is_outline else "scene_plan"
             validated_output = {}
             for field_name in task_config.get("required_fields", []):
                 if field_name not in parsed_output:
@@ -2729,8 +3083,8 @@ class LTXQueueManager:
             validated_output["task"] = str(parsed_output.get("task") or "").strip()
             validated_output["title"] = str(parsed_output.get("title") or "").strip()
             validated_output["planning_rationale"] = str(parsed_output.get("planning_rationale") or "").strip()
-            if validated_output["task"] != "scene_plan":
-                raise ValueError(f"The chatbot response reported task '{validated_output['task']}', expected 'scene_plan'.")
+            if validated_output["task"] != expected_task_name:
+                validated_output["task"] = expected_task_name
             if not validated_output["title"] or not validated_output["planning_rationale"]:
                 raise ValueError("Scene plan title and planning rationale must not be empty.")
 
@@ -2747,18 +3101,41 @@ class LTXQueueManager:
                 except (TypeError, ValueError):
                     raise ValueError("Each planned scene needs a numeric scene_number.")
                 scene_title = str(scene.get("title") or "").strip()
-                scene_prompt = str(scene.get("prompt") or "").strip()
-                scene_notes = str(scene.get("notes") or "").strip()
-                if not scene_title or not scene_prompt:
-                    raise ValueError("Each planned scene needs a non-empty title and prompt.")
-                validated_scenes.append(
-                    {
-                        "scene_number": scene_number,
-                        "title": scene_title,
-                        "prompt": scene_prompt,
-                        "notes": scene_notes,
-                    }
-                )
+                if not scene_title:
+                    raise ValueError("Each planned scene needs a non-empty title.")
+
+                if is_outline:
+                    shot_type = str(scene.get("shot_type") or "").strip()
+                    mood = str(scene.get("mood") or "").strip()
+                    visual_hook = str(scene.get("visual_hook") or "").strip()
+                    scene_notes = str(scene.get("notes") or "").strip()
+                    if not visual_hook:
+                        raise ValueError("Each outlined scene needs a non-empty visual_hook.")
+                    validated_scenes.append(
+                        {
+                            "scene_number": scene_number,
+                            "title": scene_title,
+                            "shot_type": shot_type,
+                            "mood": mood,
+                            "visual_hook": visual_hook,
+                            "notes": scene_notes,
+                        }
+                    )
+                else:
+                    scene_image_prompt = str(scene.get("image_prompt") or "").strip()
+                    scene_video_prompt = str(scene.get("video_prompt") or "").strip()
+                    scene_notes = str(scene.get("notes") or "").strip()
+                    if not scene_image_prompt or not scene_video_prompt:
+                        raise ValueError("Each planned scene needs a non-empty image_prompt and video_prompt.")
+                    validated_scenes.append(
+                        {
+                            "scene_number": scene_number,
+                            "title": scene_title,
+                            "image_prompt": scene_image_prompt,
+                            "video_prompt": scene_video_prompt,
+                            "notes": scene_notes,
+                        }
+                    )
 
             validated_output["scenes"] = validated_scenes
             return validated_output
@@ -2794,7 +3171,7 @@ class LTXQueueManager:
         )
         return response_payload
 
-    def _build_chatbot_completion_payload_variants(self, task_config, briefing_text, model_id):
+    def _build_chatbot_completion_payload_variants(self, task_config, briefing_text, model_id, keep_alive=None):
         force_non_thinking = self._chatbot_should_force_non_thinking(model_id=model_id)
         base_payload = {
             "model": model_id,
@@ -2806,25 +3183,27 @@ class LTXQueueManager:
                 model_id=model_id,
                 force_non_thinking=force_non_thinking,
             ),
-            "max_tokens": 900,
+            "max_tokens": task_config.get("max_tokens", 4096),
             "stream": False,
         }
         base_payload.update(self._build_chatbot_sampling_payload())
         if force_non_thinking and self._chatbot_request_targets_gemma4(model_id=model_id):
             base_payload["think"] = False
+        if keep_alive is not None and self.chatbot_backend_mode == CHATBOT_BACKEND_MODE_OLLAMA:
+            base_payload["keep_alive"] = keep_alive
         return [
             dict(base_payload, response_format={"type": "json_schema", "json_schema": task_config["json_schema"]}),
             dict(base_payload, response_format={"type": "json_object"}),
             dict(base_payload),
         ]
 
-    def _request_chatbot_structured_output(self, task_name, briefing_text):
+    def _request_chatbot_structured_output(self, task_name, briefing_text, keep_alive=None):
         task_config = self._get_chatbot_task_config(task_name)
         timeout_seconds = max(15, int(self.chatbot_request_timeout or DEFAULT_CHATBOT_REQUEST_TIMEOUT))
         model_id = self._resolve_chatbot_generation_model_id(timeout_seconds=min(timeout_seconds, 10))
         response_payload = None
         last_error = None
-        payload_variants = self._build_chatbot_completion_payload_variants(task_config, briefing_text, model_id)
+        payload_variants = self._build_chatbot_completion_payload_variants(task_config, briefing_text, model_id, keep_alive=keep_alive)
         for payload_index, payload in enumerate(payload_variants):
             try:
                 response_payload = self._post_chatbot_completion_payload(payload, timeout_seconds=timeout_seconds)
@@ -2926,7 +3305,7 @@ class LTXQueueManager:
         for index, scene in enumerate(scenes, start=1):
             if not isinstance(scene, dict):
                 continue
-            prompt_text = str(scene.get("prompt") or "").strip()
+            prompt_text = str(scene.get("video_prompt") or scene.get("image_prompt") or scene.get("prompt") or "").strip()
             if not prompt_text:
                 continue
             scene_number = int(scene.get("scene_number") or index)
@@ -7607,6 +7986,7 @@ class LTXQueueManager:
     def launch_comfyui(self):
         self._cancel_comfyui_console_poll()
         if self._is_comfyui_running():
+            self.comfyui_ready = True
             self.update_status("ComfyUI already running on port 8188.", "blue")
             self.comfyui_process = None
             self.comfyui_console_hwnd = None
@@ -7660,6 +8040,144 @@ class LTXQueueManager:
                 self._refresh_comfyui_terminal_button()
         else:
             self.update_status("ComfyUI launcher not configured. Use Project > Configure Runtime Paths.", "red")
+
+    def _load_comfyui_readiness_history(self):
+        history = {"samples": [], "average_seconds": 0.0}
+        try:
+            if os.path.exists(self.comfyui_readiness_history_file):
+                with open(self.comfyui_readiness_history_file, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                if isinstance(payload, dict):
+                    raw_samples = payload.get("samples") if isinstance(payload.get("samples"), list) else []
+                    samples = []
+                    for sample in raw_samples:
+                        if not isinstance(sample, dict):
+                            continue
+                        try:
+                            elapsed = max(0.0, float(sample.get("elapsed_seconds") or 0.0))
+                        except (TypeError, ValueError):
+                            continue
+                        if elapsed <= 0:
+                            continue
+                        samples.append({
+                            "elapsed_seconds": elapsed,
+                            "recorded_at": str(sample.get("recorded_at") or "").strip(),
+                        })
+                    samples = samples[-12:]
+                    elapsed_values = [s["elapsed_seconds"] for s in samples]
+                    history["samples"] = samples
+                    history["average_seconds"] = (sum(elapsed_values) / len(elapsed_values)) if elapsed_values else 0.0
+        except Exception as exc:
+            print(f"Error loading ComfyUI readiness history: {exc}")
+        self.comfyui_readiness_history = history
+
+    def _save_comfyui_readiness_history(self):
+        try:
+            os.makedirs(os.path.dirname(self.comfyui_readiness_history_file), exist_ok=True)
+            payload = {
+                "samples": self.comfyui_readiness_history.get("samples", []),
+                "average_seconds": self.comfyui_readiness_history.get("average_seconds", 0.0),
+            }
+            with open(self.comfyui_readiness_history_file, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=4)
+        except Exception as exc:
+            print(f"Error saving ComfyUI readiness history: {exc}")
+
+    def _record_comfyui_readiness_timing(self, elapsed_seconds):
+        try:
+            elapsed = max(0.0, float(elapsed_seconds))
+        except (TypeError, ValueError):
+            return
+        if elapsed <= 0:
+            return
+        samples = list(self.comfyui_readiness_history.get("samples") or [])
+        samples.append({
+            "elapsed_seconds": elapsed,
+            "recorded_at": datetime.now().isoformat(timespec="seconds"),
+        })
+        samples = samples[-12:]
+        elapsed_values = [s["elapsed_seconds"] for s in samples]
+        self.comfyui_readiness_history = {
+            "samples": samples,
+            "average_seconds": (sum(elapsed_values) / len(elapsed_values)) if elapsed_values else 0.0,
+        }
+        self._save_comfyui_readiness_history()
+
+    def _flash_autonomous_status(self):
+        if not hasattr(self, "autonomous_status_label"):
+            return
+        if self.comfyui_readiness_flash_job is not None:
+            return
+        label = self.autonomous_status_label
+        original_bg = label.cget("bg")
+        flash_color = self.colors["danger"]
+        cycle_count = 8
+
+        def flash(index=0):
+            if index >= cycle_count:
+                label.config(bg=original_bg)
+                self.comfyui_readiness_flash_job = None
+                return
+            label.config(bg=flash_color if index % 2 == 0 else original_bg)
+            self.comfyui_readiness_flash_job = self.root.after(150, lambda: flash(index + 1))
+
+        flash()
+
+    def _update_comfyui_readiness_eta(self):
+        if self.comfyui_ready:
+            self.comfyui_readiness_eta_job = None
+            return
+        avg = self.comfyui_readiness_history.get("average_seconds", 0.0)
+        if avg > 0 and self.comfyui_poll_started_at:
+            elapsed = time.time() - self.comfyui_poll_started_at
+            remaining = max(0, int(avg - elapsed))
+            if remaining > 0:
+                eta_text = f"⏳ Waiting for ComfyUI to become ready... (ETA: ~{remaining}s)"
+            else:
+                eta_text = "⏳ Waiting for ComfyUI to become ready... (any moment now)"
+            if hasattr(self, "autonomous_status_label"):
+                self.autonomous_status_label.config(text=eta_text)
+        self.comfyui_readiness_eta_job = self.root.after(1000, self._update_comfyui_readiness_eta)
+
+    def _start_comfyui_readiness_poll(self):
+        """Begin polling ComfyUI until it responds, updating the autonomous panel status."""
+        if self.comfyui_ready:
+            return
+        self.comfyui_poll_started_at = time.time()
+        if hasattr(self, "autonomous_start_btn"):
+            self.autonomous_start_btn.config(state=tk.DISABLED)
+        if hasattr(self, "autonomous_status_label"):
+            self.autonomous_status_label.config(text="⏳ Waiting for ComfyUI to become ready...")
+        self._update_comfyui_readiness_eta()
+        self._poll_comfyui_readiness()
+
+    def _poll_comfyui_readiness(self):
+        """Check if ComfyUI is reachable. Update autonomous panel and re-schedule if not."""
+        try:
+            req = urllib.request.Request("http://127.0.0.1:8188/queue")
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                resp.read()
+            reachable = True
+        except Exception:
+            reachable = False
+
+        if reachable:
+            self.comfyui_ready = True
+            self.comfyui_ready_poll_id = None
+            if self.comfyui_readiness_eta_job is not None:
+                self.root.after_cancel(self.comfyui_readiness_eta_job)
+                self.comfyui_readiness_eta_job = None
+            if self.comfyui_poll_started_at:
+                elapsed = time.time() - self.comfyui_poll_started_at
+                self._record_comfyui_readiness_timing(elapsed)
+                self.comfyui_poll_started_at = None
+            if hasattr(self, "autonomous_status_label"):
+                self.autonomous_status_label.config(text="✅ ComfyUI is ready. Enter a creative brief and click Start.")
+            if hasattr(self, "autonomous_start_btn") and not getattr(self, "autonomous_active", False):
+                self.autonomous_start_btn.config(state=tk.NORMAL)
+            self.update_status("ComfyUI is online and ready.", "green")
+        else:
+            self.comfyui_ready_poll_id = self.root.after(3000, self._poll_comfyui_readiness)
 
     def setup_ui(self):
         # Top Menu Bar
@@ -9173,6 +9691,111 @@ class LTXQueueManager:
         )
         self.chatbot_history_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.chatbot_history_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # ── Autonomous Mode Panel ──
+        self.chatbot_workspace_frame.grid_rowconfigure(2, weight=0)
+        self.autonomous_section = self._create_collapsible_section(
+            self.chatbot_workspace_frame,
+            "autonomous_mode",
+            "🚀 Autonomous Music Video",
+            meta_text="One-click pipeline",
+            is_open=False,
+            body_expand=False,
+            body_background=self.colors["surface"],
+        )
+        self.autonomous_section["container"].grid(row=2, column=0, sticky="ew", pady=(0, 12))
+        self._style_panel(self.autonomous_section["container"], self.colors["surface"], border=True)
+        self._style_panel(self.autonomous_section["header"], self.colors["surface"])
+        self._style_panel(self.autonomous_section["body"], self.colors["surface"])
+        self._style_label(self.autonomous_section["title"], "section", self.autonomous_section["header"].cget("bg"))
+        self._style_label(self.autonomous_section["meta"], "muted", self.autonomous_section["header"].cget("bg"))
+        self._style_button(self.autonomous_section["toggle"], "ghost", compact=True)
+
+        auto_body = self.autonomous_section["body"]
+
+        auto_desc = tk.Label(
+            auto_body,
+            text="Describe the vibe, theme, and mood of your music video below, set a target duration, then click Start. "
+                 "The pipeline will automatically plan scenes, render video, generate music, and merge everything.",
+            anchor="w", justify=tk.LEFT, wraplength=860,
+        )
+        auto_desc.pack(anchor="w", fill=tk.X, pady=(0, 8))
+        self._style_label(auto_desc, "muted", auto_body.cget("bg"))
+
+        auto_brief_label = tk.Label(auto_body, text="Creative Brief:", anchor="w")
+        auto_brief_label.pack(anchor="w", pady=(0, 4))
+        self._style_label(auto_brief_label, "body_strong", auto_body.cget("bg"))
+
+        self.autonomous_brief_text = tk.Text(auto_body, height=4, wrap=tk.WORD)
+        self.autonomous_brief_text.pack(fill=tk.X, pady=(0, 10))
+        self.autonomous_brief_text.insert("1.0", "")
+        self.autonomous_brief_text.configure(
+            bg=self.colors["card"], fg=self.colors["text"],
+            insertbackground=self.colors["text"], relief=tk.FLAT,
+            highlightthickness=1, highlightcolor=self.colors["accent"],
+            highlightbackground=self.colors["border"],
+        )
+
+        auto_controls = tk.Frame(auto_body)
+        auto_controls.pack(fill=tk.X, pady=(0, 8))
+        self._style_panel(auto_controls, auto_body.cget("bg"))
+
+        dur_label = tk.Label(auto_controls, text="Target Duration (seconds):")
+        dur_label.pack(side=tk.LEFT, padx=(0, 6))
+        self._style_label(dur_label, "body_strong", auto_body.cget("bg"))
+
+        self.autonomous_duration_var = tk.StringVar(value="120")
+        self.autonomous_duration_entry = tk.Spinbox(
+            auto_controls, from_=5, to=3600, increment=5,
+            textvariable=self.autonomous_duration_var, width=8,
+        )
+        self.autonomous_duration_entry.pack(side=tk.LEFT, padx=(0, 12))
+        self.autonomous_duration_var.trace_add("write", self._update_autonomous_scene_estimate)
+
+        self.autonomous_estimate_label = tk.Label(auto_controls, text="", anchor="w")
+        self.autonomous_estimate_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._style_label(self.autonomous_estimate_label, "muted", auto_body.cget("bg"))
+        self._update_autonomous_scene_estimate()
+
+        auto_btn_row = tk.Frame(auto_body)
+        auto_btn_row.pack(fill=tk.X, pady=(0, 8))
+        self._style_panel(auto_btn_row, auto_body.cget("bg"))
+
+        self.autonomous_start_btn = tk.Button(
+            auto_btn_row, text="🚀  Start Autonomous Generation",
+            command=self._start_autonomous_pipeline,
+        )
+        self.autonomous_start_btn.pack(side=tk.LEFT, padx=(0, 8))
+        self._style_button(self.autonomous_start_btn, "primary")
+
+        self.autonomous_cancel_btn = tk.Button(
+            auto_btn_row, text="Cancel",
+            command=self._cancel_autonomous_pipeline, state=tk.DISABLED,
+        )
+        self.autonomous_cancel_btn.pack(side=tk.LEFT)
+        self._style_button(self.autonomous_cancel_btn, "danger")
+
+        auto_progress_frame = tk.Frame(auto_body)
+        auto_progress_frame.pack(fill=tk.X, pady=(0, 4))
+        self._style_panel(auto_progress_frame, auto_body.cget("bg"))
+
+        self.autonomous_progress_var = tk.IntVar(value=0)
+        self.autonomous_progressbar = ttk.Progressbar(
+            auto_progress_frame, variable=self.autonomous_progress_var,
+            maximum=100, mode="determinate",
+        )
+        self.autonomous_progressbar.pack(fill=tk.X, pady=(0, 6))
+
+        self.autonomous_status_label = tk.Label(auto_progress_frame, text="Ready. Enter a creative brief and click Start.", anchor="w", justify=tk.LEFT)
+        self.autonomous_status_label.pack(anchor="w", fill=tk.X)
+        self._style_label(self.autonomous_status_label, "body", auto_body.cget("bg"))
+
+        self.autonomous_phase_labels = {}
+        for phase_key in AUTONOMOUS_PHASE_ORDER:
+            plbl = tk.Label(auto_progress_frame, text=f"  ○  {AUTONOMOUS_PHASE_LABELS[phase_key]}", anchor="w")
+            plbl.pack(anchor="w")
+            self._style_label(plbl, "muted", auto_body.cget("bg"))
+            self.autonomous_phase_labels[phase_key] = plbl
 
         self.chatbot_readiness_section = self._create_collapsible_section(
             self.chatbot_shell,
@@ -11482,6 +12105,7 @@ class LTXQueueManager:
                     chatbot_settings_dirty = True
             self._refresh_chatbot_runtime_ui()
             self.load_tutorial_phase_history()
+            self._load_comfyui_readiness_history()
 
             # On first launch, let the user choose where to store projects
             if self.is_first_launch and not settings.get("output_root"):
@@ -11989,7 +12613,8 @@ class LTXQueueManager:
             "current_generated_audio": self.current_generated_audio,
             "current_audio_source": self.current_audio_source,
             "selected_video_for_music": self.selected_video_for_music,
-            "current_final_video": getattr(self, 'current_final_video', None)
+            "current_final_video": getattr(self, 'current_final_video', None),
+            "autonomous_target_duration": self.autonomous_target_duration,
         }
         try:
             with open(project_data_file, 'w', encoding='utf-8') as f:
@@ -12056,7 +12681,14 @@ class LTXQueueManager:
                 self.current_audio_source = state.get("current_audio_source") or self._infer_audio_source(self.current_generated_audio)
                 self.selected_video_for_music = state.get("selected_video_for_music")
                 self.current_final_video = state.get("current_final_video")
-                
+
+                # Load Autonomous Mode State
+                saved_auto_dur = state.get("autonomous_target_duration")
+                if saved_auto_dur is not None:
+                    self.autonomous_target_duration = int(saved_auto_dur)
+                    if hasattr(self, "autonomous_duration_var"):
+                        self.autonomous_duration_var.set(str(self.autonomous_target_duration))
+
                 # Update UI for loaded music state
                 if self.selected_video_for_music and os.path.exists(self.selected_video_for_music):
                     thumb_path = os.path.join(self.thumbs_dir, f"{os.path.basename(self.selected_video_for_music)}.jpg")
@@ -13759,6 +14391,901 @@ class LTXQueueManager:
             self.root.after(0, lambda: self.merge_music_btn.config(state=tk.NORMAL))
             self.root.after(0, lambda: self.gen_music_btn.config(state=tk.NORMAL))
             self.root.after(0, self._refresh_music_sidebar_state)
+
+    # ── Autonomous Music Video Pipeline ──────────────────────────────────
+
+    def _calculate_autonomous_scene_count(self, target_duration_seconds):
+        try:
+            frames = int(self.video_length_var.get())
+        except (ValueError, tk.TclError):
+            frames = 121
+        try:
+            fps = int(self.video_fps_var.get())
+        except (ValueError, tk.TclError):
+            fps = 24
+        if fps <= 0:
+            fps = 24
+        if frames <= 0:
+            frames = 121
+        seconds_per_scene = frames / fps
+        scene_count = max(1, math.ceil(target_duration_seconds / seconds_per_scene))
+        actual_duration = round(scene_count * seconds_per_scene, 2)
+        return scene_count, actual_duration, seconds_per_scene
+
+    def _update_autonomous_scene_estimate(self, *_args):
+        try:
+            dur = int(self.autonomous_duration_var.get())
+        except (ValueError, tk.TclError):
+            dur = 0
+        if dur <= 0:
+            if hasattr(self, "autonomous_estimate_label"):
+                self.autonomous_estimate_label.config(text="Enter a duration above 0.")
+            return
+        scene_count, actual_dur, sps = self._calculate_autonomous_scene_count(dur)
+        if hasattr(self, "autonomous_estimate_label"):
+            self.autonomous_estimate_label.config(text=f"{scene_count} scenes × ~{sps:.1f}s = ~{actual_dur:.0f}s total video")
+
+    def _autonomous_preflight(self):
+        errors = []
+        try:
+            req = urllib.request.Request("http://127.0.0.1:8188/queue")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                resp.read()
+        except Exception:
+            errors.append("ComfyUI is not reachable at http://127.0.0.1:8188. Start it first.")
+        if not self.current_project_dir:
+            errors.append("No project is open. Create or open a project first.")
+        if not self.workflow:
+            errors.append("No video workflow loaded. Load a workflow first.")
+        if not self.image_workflow:
+            errors.append("No image workflow loaded. Load a Z-Image workflow for image generation.")
+        if not self.music_workflow:
+            errors.append("No music workflow loaded.")
+        return errors
+
+    def _start_autonomous_pipeline(self):
+        if not self.comfyui_ready:
+            self._flash_autonomous_status()
+            return
+        brief = self.autonomous_brief_text.get("1.0", tk.END).strip() if hasattr(self, "autonomous_brief_text") else ""
+        if not brief:
+            messagebox.showwarning("Autonomous Mode", "Enter a creative brief in the Autonomous Mode panel.\n\nDescribe the music video concept, mood, style, or any visual ideas.")
+            return
+        try:
+            target_dur = int(self.autonomous_duration_var.get())
+        except (ValueError, tk.TclError):
+            target_dur = 0
+        if target_dur <= 0:
+            messagebox.showwarning("Autonomous Mode", "Set a target duration greater than 0 seconds.")
+            return
+
+        preflight_errors = self._autonomous_preflight()
+        if preflight_errors:
+            messagebox.showerror("Autonomous Mode – Pre-flight Failed", "\n\n".join(preflight_errors))
+            return
+
+        if not self.ensure_chatbot_model_ready(interactive=True):
+            return
+
+        self.autonomous_active = True
+        self.autonomous_cancel_requested = False
+        self.autonomous_state = AUTONOMOUS_STATE_IDLE
+        self.autonomous_target_duration = target_dur
+        self.autonomous_creative_brief = brief
+        self.autonomous_completed_phases = set()
+        self.autonomous_rendered_scene_paths = []
+        self.autonomous_expanded_concept = ""
+        self.autonomous_image_prompts = []
+        self.autonomous_video_prompts = []
+        self.autonomous_i2v_prompts = []
+        self.autonomous_image_asset_map = {}
+        self.autonomous_scene_outline = []
+        scene_count, actual_dur, _ = self._calculate_autonomous_scene_count(target_dur)
+        self.autonomous_scene_count = scene_count
+        self.autonomous_actual_duration = actual_dur
+
+        self._set_autonomous_ui_running(True)
+        self._update_autonomous_progress(AUTONOMOUS_STATE_EXPANDING_CONCEPT, "Starting autonomous pipeline...", 0.0)
+
+        thread = threading.Thread(target=self._run_autonomous_pipeline, daemon=True)
+        thread.start()
+
+    def _cancel_autonomous_pipeline(self):
+        self.autonomous_cancel_requested = True
+        self.update_status("Autonomous pipeline cancellation requested...", "orange")
+
+    def _set_autonomous_ui_running(self, is_running):
+        def apply():
+            state = tk.DISABLED if is_running else tk.NORMAL
+            if hasattr(self, "autonomous_start_btn"):
+                self.autonomous_start_btn.config(state=state)
+            if hasattr(self, "autonomous_cancel_btn"):
+                self.autonomous_cancel_btn.config(state=tk.NORMAL if is_running else tk.DISABLED)
+            if hasattr(self, "autonomous_duration_entry"):
+                self.autonomous_duration_entry.config(state="readonly" if is_running else tk.NORMAL)
+            if hasattr(self, "autonomous_brief_text"):
+                self.autonomous_brief_text.config(state=tk.DISABLED if is_running else tk.NORMAL)
+            if hasattr(self, "chatbot_send_btn"):
+                self.chatbot_send_btn.config(state=state)
+            if hasattr(self, "chatbot_scene_plan_btn"):
+                self.chatbot_scene_plan_btn.config(state=state)
+            if hasattr(self, "chatbot_generate_btn"):
+                self.chatbot_generate_btn.config(state=state)
+            if hasattr(self, "chatbot_finalize_song_btn"):
+                self.chatbot_finalize_song_btn.config(state=state)
+        self.root.after(0, apply)
+
+    def _update_autonomous_progress(self, current_phase, message, phase_progress=0.0):
+        def apply():
+            if hasattr(self, "autonomous_status_label"):
+                self.autonomous_status_label.config(text=message)
+            if hasattr(self, "autonomous_phase_labels"):
+                for phase_key, label_widget in self.autonomous_phase_labels.items():
+                    if phase_key in self.autonomous_completed_phases:
+                        label_widget.config(text=f"  ✓  {AUTONOMOUS_PHASE_LABELS[phase_key]}", fg=self.colors["success"])
+                    elif phase_key == current_phase:
+                        label_widget.config(text=f"  ⟳  {AUTONOMOUS_PHASE_LABELS[phase_key]}", fg=self.colors["accent"])
+                    else:
+                        label_widget.config(text=f"  ○  {AUTONOMOUS_PHASE_LABELS[phase_key]}", fg=self.colors["text_muted"])
+            overall = 0.0
+            for p in AUTONOMOUS_PHASE_ORDER:
+                w = AUTONOMOUS_PHASE_WEIGHTS.get(p, 0)
+                if p in self.autonomous_completed_phases:
+                    overall += w
+                elif p == current_phase:
+                    overall += w * max(0.0, min(1.0, phase_progress))
+            if hasattr(self, "autonomous_progress_var"):
+                self.autonomous_progress_var.set(int(overall * 100))
+        self.root.after(0, apply)
+
+    def _run_autonomous_pipeline(self):
+        brief = self.autonomous_creative_brief
+        scene_count = self.autonomous_scene_count
+        actual_duration = self.autonomous_actual_duration
+
+        try:
+            # ═══════════════════════════════════════════════════════════════
+            # LLM BLOCK — All chatbot work runs while the model is warm.
+            # The model stays loaded with keep_alive="30m" between calls,
+            # then is explicitly unloaded before GPU-heavy ComfyUI phases.
+            # ═══════════════════════════════════════════════════════════════
+
+            # ── Phase 1: Expand Concept ──
+            self.autonomous_state = AUTONOMOUS_STATE_EXPANDING_CONCEPT
+            self._update_autonomous_progress(AUTONOMOUS_STATE_EXPANDING_CONCEPT, "Expanding creative concept...", 0.1)
+
+            if self.autonomous_cancel_requested:
+                raise InterruptedError("Cancelled by user.")
+            concept_result = self._autonomous_expand_concept(brief)
+            if self.autonomous_cancel_requested:
+                raise InterruptedError("Cancelled by user.")
+            self.autonomous_completed_phases.add(AUTONOMOUS_STATE_EXPANDING_CONCEPT)
+
+            # ── Phase 2: Plan Scene Outline ──
+            self.autonomous_state = AUTONOMOUS_STATE_PLANNING_SCENES
+            self._update_autonomous_progress(AUTONOMOUS_STATE_PLANNING_SCENES, f"Outlining {scene_count} scenes...", 0.1)
+
+            outline_result = self._autonomous_plan_scene_outline(brief, scene_count)
+            if self.autonomous_cancel_requested:
+                raise InterruptedError("Cancelled by user.")
+            if not outline_result:
+                raise RuntimeError("Scene outline failed — no scenes were generated.")
+            self.autonomous_completed_phases.add(AUTONOMOUS_STATE_PLANNING_SCENES)
+
+            # ── Phase 3: Plan Song ──
+            self.autonomous_state = AUTONOMOUS_STATE_PLANNING_SONG
+            self._update_autonomous_progress(AUTONOMOUS_STATE_PLANNING_SONG, "Writing song lyrics and style tags...", 0.1)
+
+            if self.autonomous_cancel_requested:
+                raise InterruptedError("Cancelled by user.")
+            song_result = self._autonomous_plan_song(brief, actual_duration, outline_result)
+            if self.autonomous_cancel_requested:
+                raise InterruptedError("Cancelled by user.")
+            if not song_result:
+                raise RuntimeError("Song planning failed — no lyrics or style tags were generated.")
+
+            song_apply_done = threading.Event()
+            self.root.after(0, lambda: (self._autonomous_apply_song(song_result, actual_duration), song_apply_done.set()))
+            song_apply_done.wait()
+            self.autonomous_completed_phases.add(AUTONOMOUS_STATE_PLANNING_SONG)
+
+            # ── Phase 3b: Batch-generate ALL image + video prompts ──
+            self._update_autonomous_progress(AUTONOMOUS_STATE_PLANNING_SCENES, "Generating all scene prompts...", 0.0)
+
+            if self.autonomous_cancel_requested:
+                raise InterruptedError("Cancelled by user.")
+            self._autonomous_generate_all_prompts()
+            if self.autonomous_cancel_requested:
+                raise InterruptedError("Cancelled by user.")
+
+            # ── Unload LLM to free VRAM for ComfyUI ──
+            self._unload_chatbot_model()
+
+            # ═══════════════════════════════════════════════════════════════
+            # IMAGE BLOCK — ComfyUI renders all images with models staying
+            # loaded across the entire batch.
+            # ═══════════════════════════════════════════════════════════════
+
+            # ── Phase 4: Generate Images (pure ComfyUI, no LLM) ──
+            self.autonomous_state = AUTONOMOUS_STATE_GENERATING_IMAGES
+            self._update_autonomous_progress(AUTONOMOUS_STATE_GENERATING_IMAGES, "Rendering scene images...", 0.0)
+
+            if self.autonomous_cancel_requested:
+                raise InterruptedError("Cancelled by user.")
+            images_ok = self._autonomous_generate_images()
+            if self.autonomous_cancel_requested:
+                raise InterruptedError("Cancelled by user.")
+            if not images_ok:
+                raise RuntimeError("Image generation failed — no images were produced.")
+            self.autonomous_completed_phases.add(AUTONOMOUS_STATE_GENERATING_IMAGES)
+
+            # ── Free image models so video models can load cleanly ──
+            self._free_comfyui_vram()
+
+            # ═══════════════════════════════════════════════════════════════
+            # VIDEO BLOCK — Build timeline from images, then render all
+            # video scenes with LTX models staying loaded for the batch.
+            # ═══════════════════════════════════════════════════════════════
+
+            # ── Phase 5: Build I2V Timeline ──
+            self.autonomous_state = AUTONOMOUS_STATE_BUILDING_TIMELINE
+            self._update_autonomous_progress(AUTONOMOUS_STATE_BUILDING_TIMELINE, "Building I2V scene timeline...", 0.5)
+
+            if self.autonomous_cancel_requested:
+                raise InterruptedError("Cancelled by user.")
+            self._autonomous_build_i2v_timeline()
+            rebuild_done = threading.Event()
+            self.root.after(0, lambda: (self._autonomous_rebuild_timeline_ui(), rebuild_done.set()))
+            rebuild_done.wait()
+            self.autonomous_completed_phases.add(AUTONOMOUS_STATE_BUILDING_TIMELINE)
+
+            # ── Phase 6: Render All Scenes (pure ComfyUI, no LLM) ──
+            self.autonomous_state = AUTONOMOUS_STATE_RENDERING
+            self._update_autonomous_progress(AUTONOMOUS_STATE_RENDERING, "Rendering video scenes...", 0.0)
+
+            if self.autonomous_cancel_requested:
+                raise InterruptedError("Cancelled by user.")
+            render_ok = self._autonomous_render_scenes()
+            if self.autonomous_cancel_requested:
+                raise InterruptedError("Cancelled by user.")
+            if not render_ok:
+                raise RuntimeError("Scene rendering failed or produced no output files.")
+            self.autonomous_completed_phases.add(AUTONOMOUS_STATE_RENDERING)
+
+            # ── Phase 7: Stitch ──
+            self.autonomous_state = AUTONOMOUS_STATE_STITCHING
+            self._update_autonomous_progress(AUTONOMOUS_STATE_STITCHING, "Stitching rendered clips...", 0.1)
+
+            if self.autonomous_cancel_requested:
+                raise InterruptedError("Cancelled by user.")
+            stitch_ok = self._autonomous_stitch_scenes()
+            if not stitch_ok:
+                raise RuntimeError("Stitching failed — no stitched video was produced.")
+            self.autonomous_completed_phases.add(AUTONOMOUS_STATE_STITCHING)
+
+            # ── Free video models before music generation ──
+            self._free_comfyui_vram()
+
+            # ═══════════════════════════════════════════════════════════════
+            # MUSIC BLOCK — ACE-Step loads its own model.
+            # ═══════════════════════════════════════════════════════════════
+
+            # ── Phase 8: Generate Music ──
+            self.autonomous_state = AUTONOMOUS_STATE_GENERATING_MUSIC
+            self._update_autonomous_progress(AUTONOMOUS_STATE_GENERATING_MUSIC, "Generating soundtrack...", 0.1)
+
+            if self.autonomous_cancel_requested:
+                raise InterruptedError("Cancelled by user.")
+            music_ok = self._autonomous_generate_music()
+            if self.autonomous_cancel_requested:
+                raise InterruptedError("Cancelled by user.")
+            if not music_ok:
+                raise RuntimeError("Music generation failed — no audio was produced.")
+            self.autonomous_completed_phases.add(AUTONOMOUS_STATE_GENERATING_MUSIC)
+
+            # ── Phase 9: Final Merge ──
+            self.autonomous_state = AUTONOMOUS_STATE_MERGING
+            self._update_autonomous_progress(AUTONOMOUS_STATE_MERGING, "Merging video and audio...", 0.1)
+
+            if self.autonomous_cancel_requested:
+                raise InterruptedError("Cancelled by user.")
+            self._autonomous_final_merge()
+            self.autonomous_completed_phases.add(AUTONOMOUS_STATE_MERGING)
+
+            # ── Complete ──
+            self.autonomous_state = AUTONOMOUS_STATE_COMPLETE
+            self._update_autonomous_progress(AUTONOMOUS_STATE_MERGING, "Autonomous music video complete!", 1.0)
+            self.root.after(0, lambda: self.update_status("Autonomous music video pipeline complete!", "green"))
+            self.root.after(0, self.refresh_gallery)
+            self.root.after(0, self.save_project_state)
+            if hasattr(self, "notebook") and hasattr(self, "gallery_tab"):
+                self.root.after(0, lambda: self.notebook.select(self.gallery_tab))
+
+        except InterruptedError:
+            self.autonomous_state = AUTONOMOUS_STATE_FAILED
+            self._update_autonomous_progress(self.autonomous_state, "Pipeline cancelled by user.", 0.0)
+            self.root.after(0, lambda: self.update_status("Autonomous pipeline cancelled.", "orange"))
+        except Exception as exc:
+            self.autonomous_state = AUTONOMOUS_STATE_FAILED
+            error_msg = str(exc)
+            self._update_autonomous_progress(self.autonomous_state, f"Pipeline failed: {error_msg[:120]}", 0.0)
+            self.root.after(0, lambda: self.update_status(f"Autonomous pipeline failed: {error_msg[:120]}", "red"))
+            self.root.after(0, lambda: messagebox.showerror("Autonomous Mode", f"Pipeline failed:\n\n{error_msg}"))
+        finally:
+            self.autonomous_active = False
+            self._set_autonomous_ui_running(False)
+            self.root.after(0, self.save_project_state)
+
+    # ── Autonomous sub-phase implementations ──
+
+    def _unload_chatbot_model(self):
+        """Explicitly unload the LLM from VRAM to free memory for ComfyUI."""
+        try:
+            if self.chatbot_backend_mode == CHATBOT_BACKEND_MODE_OLLAMA:
+                model_id = None
+                try:
+                    model_id = self._resolve_chatbot_generation_model_id(timeout_seconds=5)
+                except Exception:
+                    pass
+                if model_id:
+                    self._chatbot_http_json(
+                        f"{self._chatbot_base_url()}/api/generate",
+                        method="POST",
+                        payload={"model": model_id, "keep_alive": 0},
+                        timeout_seconds=10,
+                    )
+                    self.log_debug("CHATBOT_MODEL_UNLOADED", model_id=model_id, backend="ollama")
+            self.chatbot_model_warm = False
+        except Exception as exc:
+            self.log_debug("CHATBOT_MODEL_UNLOAD_FAILED", error=str(exc))
+
+    def _free_comfyui_vram(self):
+        """Ask ComfyUI to unload cached models and free GPU memory."""
+        try:
+            req_body = json.dumps({"unload_models": True, "free_memory": True}).encode("utf-8")
+            req = urllib.request.Request(
+                "http://127.0.0.1:8188/free",
+                data=req_body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp.read()
+            self.log_debug("COMFYUI_VRAM_FREED")
+        except Exception as exc:
+            self.log_debug("COMFYUI_VRAM_FREE_FAILED", error=str(exc))
+
+    def _autonomous_expand_concept(self, brief):
+        backend_result = self._ensure_chatbot_backend_ready_for_use(action_label="autonomous concept expansion")
+        if not backend_result.get("ok"):
+            raise RuntimeError(f"Chatbot backend not ready: {backend_result.get('detail') or backend_result.get('status')}")
+        self.chatbot_model_warm = True
+
+        result = self._request_chatbot_structured_output(CHATBOT_TASK_CONCEPT_EXPAND, brief, keep_alive="30m")
+        expanded_brief = str(result.get("expanded_brief") or "").strip()
+        if not expanded_brief:
+            raise RuntimeError("Concept expansion failed — no expanded brief was generated.")
+
+        self.autonomous_expanded_concept = expanded_brief
+
+        conversation_id = self._ensure_active_chatbot_conversation()
+        self._append_chatbot_turn("user", f"[Autonomous] Expand concept: {brief[:200]}", kind="chat", conversation_id=conversation_id)
+        display_text = result.get("raw_content") or json.dumps(result, indent=2)
+        self._append_chatbot_turn("assistant", display_text, kind="artifact", conversation_id=conversation_id)
+        self.chatbot_last_result = result
+        self._record_chatbot_history_entry(CHATBOT_TASK_CONCEPT_EXPAND, brief, result)
+        return result
+
+    def _autonomous_plan_scenes(self, brief, scene_count):
+        """Legacy wrapper — delegates to outline-based planning."""
+        return self._autonomous_plan_scene_outline(brief, scene_count)
+
+    def _autonomous_plan_scene_outline(self, brief, scene_count):
+        backend_result = self._ensure_chatbot_backend_ready_for_use(action_label="autonomous scene outline")
+        if not backend_result.get("ok"):
+            raise RuntimeError(f"Chatbot backend not ready: {backend_result.get('detail') or backend_result.get('status')}")
+        self.chatbot_model_warm = True
+
+        concept = self.autonomous_expanded_concept or brief
+        augmented_brief = (
+            f"Create exactly {scene_count} scenes for a music video.\n"
+            f"The video will be approximately {self.autonomous_actual_duration:.0f} seconds long "
+            f"({scene_count} clips of ~{self.autonomous_actual_duration / max(scene_count, 1):.1f}s each).\n\n"
+            f"Creative concept:\n{concept}"
+        )
+        result = self._request_chatbot_structured_output(CHATBOT_TASK_SCENE_OUTLINE, augmented_brief, keep_alive="30m")
+        scenes = result.get("scenes") if isinstance(result.get("scenes"), list) else []
+        if not scenes:
+            return None
+
+        # Cap to requested scene_count — LLM may return more scenes than asked for
+        scenes = scenes[:scene_count]
+        self.autonomous_scene_outline = scenes
+
+        conversation_id = self._ensure_active_chatbot_conversation()
+        self._append_chatbot_turn("user", f"[Autonomous] Outline {scene_count} scenes", kind="chat", conversation_id=conversation_id)
+        display_text = result.get("raw_content") or json.dumps(result, indent=2)
+        self._append_chatbot_turn("assistant", display_text, kind="artifact", conversation_id=conversation_id)
+        self.chatbot_last_result = result
+        self._record_chatbot_history_entry(CHATBOT_TASK_SCENE_OUTLINE, augmented_brief, result)
+        return result
+
+    def _autonomous_generate_single_image_prompt(self, outline_entry, scene_index, total_scenes, previous_image_prompt="", keep_alive=None):
+        concept = self.autonomous_expanded_concept or self.autonomous_creative_brief
+        title = str(outline_entry.get("title") or "").strip()
+        shot_type = str(outline_entry.get("shot_type") or "").strip()
+        mood = str(outline_entry.get("mood") or "").strip()
+        visual_hook = str(outline_entry.get("visual_hook") or "").strip()
+        notes = str(outline_entry.get("notes") or "").strip()
+
+        briefing = (
+            f"Scene {scene_index} of {total_scenes} in a music video.\n\n"
+            f"Overall concept: {concept[:300]}\n\n"
+            f"This scene:\n"
+            f"- Title: {title}\n"
+            f"- Shot type: {shot_type}\n"
+            f"- Mood: {mood}\n"
+            f"- Visual hook: {visual_hook}\n"
+        )
+        if notes:
+            briefing += f"- Notes: {notes}\n"
+        if previous_image_prompt:
+            briefing += f"\nPrevious scene's image direction (for visual continuity):\n{previous_image_prompt[:200]}\n"
+
+        result = self._request_chatbot_structured_output(CHATBOT_TASK_JIT_IMAGE_PROMPT, briefing, keep_alive=keep_alive)
+        return str(result.get("image_prompt") or "").strip()
+
+    def _autonomous_generate_single_video_prompt(self, outline_entry, image_prompt_used, scene_index, total_scenes, keep_alive=None):
+        title = str(outline_entry.get("title") or "").strip()
+        shot_type = str(outline_entry.get("shot_type") or "").strip()
+        mood = str(outline_entry.get("mood") or "").strip()
+        visual_hook = str(outline_entry.get("visual_hook") or "").strip()
+
+        briefing = (
+            f"Scene {scene_index} of {total_scenes}.\n\n"
+            f"Scene outline:\n"
+            f"- Title: {title}\n"
+            f"- Shot type: {shot_type}\n"
+            f"- Mood: {mood}\n"
+            f"- Visual hook: {visual_hook}\n\n"
+            f"The still image that will be animated shows:\n{image_prompt_used[:300]}\n"
+        )
+
+        result = self._request_chatbot_structured_output(CHATBOT_TASK_JIT_VIDEO_PROMPT, briefing, keep_alive=keep_alive)
+        return str(result.get("video_prompt") or "").strip()
+
+    def _autonomous_apply_scene_plan(self, result):
+        scenes = result.get("scenes") if isinstance(result.get("scenes"), list) else []
+        normalized_timeline = []
+        for index, scene in enumerate(scenes, start=1):
+            if not isinstance(scene, dict):
+                continue
+            prompt_text = str(scene.get("prompt") or "").strip()
+            if not prompt_text:
+                continue
+            scene_number = int(scene.get("scene_number") or index)
+            normalized_timeline.append(self._create_scene_entry(scene_number, mode=SCENE_MODE_T2V, prompt=prompt_text))
+        if normalized_timeline:
+            self.scene_timeline = self._normalize_scene_timeline(normalized_timeline)
+            if hasattr(self, "scene_scrollable_frame"):
+                self._rebuild_scene_timeline_from_state(self.scene_timeline)
+
+    def _autonomous_plan_song(self, brief, actual_duration, outline_result):
+        concept = self.autonomous_expanded_concept or brief
+        scene_descriptions = ""
+        scenes = outline_result.get("scenes") if isinstance(outline_result.get("scenes"), list) else []
+        for s in scenes:
+            title = str(s.get("title") or "").strip()
+            mood = str(s.get("mood") or "").strip()
+            notes = str(s.get("notes") or "").strip()
+            if title:
+                scene_descriptions += f"- {title}"
+                if mood:
+                    scene_descriptions += f" [{mood}]"
+                if notes:
+                    scene_descriptions += f" ({notes})"
+                scene_descriptions += "\n"
+
+        augmented_brief = (
+            f"Write lyrics and style tags for a song to accompany this music video.\n"
+            f"Target song duration: {actual_duration:.0f} seconds.\n\n"
+            f"Creative concept:\n{concept}\n\n"
+        )
+        if scene_descriptions:
+            augmented_brief += f"Visual narrative (scene by scene):\n{scene_descriptions}\n"
+        augmented_brief += "The song should match the visual mood, pacing, and emotional arc of the scenes."
+
+        result = self._request_chatbot_structured_output(CHATBOT_TASK_SONG_BRAINSTORM, augmented_brief, keep_alive="30m")
+        lyrics = str(result.get("lyrics") or "").strip()
+        style_tags = str(result.get("style_tags") or "").strip()
+        if not lyrics and not style_tags:
+            return None
+
+        conversation_id = self._ensure_active_chatbot_conversation()
+        self._append_chatbot_turn("user", f"[Autonomous] Write song for ~{actual_duration:.0f}s video", kind="chat", conversation_id=conversation_id)
+        display_text = result.get("raw_content") or json.dumps(result, indent=2)
+        self._append_chatbot_turn("assistant", display_text, kind="artifact", conversation_id=conversation_id)
+        self.chatbot_last_result = result
+        self._record_chatbot_history_entry(CHATBOT_TASK_SONG_BRAINSTORM, augmented_brief, result)
+        return result
+
+    def _autonomous_generate_all_prompts(self):
+        """Batch-generate ALL image and video prompts while the LLM model is warm.
+
+        Generates prompts one-at-a-time (to stay within context limits) but
+        back-to-back so the model is never idle long enough to trigger Ollama's
+        unload timeout.  Results are stored in self.autonomous_image_prompts
+        and self.autonomous_video_prompts for later use by the ComfyUI render
+        phases.
+        """
+        scene_outline = getattr(self, "autonomous_scene_outline", None) or []
+        if not scene_outline:
+            raise RuntimeError("No scene outline available for prompt generation.")
+
+        scene_outline = scene_outline[:self.autonomous_scene_count]
+        total = len(scene_outline)
+        keep_alive = "30m"
+
+        # ── Generate all image prompts ──
+        self.autonomous_image_prompts = []
+        previous_image_prompt = ""
+
+        for index, outline_entry in enumerate(scene_outline, start=1):
+            if self.autonomous_cancel_requested:
+                raise InterruptedError("Cancelled by user.")
+
+            phase_progress = (index - 1) / (total * 2)  # first half of prompt gen
+            self._update_autonomous_progress(
+                AUTONOMOUS_STATE_PLANNING_SCENES,
+                f"Generating image prompt {index} of {total}...",
+                phase_progress,
+            )
+            self.root.after(0, lambda i=index, t=total: self.update_status(
+                f"[Autonomous] Writing image prompt {i} of {t}...", "blue"))
+
+            prompt_text = ""
+            for attempt in range(2):
+                try:
+                    prompt_text = self._autonomous_generate_single_image_prompt(
+                        outline_entry, index, total, previous_image_prompt, keep_alive=keep_alive
+                    )
+                    if prompt_text:
+                        break
+                except Exception:
+                    if attempt >= 1:
+                        pass  # Give up on this scene's prompt
+
+            self.autonomous_image_prompts.append(prompt_text)
+            if prompt_text:
+                previous_image_prompt = prompt_text
+
+        # ── Generate all video prompts ──
+        self.autonomous_video_prompts = []
+
+        for index, outline_entry in enumerate(scene_outline, start=1):
+            if self.autonomous_cancel_requested:
+                raise InterruptedError("Cancelled by user.")
+
+            phase_progress = 0.5 + (index - 1) / (total * 2)  # second half
+            self._update_autonomous_progress(
+                AUTONOMOUS_STATE_PLANNING_SCENES,
+                f"Generating video prompt {index} of {total}...",
+                phase_progress,
+            )
+            self.root.after(0, lambda i=index, t=total: self.update_status(
+                f"[Autonomous] Writing video prompt {i} of {t}...", "blue"))
+
+            image_prompt_used = self.autonomous_image_prompts[index - 1] if index <= len(self.autonomous_image_prompts) else ""
+
+            prompt_text = ""
+            for attempt in range(2):
+                try:
+                    prompt_text = self._autonomous_generate_single_video_prompt(
+                        outline_entry, image_prompt_used, index, total, keep_alive=keep_alive
+                    )
+                    if prompt_text:
+                        break
+                except Exception:
+                    if attempt >= 1:
+                        pass
+
+            self.autonomous_video_prompts.append(prompt_text)
+
+        image_count = sum(1 for p in self.autonomous_image_prompts if p)
+        video_count = sum(1 for p in self.autonomous_video_prompts if p)
+        self.log_debug(
+            "AUTONOMOUS_ALL_PROMPTS_GENERATED",
+            image_prompts=image_count,
+            video_prompts=video_count,
+            total_scenes=total,
+        )
+        self._update_autonomous_progress(
+            AUTONOMOUS_STATE_PLANNING_SCENES,
+            f"Generated {image_count} image + {video_count} video prompts.",
+            1.0,
+        )
+
+    def _autonomous_apply_song(self, result, actual_duration):
+        lyrics = str(result.get("lyrics") or "").strip()
+        style_tags = str(result.get("style_tags") or "").strip()
+        self.autonomous_music_lyrics = lyrics
+        self.autonomous_music_tags = style_tags
+        if hasattr(self, "music_lyrics_text") and lyrics:
+            self.music_lyrics_text.delete("1.0", tk.END)
+            self.music_lyrics_text.insert("1.0", lyrics)
+        if hasattr(self, "music_tags_text") and style_tags:
+            self.music_tags_text.delete("1.0", tk.END)
+            self.music_tags_text.insert("1.0", style_tags)
+        try:
+            self.music_duration_var.set(int(round(actual_duration)))
+        except (ValueError, tk.TclError):
+            pass
+
+    def _autonomous_generate_images(self):
+        """Render all scene images using pre-planned prompts (no LLM calls)."""
+        image_prompts = getattr(self, "autonomous_image_prompts", None) or []
+        if not image_prompts:
+            raise RuntimeError("No pre-planned image prompts available. Run prompt generation first.")
+
+        image_prompts = image_prompts[:self.autonomous_scene_count]
+
+        if not self.image_workflow:
+            raise RuntimeError("No image workflow loaded. Load a Z-Image workflow first.")
+
+        image_settings = self._get_default_image_settings()
+        total = len(image_prompts)
+        self.autonomous_image_asset_map = {}
+
+        for index, prompt_text in enumerate(image_prompts, start=1):
+            if self.autonomous_cancel_requested:
+                return False
+
+            phase_progress = (index - 1) / total
+            self._update_autonomous_progress(
+                AUTONOMOUS_STATE_GENERATING_IMAGES,
+                f"Rendering image {index} of {total}...",
+                phase_progress,
+            )
+            self.root.after(0, lambda i=index, t=total: self.update_status(f"[Autonomous] Rendering image {i} of {t}...", "blue"))
+
+            if not prompt_text:
+                continue  # Skip scenes where prompt generation failed
+
+            # ── Submit to ComfyUI ──
+            filename_prefix = self._build_image_filename_prefix("auto", index=index)
+            workflow_to_submit = self._build_image_workflow_for_prompt(prompt_text, filename_prefix, image_settings)
+
+            before_files = self._snapshot_media_files(self.generated_image_dir, SUPPORTED_IMAGE_EXTENSIONS)
+
+            success = False
+            for attempt in range(2):
+                prompt_id = self.queue_prompt(workflow_to_submit)
+                if not prompt_id:
+                    continue
+                self.eta_item_start_time = time.time()
+                success = self.wait_for_completion(prompt_id, output_kind="image", prompt_text=prompt_text)
+                if success:
+                    break
+
+            if not success:
+                continue
+
+            new_file = self._get_newest_rendered_media(before_files, self.generated_image_dir, SUPPORTED_IMAGE_EXTENSIONS)
+            if new_file:
+                asset = self._get_image_asset_by_path(new_file)
+                if asset:
+                    self.autonomous_image_asset_map[index] = asset.get("asset_id")
+
+        self._update_autonomous_progress(
+            AUTONOMOUS_STATE_GENERATING_IMAGES,
+            f"Generated {len(self.autonomous_image_asset_map)} of {total} images.",
+            1.0,
+        )
+        return len(self.autonomous_image_asset_map) > 0
+
+    def _autonomous_build_i2v_timeline(self):
+        scene_outline = getattr(self, "autonomous_scene_outline", None) or []
+        asset_map = self.autonomous_image_asset_map
+        if not scene_outline or not asset_map:
+            raise RuntimeError("No scene outline or image assets available to build timeline.")
+
+        normalized_timeline = []
+        for index in range(1, len(scene_outline) + 1):
+            asset_id = asset_map.get(index)
+            if not asset_id:
+                continue
+            asset = self._get_image_asset_by_id(asset_id)
+            if not asset or not os.path.exists(asset.get("project_path", "")):
+                continue
+            # Use a placeholder prompt — the actual video prompt will be generated JIT during rendering
+            normalized_timeline.append(
+                self._create_scene_entry(
+                    order_index=index,
+                    mode=SCENE_MODE_I2V,
+                    prompt="(JIT — will be generated before render)",
+                    image_asset_id=asset_id,
+                )
+            )
+
+        if not normalized_timeline:
+            raise RuntimeError("Failed to build I2V timeline — no valid scene entries created.")
+
+        self.scene_timeline = self._normalize_scene_timeline(normalized_timeline)
+
+    def _autonomous_rebuild_timeline_ui(self):
+        if hasattr(self, "scene_scrollable_frame"):
+            self._rebuild_scene_timeline_from_state(self.scene_timeline)
+
+    def _autonomous_render_scenes(self):
+        """Render all video scenes using pre-planned prompts (no LLM calls)."""
+        scene_timeline = list(self.scene_timeline)
+        if not scene_timeline:
+            return False
+
+        video_settings, validation_error = self._collect_validated_video_settings()
+        if validation_error:
+            raise RuntimeError(f"Video settings validation error: {validation_error}")
+
+        video_prompts = getattr(self, "autonomous_video_prompts", None) or []
+        total = len(scene_timeline)
+        rendered_paths = []
+
+        for index, scene_entry in enumerate(scene_timeline, start=1):
+            if self.autonomous_cancel_requested:
+                return False
+
+            phase_progress = (index - 1) / total
+            self._update_autonomous_progress(
+                AUTONOMOUS_STATE_RENDERING,
+                f"Rendering scene {index} of {total}...",
+                phase_progress,
+            )
+
+            scene_id = scene_entry.get("scene_id")
+            self.root.after(0, lambda sid=scene_id: self._set_scene_entry_render_state(sid, "rendering"))
+            self.root.after(0, lambda i=index, t=total: self.update_status(f"[Autonomous] Rendering scene {i} of {t}...", "blue"))
+
+            # ── Use pre-planned video prompt ──
+            prompt_text = video_prompts[index - 1] if index <= len(video_prompts) else ""
+
+            if not prompt_text:
+                self.root.after(0, lambda sid=scene_id: self._set_scene_entry_render_state(sid, "failed"))
+                continue
+
+            # Update the scene entry with the actual prompt
+            scene_entry["prompt"] = prompt_text
+
+            before_files = self._snapshot_media_files(self.scenes_dir, SUPPORTED_VIDEO_EXTENSIONS)
+            filename_prefix = self._build_video_filename_prefix(video_settings, "timeline", index)
+
+            scene_mode = scene_entry.get("mode", SCENE_MODE_T2V)
+            if scene_mode == SCENE_MODE_I2V:
+                asset = self._get_image_asset_by_id(scene_entry.get("image_asset_id"))
+                if not asset or not os.path.exists(asset.get("project_path", "")):
+                    self.root.after(0, lambda sid=scene_id: self._set_scene_entry_render_state(sid, "failed"))
+                    continue
+                workflow_to_submit = self._build_i2v_workflow_for_scene(prompt_text, asset.get("project_path"), filename_prefix, video_settings)
+            else:
+                workflow_to_submit = self._build_video_workflow_for_prompt(prompt_text, filename_prefix, video_settings)
+
+            # ── Submit to ComfyUI with retry ──
+            success = False
+            for attempt in range(2):
+                prompt_id = self.queue_prompt(workflow_to_submit)
+                if not prompt_id:
+                    continue
+                self.eta_item_start_time = time.time()
+                success = self.wait_for_completion(prompt_id)
+                if success:
+                    break
+
+            if not success:
+                self.root.after(0, lambda sid=scene_id: self._set_scene_entry_render_state(sid, "failed"))
+                continue
+
+            rendered_output = self._get_newest_rendered_media(before_files, self.scenes_dir, SUPPORTED_VIDEO_EXTENSIONS)
+            if rendered_output:
+                rendered_paths.append(rendered_output)
+                scene_entry["output_path"] = rendered_output
+                scene_entry["render_status"] = "ready"
+                self.root.after(0, lambda sid=scene_id, op=rendered_output: self._set_scene_entry_render_state(sid, "ready", op))
+
+        self.autonomous_rendered_scene_paths = rendered_paths
+        self.scene_timeline = self._normalize_scene_timeline(scene_timeline)
+        self.root.after(0, self.refresh_gallery)
+        self.root.after(0, self.save_project_state)
+
+        self._update_autonomous_progress(AUTONOMOUS_STATE_RENDERING, f"Rendered {len(rendered_paths)} of {total} scenes.", 1.0)
+        return len(rendered_paths) > 0
+
+    def _autonomous_stitch_scenes(self):
+        # Use rendered paths in timeline order (not mtime) to preserve scene sequence
+        paths = self.autonomous_rendered_scene_paths
+        if not paths:
+            scene_files = []
+            if hasattr(self, "scenes_dir") and os.path.isdir(self.scenes_dir):
+                for f in sorted(os.listdir(self.scenes_dir)):
+                    full = os.path.join(self.scenes_dir, f)
+                    if os.path.isfile(full) and os.path.splitext(f)[1].lower() in SUPPORTED_VIDEO_EXTENSIONS:
+                        scene_files.append(full)
+            paths = scene_files
+        if not paths:
+            return False
+
+        # Preserve timeline order — paths are already in scene sequence from the render loop
+        filepaths = list(paths)
+
+        timestamp = int(time.time())
+        list_file = os.path.join(self.stitched_dir, f"concat_auto_{timestamp}.txt")
+        output_file = os.path.join(self.stitched_dir, f"final_master_render_{timestamp}.mp4")
+        try:
+            with open(list_file, 'w', encoding='utf-8') as f:
+                for path in filepaths:
+                    formatted_path = path.replace('\\', '/')
+                    f.write(f"file '{formatted_path}'\n")
+            cmd = [FFMPEG_PATH, '-y', '-f', 'concat', '-safe', '0', '-i', list_file, '-c:v', 'copy', '-an', output_file]
+            subprocess.run(cmd, creationflags=subprocess.CREATE_NO_WINDOW, capture_output=True, text=True, check=True)
+        except Exception as exc:
+            raise RuntimeError(f"Stitching failed: {exc}")
+        finally:
+            if os.path.exists(list_file):
+                try:
+                    os.remove(list_file)
+                except Exception:
+                    pass
+
+        if not os.path.exists(output_file):
+            return False
+
+        self.selected_video_for_music = output_file
+        self._update_autonomous_progress(AUTONOMOUS_STATE_STITCHING, f"Stitched {len(filepaths)} clips.", 1.0)
+        self.root.after(0, self.refresh_gallery)
+        return True
+
+    def _autonomous_generate_music(self):
+        tags = self.autonomous_music_tags
+        lyrics = self.autonomous_music_lyrics
+        if not tags and not lyrics:
+            raise RuntimeError("No music tags or lyrics available for music generation.")
+
+        self.current_generated_audio = None
+        self.run_music_generation(tags, lyrics)
+
+        if self.current_generated_audio and os.path.exists(self.current_generated_audio):
+            self._update_autonomous_progress(AUTONOMOUS_STATE_GENERATING_MUSIC, "Soundtrack generated.", 1.0)
+            return True
+
+        return False
+
+    def _autonomous_final_merge(self):
+        if not self.selected_video_for_music or not os.path.exists(self.selected_video_for_music):
+            raise RuntimeError("No stitched video available for final merge.")
+        if not self.current_generated_audio or not os.path.exists(self.current_generated_audio):
+            raise RuntimeError("No generated audio available for final merge.")
+
+        timestamp = int(time.time())
+        output_file = os.path.join(self.final_mv_dir, f"Final_Music_Video_{timestamp}.mp4")
+        cmd = [
+            FFMPEG_PATH, '-y',
+            '-i', self.selected_video_for_music,
+            '-i', self.current_generated_audio,
+            '-map', '0:v:0', '-map', '1:a:0',
+            '-c:v', 'copy', '-c:a', 'aac',
+            '-shortest', output_file
+        ]
+        try:
+            subprocess.run(cmd, creationflags=subprocess.CREATE_NO_WINDOW, capture_output=True, text=True, check=True)
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(f"Final merge FFmpeg error: {exc.stderr}")
+        except FileNotFoundError:
+            raise RuntimeError("FFmpeg not found. Install FFmpeg or imageio-ffmpeg.")
+
+        if not os.path.exists(output_file):
+            raise RuntimeError("Final merge produced no output file.")
+
+        self.current_final_video = output_file
+        self._update_autonomous_progress(AUTONOMOUS_STATE_MERGING, f"Music video complete: {os.path.basename(output_file)}", 1.0)
+        self.root.after(0, self.refresh_gallery)
 
     def on_closing(self):
         self._cancel_comfyui_console_poll()
