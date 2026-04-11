@@ -14,20 +14,49 @@
 
 ## Screenshots
 
-### Chatbot — AI Creative Assistant
-![Chatbot tab](screenshots/01_chatbot.png)
+### Chatbot Phase — AI Creative Assistant
 
-### Image Phase — Batch Prompt Queue
-![Image Phase tab](screenshots/02_image_phase.png)
+| | |
+|---|---|
+| ![Chatbot Ready](screenshots/01_chatbot_ready.png) | ![Chatbot Planning](screenshots/02_chatbot_planning.png) |
+| **Model Readiness** — Setup and backend connectivity check | **Scene Planning** — AI brainstorms scene prompts from your brief |
 
-### Video Generation — Scene Timeline & Workflow
-![Video Generation tab](screenshots/03_video_generation.png)
+![Apply Plan](screenshots/03_chatbot_apply.png)
+**Apply to Timeline** — One click moves the AI plan into the Scene Timeline
 
-### Gallery — Media Browser
-![Gallery tab](screenshots/04_gallery.png)
+### Image Phase — AI Image Generation
 
-### Music Studio — AI Score Composer
-![Music Studio tab](screenshots/05_music_studio.png)
+| | |
+|---|---|
+| ![Image Config](screenshots/04_image_config.png) | ![Image Generated](screenshots/05_image_generated.png) |
+| **Workflow Settings** — Resolution, steps, CFG, and model selection | **Generated Output** — Real image from the batch prompt queue |
+
+### Video Phase — Scene Render Pipeline
+
+| | |
+|---|---|
+| ![Video Config](screenshots/06_video_config.png) | ![I2V Setup](screenshots/07_video_i2v_setup.png) |
+| **Video Settings** — Resolution, frame count, FPS, and models | **Image-to-Video** — Link a generated image as the scene source |
+
+![Video Rendered](screenshots/08_video_rendered.png)
+**Rendered Scene** — Real video output from the ComfyUI render pipeline
+
+### Gallery Phase — Media Review & Stitching
+
+| | |
+|---|---|
+| ![Gallery Review](screenshots/09_gallery_review.png) | ![Stitch](screenshots/10_gallery_stitch.png) |
+| **Gallery Browser** — Thumbnails for every generated clip and image | **Stitch Videos** — Select and combine clips into a single timeline |
+
+### Music Phase — AI Soundtrack & Final Merge
+
+| | |
+|---|---|
+| ![Music Config](screenshots/11_music_config.png) | ![Music Generated](screenshots/12_music_generated.png) |
+| **Music Tags** — Genre, mood, and instrumentation for ACE-Step | **Generated Track** — AI-composed soundtrack ready for merge |
+
+![Final Output](screenshots/13_final_output.png)
+**Final Music Video** — Merged video + AI soundtrack in the Gallery
 
 ## Quick Start
 
