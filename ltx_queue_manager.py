@@ -206,7 +206,7 @@ WINDOWS_HIDE = 0
 WINDOWS_SHOW = 5
 WINDOWS_RESTORE = 9
 APP_NAME = "Prompt2MTV"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.1"
 APP_PUBLISHER = "Prompt2MTV"
 APP_TAGLINE = "Local AI Music Video Studio"
 ENV_COMFYUI_ROOT_KEYS = ("PROMPT2MTV_COMFYUI_ROOT", "COMFYUI_ROOT")
@@ -11190,15 +11190,21 @@ class LTXQueueManager:
 
     def _load_image_workflow_template(self):
         self.image_json_path = self._make_workflow_path_absolute(self.image_json_path)
+        print(f"[DEBUG-IMG] _load_image_workflow_template path={self.image_json_path}")
+        print(f"[DEBUG-IMG] resource_root_dir={self.resource_root_dir}  app_root_dir={self.app_root_dir}")
+        print(f"[DEBUG-IMG] exists={os.path.exists(self.image_json_path)}  frozen={getattr(sys, 'frozen', False)}")
 
         if not os.path.exists(self.image_json_path):
+            print(f"[DEBUG-IMG] FILE NOT FOUND, setting image_workflow=None")
             self.image_workflow = None
             return
 
         try:
             with open(self.image_json_path, 'r', encoding='utf-8') as f:
                 self.image_workflow = json.load(f)
-        except Exception:
+            print(f"[DEBUG-IMG] Loaded OK, {len(self.image_workflow)} nodes")
+        except Exception as e:
+            print(f"[DEBUG-IMG] EXCEPTION: {type(e).__name__}: {e}")
             self.image_workflow = None
 
     def _load_i2v_workflow_template(self):

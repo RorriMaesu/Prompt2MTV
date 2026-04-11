@@ -5,7 +5,7 @@ from PyInstaller.utils.hooks import collect_all
 
 
 APP_NAME = 'Prompt2MTV'
-APP_VERSION = '1.5.0'
+APP_VERSION = '1.5.1'
 APP_COMPANY = 'Prompt2MTV'
 APP_DESCRIPTION = 'Prompt2MTV Local AI Music Video Studio'
 

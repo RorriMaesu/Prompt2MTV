@@ -169,7 +169,7 @@ python ltx_queue_manager.py
 
 ```powershell
 .\build_exe.bat              # → dist\Prompt2MTV\Prompt2MTV.exe
-.\.build_installer.bat        # → dist_installer\Prompt2MTV-Setup-1.5.0.exe
+.\.build_installer.bat        # → dist_installer\Prompt2MTV-Setup-1.5.1.exe
 ```
 
 ### Upgrade helper
