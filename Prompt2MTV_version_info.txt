@@ -16,11 +16,11 @@ VSVersionInfo(
         [
           StringStruct('CompanyName', 'Prompt2MTV'),
           StringStruct('FileDescription', 'Prompt2MTV Local AI Music Video Studio'),
-          StringStruct('FileVersion', '1.5.1'),
+          StringStruct('FileVersion', '1.5.2'),
           StringStruct('InternalName', 'Prompt2MTV'),
           StringStruct('OriginalFilename', 'Prompt2MTV.exe'),
           StringStruct('ProductName', 'Prompt2MTV'),
-          StringStruct('ProductVersion', '1.5.1')
+          StringStruct('ProductVersion', '1.5.2')
         ]
       )
     ]),

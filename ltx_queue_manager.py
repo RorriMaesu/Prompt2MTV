@@ -206,7 +206,7 @@ WINDOWS_HIDE = 0
 WINDOWS_SHOW = 5
 WINDOWS_RESTORE = 9
 APP_NAME = "Prompt2MTV"
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.5.2"
 APP_PUBLISHER = "Prompt2MTV"
 APP_TAGLINE = "Local AI Music Video Studio"
 ENV_COMFYUI_ROOT_KEYS = ("PROMPT2MTV_COMFYUI_ROOT", "COMFYUI_ROOT")
@@ -550,6 +550,11 @@ class LTXQueueManager:
         self.acestep_api_process = None
         self.acestep_api_healthy = False
         self.acestep_model_loaded = False
+        self.acestep_console_hwnd = None
+        self.acestep_console_visible = False
+        self.acestep_console_title = None
+        self.acestep_console_poll_after_id = None
+        self.acestep_console_pending_visibility = None
         self.xl_gen_phase = None
         self.xl_gen_phase_start = None
         self.xl_gen_progress = 0.0
@@ -5598,6 +5603,182 @@ class LTXQueueManager:
 
         self.update_status("ComfyUI terminal shown." if target_visibility else "ComfyUI terminal hidden.", "blue")
 
+    # ── ACE-Step (Music) console window management ──
+
+    def _cancel_acestep_console_poll(self):
+        if self.acestep_console_poll_after_id is None:
+            return
+        try:
+            self.root.after_cancel(self.acestep_console_poll_after_id)
+        except Exception:
+            pass
+        self.acestep_console_poll_after_id = None
+
+    def _queue_acestep_console_visibility(self, visible, attempts=24, delay_ms=250, source="unknown"):
+        if sys.platform != "win32":
+            return False
+        if not (self.acestep_api_process and self.acestep_api_process.poll() is None):
+            return False
+
+        self.acestep_console_pending_visibility = bool(visible)
+        self._cancel_acestep_console_poll()
+        self.log_debug(
+            "ACESTEP_CONSOLE_VISIBILITY_QUEUED",
+            visible=self.acestep_console_pending_visibility,
+            attempts=attempts,
+            delay_ms=delay_ms,
+            source=source,
+            pid=self.acestep_api_process.pid,
+            console_title=self.acestep_console_title
+        )
+        self.acestep_console_poll_after_id = self.root.after(
+            delay_ms,
+            lambda: self._poll_acestep_console_window(attempts=attempts, delay_ms=delay_ms, source=source)
+        )
+        return True
+
+    def _poll_acestep_console_window(self, attempts=24, delay_ms=250, source="unknown"):
+        self.acestep_console_poll_after_id = None
+        if sys.platform != "win32":
+            return
+
+        process_running = bool(self.acestep_api_process and self.acestep_api_process.poll() is None)
+        if not process_running:
+            self.acestep_console_hwnd = None
+            self.acestep_console_pending_visibility = None
+            self._refresh_acestep_terminal_button()
+            return
+
+        hwnd = self._resolve_acestep_console_window()
+        if hwnd:
+            self.log_debug(
+                "ACESTEP_CONSOLE_WINDOW_FOUND",
+                hwnd=hwnd,
+                source=source,
+                pid=self.acestep_api_process.pid,
+                console_title=self.acestep_console_title
+            )
+            desired_visibility = self.acestep_console_pending_visibility
+            if desired_visibility is not None:
+                if self._set_acestep_terminal_visibility(desired_visibility, retry_on_missing=False):
+                    self.acestep_console_pending_visibility = None
+            self._refresh_acestep_terminal_button()
+            return
+
+        if attempts > 1:
+            self.acestep_console_poll_after_id = self.root.after(
+                delay_ms,
+                lambda: self._poll_acestep_console_window(attempts=attempts - 1, delay_ms=delay_ms, source=source)
+            )
+            return
+
+        self.log_debug(
+            "ACESTEP_CONSOLE_WINDOW_NOT_FOUND",
+            source=source,
+            pid=self.acestep_api_process.pid,
+            console_title=self.acestep_console_title
+        )
+        self._refresh_acestep_terminal_button()
+
+    def _resolve_acestep_console_window(self):
+        if sys.platform != "win32":
+            return None
+
+        if self.acestep_console_hwnd:
+            try:
+                if ctypes.windll.user32.IsWindow(self.acestep_console_hwnd):
+                    return self.acestep_console_hwnd
+            except Exception:
+                pass
+
+        if self.acestep_api_process and self.acestep_api_process.poll() is None:
+            self.acestep_console_hwnd = self._find_window_handle_for_title(self.acestep_console_title)
+            if not self.acestep_console_hwnd:
+                self.acestep_console_hwnd = self._find_window_handle_for_pid(self.acestep_api_process.pid)
+            if self.acestep_console_hwnd:
+                title_buffer = ctypes.create_unicode_buffer(512)
+                ctypes.windll.user32.GetWindowTextW(self.acestep_console_hwnd, title_buffer, len(title_buffer))
+                if title_buffer.value:
+                    self.acestep_console_title = title_buffer.value
+                self.log_debug(
+                    "ACESTEP_CONSOLE_WINDOW_RESOLVED",
+                    hwnd=self.acestep_console_hwnd,
+                    pid=self.acestep_api_process.pid,
+                    console_title=self.acestep_console_title
+                )
+        else:
+            self.acestep_console_hwnd = None
+            self.acestep_console_title = None
+            self.acestep_console_pending_visibility = None
+        return self.acestep_console_hwnd
+
+    def _set_acestep_terminal_visibility(self, visible, retry_on_missing=True):
+        if sys.platform != "win32":
+            return False
+
+        hwnd = self._resolve_acestep_console_window()
+        if not hwnd and retry_on_missing and self.acestep_api_process and self.acestep_api_process.poll() is None:
+            self.acestep_console_hwnd = None
+            hwnd = self._resolve_acestep_console_window()
+        if not hwnd:
+            return False
+
+        try:
+            user32 = ctypes.windll.user32
+            user32.ShowWindow(hwnd, WINDOWS_RESTORE if visible else WINDOWS_HIDE)
+            if visible:
+                try:
+                    user32.BringWindowToTop(hwnd)
+                    user32.SetForegroundWindow(hwnd)
+                except Exception:
+                    pass
+            self.acestep_console_visible = bool(visible)
+            self.acestep_console_pending_visibility = None
+            self.log_debug(
+                "ACESTEP_CONSOLE_VISIBILITY_SET",
+                hwnd=hwnd,
+                visible=self.acestep_console_visible,
+                pid=self.acestep_api_process.pid if self.acestep_api_process else None,
+                console_title=self.acestep_console_title
+            )
+            self._refresh_acestep_terminal_button()
+            return True
+        except Exception:
+            return False
+
+    def _refresh_acestep_terminal_button(self):
+        process_running = bool(self.acestep_api_process and self.acestep_api_process.poll() is None)
+        console_available = bool(process_running) and sys.platform == "win32"
+
+        if not console_available:
+            self.acestep_console_hwnd = None
+            self.acestep_console_visible = False
+            self.acestep_console_title = None
+        elif self.acestep_console_hwnd:
+            try:
+                user32 = ctypes.windll.user32
+                self.acestep_console_visible = bool(user32.IsWindowVisible(self.acestep_console_hwnd) and not user32.IsIconic(self.acestep_console_hwnd))
+            except Exception:
+                pass
+
+        button_state = tk.NORMAL if console_available else tk.DISABLED
+        button_text = "Hide Music Terminal" if self.acestep_console_visible else "Show Music Terminal"
+        if hasattr(self, "help_menu") and hasattr(self, "help_menu_toggle_music_terminal_index"):
+            self.help_menu.entryconfig(self.help_menu_toggle_music_terminal_index, label=button_text, state=button_state)
+
+    def toggle_acestep_terminal(self):
+        target_visibility = not self.acestep_console_visible
+        if not self._set_acestep_terminal_visibility(target_visibility):
+            if self._queue_acestep_console_visibility(target_visibility, source="toggle"):
+                self.update_status("Music terminal is still initializing; requested visibility will apply when it becomes available.", "orange")
+                self._refresh_acestep_terminal_button()
+                return
+            self.update_status("Music terminal window is not available to toggle.", "orange")
+            self._refresh_acestep_terminal_button()
+            return
+
+        self.update_status("Music terminal shown." if target_visibility else "Music terminal hidden.", "blue")
+
     def _resolve_model_search_roots(self, saved_roots=None, comfyui_root=None):
         configured_roots = []
         if isinstance(saved_roots, list):
@@ -7283,7 +7464,6 @@ class LTXQueueManager:
 
         workflow_width = self._safe_widget_width(getattr(self, "chatbot_workflow_card", None)) or max(420, workspace_width // 2)
         output_width = self._safe_widget_width(getattr(self, "chatbot_output_card", None)) or max(480, workspace_width // 2)
-        history_width = self._safe_widget_width(getattr(self, "chatbot_history_card", None)) or max(520, workspace_width)
 
         for widget in [
             getattr(self, "chatbot_workflow_hint_label", None),
@@ -7303,8 +7483,6 @@ class LTXQueueManager:
             getattr(self, "chatbot_artifact_review_preview_label", None),
         ]:
             self._set_wraplength(widget, output_width, padding=56, minimum=260)
-
-        self._set_wraplength(getattr(self, "chatbot_apply_hint_label", None), history_width, padding=56, minimum=320)
 
     def _maximize_window(self):
         try:
@@ -7392,12 +7570,6 @@ class LTXQueueManager:
         chatbot_header_width = self._safe_widget_width(getattr(self, "chatbot_header_frame", None))
         if chatbot_header_width:
             self._set_wraplength(self.chatbot_header_copy_label, chatbot_header_width, padding=24, minimum=320)
-
-        chatbot_runtime_width = self._safe_widget_width(getattr(self, "chatbot_runtime_card", None))
-        if chatbot_runtime_width:
-            self._set_wraplength(self.chatbot_readiness_next_step_label, chatbot_runtime_width, padding=40, minimum=320)
-            self._set_wraplength(self.chatbot_runtime_status_label, chatbot_runtime_width, padding=40, minimum=320)
-            self._set_wraplength(self.chatbot_readiness_health_label, chatbot_runtime_width, padding=40, minimum=320)
 
         self._update_chatbot_workspace_balance()
 
@@ -7623,15 +7795,12 @@ class LTXQueueManager:
             self.music_preview_status_frame,
             self.chatbot_shell,
             self.chatbot_header_frame,
-            self.chatbot_runtime_card,
-            self.chatbot_runtime_actions_frame,
             self.chatbot_workspace_frame,
             self.chatbot_focus_workspace_frame,
             self.chatbot_briefing_card,
             self.chatbot_output_card,
             self.chatbot_task_actions_frame,
             self.chatbot_output_actions_frame,
-            self.chatbot_history_card
         ]:
             self._style_panel(widget, self.colors["bg"] if widget in [self.video_tab, self.image_tab, self.gallery_tab, self.music_tab, self.chatbot_tab] else self.colors["surface"])
 
@@ -7731,11 +7900,6 @@ class LTXQueueManager:
         self._style_label(self.chatbot_focus_workspace_section["title"], "section", self.chatbot_focus_workspace_section["header"].cget("bg"))
         self._style_label(self.chatbot_focus_workspace_section["meta"], "muted", self.chatbot_focus_workspace_section["header"].cget("bg"))
         self._style_button(self.chatbot_focus_workspace_section["toggle"], "ghost", compact=True)
-        self._style_label(self.chatbot_runtime_title_label, "section", self.chatbot_runtime_card.cget("bg"))
-        self._style_label(self.chatbot_readiness_summary_label, "body_strong", self.chatbot_runtime_card.cget("bg"))
-        self._style_label(self.chatbot_readiness_next_step_label, "body", self.chatbot_runtime_card.cget("bg"))
-        self._style_label(self.chatbot_runtime_status_label, "muted", self.chatbot_runtime_card.cget("bg"))
-        self._style_label(self.chatbot_readiness_health_label, "muted", self.chatbot_runtime_card.cget("bg"))
         self._style_label(self.chatbot_workflow_title_label, "section", self.chatbot_briefing_card.cget("bg"))
         self._style_label(self.chatbot_workflow_hint_label, "muted", self.chatbot_briefing_card.cget("bg"))
         self._style_label(self.chatbot_mode_label, "body_strong", self.chatbot_mode_row.cget("bg"))
@@ -7753,7 +7917,6 @@ class LTXQueueManager:
         self._style_label(self.chatbot_artifact_review_brief_label, "muted", self.chatbot_artifact_review_card.cget("bg"))
         self._style_label(self.chatbot_artifact_review_preview_label, "body", self.chatbot_artifact_review_card.cget("bg"))
         self._style_label(self.chatbot_task_hint_label, "body", self.chatbot_briefing_card.cget("bg"))
-        self._style_label(self.chatbot_apply_hint_label, "muted", self.chatbot_history_card.cget("bg"))
         if hasattr(self, "gallery_drop_hint_label"):
             self._style_label(self.gallery_drop_hint_label, "muted", self.gallery_header_frame.cget("bg"))
         if hasattr(self, "music_drop_hint_label"):
@@ -7788,10 +7951,6 @@ class LTXQueueManager:
             (self.preview_music_btn, "secondary"),
             (self.preview_final_btn, "secondary"),
             (self.merge_music_btn, "primary"),
-            (self.chatbot_setup_btn, "secondary"),
-            (self.chatbot_download_btn, "accent"),
-            (self.chatbot_runtime_btn, "secondary"),
-            (self.chatbot_test_backend_btn, "secondary"),
             (self.chatbot_output_mode_btn, "ghost"),
             (self.chatbot_copy_output_btn, "secondary"),
             (self.chatbot_apply_btn, "accent"),
@@ -7826,10 +7985,6 @@ class LTXQueueManager:
             (self.gallery_import_image_btn, "secondary"),
             (self.gallery_import_btn, "secondary"),
             (self.import_audio_btn, "secondary"),
-            (self.chatbot_setup_btn, "secondary"),
-            (self.chatbot_download_btn, "accent"),
-            (self.chatbot_runtime_btn, "secondary"),
-            (self.chatbot_test_backend_btn, "secondary"),
             (self.chatbot_output_mode_btn, "ghost"),
             (self.chatbot_copy_output_btn, "secondary"),
             (self.chatbot_send_btn, "secondary"),
@@ -8202,6 +8357,8 @@ class LTXQueueManager:
         self.help_menu_open_debug_index = self.help_menu.index("end")
         self.help_menu.add_command(label="Show ComfyUI Terminal", command=self.toggle_comfyui_terminal, state=tk.DISABLED)
         self.help_menu_toggle_terminal_index = self.help_menu.index("end")
+        self.help_menu.add_command(label="Show Music Terminal", command=self.toggle_acestep_terminal, state=tk.DISABLED)
+        self.help_menu_toggle_music_terminal_index = self.help_menu.index("end")
         self.help_menu.add_separator()
         self.help_menu.add_command(label="Run Interactive Tutorial", command=self.run_interactive_tutorial)
         self.help_menu.add_command(label=f"About {APP_NAME}", command=self.show_about_dialog)
@@ -9433,8 +9590,8 @@ class LTXQueueManager:
         self.chatbot_workspace_frame.pack(fill=tk.BOTH, expand=True)
         self._style_panel(self.chatbot_workspace_frame, self.colors["bg"])
         self.chatbot_workspace_frame.grid_columnconfigure(0, weight=1)
-        self.chatbot_workspace_frame.grid_rowconfigure(0, weight=1)
-        self.chatbot_workspace_frame.grid_rowconfigure(1, weight=0)
+        self.chatbot_workspace_frame.grid_rowconfigure(0, weight=0)
+        self.chatbot_workspace_frame.grid_rowconfigure(1, weight=1)
 
         self.chatbot_focus_workspace_section = self._create_collapsible_section(
             self.chatbot_workspace_frame,
@@ -9445,7 +9602,7 @@ class LTXQueueManager:
             body_expand=True,
             body_background=self.colors["surface"],
         )
-        self.chatbot_focus_workspace_section["container"].grid(row=0, column=0, sticky="nsew", pady=(0, 12))
+        self.chatbot_focus_workspace_section["container"].grid(row=1, column=0, sticky="nsew", pady=(0, 12))
         self._style_panel(self.chatbot_focus_workspace_section["container"], self.colors["surface"], border=True)
         self._style_panel(self.chatbot_focus_workspace_section["header"], self.colors["surface"])
         self._style_panel(self.chatbot_focus_workspace_section["body"], self.colors["surface"])
@@ -9651,49 +9808,7 @@ class LTXQueueManager:
         self.chatbot_transcript_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.chatbot_transcript_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        self.chatbot_history_section = self._create_collapsible_section(
-            self.chatbot_workspace_frame,
-            "chatbot_history",
-            "Saved Results",
-            meta_text="No saved results",
-            is_open=False,
-            body_expand=False,
-            body_background=self.colors["surface"],
-        )
-        self.chatbot_history_section["container"].grid(row=1, column=0, sticky="ew", pady=(0, 12))
-        self._style_panel(self.chatbot_history_section["container"], self.colors["surface"], border=True)
-        self._style_panel(self.chatbot_history_section["header"], self.colors["surface"])
-        self._style_panel(self.chatbot_history_section["body"], self.colors["surface"])
-        self._style_label(self.chatbot_history_section["title"], "section", self.chatbot_history_section["header"].cget("bg"))
-        self._style_label(self.chatbot_history_section["meta"], "muted", self.chatbot_history_section["header"].cget("bg"))
-        self._style_button(self.chatbot_history_section["toggle"], "ghost", compact=True)
-
-        self.chatbot_history_card = self.chatbot_history_section["body"]
-        self.chatbot_apply_hint_label = tk.Label(self.chatbot_history_card, text="Saved scene plans and prompt drafts stay here for quick compare-and-reload. Selecting one reloads it into the review surface above the transcript.", anchor="w", justify=tk.LEFT, wraplength=860)
-        self.chatbot_apply_hint_label.pack(anchor="w", fill=tk.X, pady=(0, 10))
-        self._style_label(self.chatbot_apply_hint_label, "muted", self.chatbot_history_card.cget("bg"))
-        self.chatbot_history_shell = tk.Frame(self.chatbot_history_card)
-        self.chatbot_history_shell.pack(fill=tk.BOTH, expand=True)
-        self._style_panel(self.chatbot_history_shell, self.chatbot_history_card.cget("bg"))
-        self.chatbot_history_canvas = tk.Canvas(self.chatbot_history_shell, bd=0, highlightthickness=0, bg=self.colors["surface"], height=220)
-        self.chatbot_history_scrollbar = tk.Scrollbar(self.chatbot_history_shell, orient="vertical", command=self.chatbot_history_canvas.yview)
-        self.chatbot_history_frame = tk.Frame(self.chatbot_history_canvas)
-        self._style_panel(self.chatbot_history_frame, self.colors["surface"])
-        self.chatbot_history_window_id = self.chatbot_history_canvas.create_window((0, 0), window=self.chatbot_history_frame, anchor="nw")
-        self.chatbot_history_canvas.configure(yscrollcommand=self.chatbot_history_scrollbar.set)
-        self.chatbot_history_frame.bind(
-            "<Configure>",
-            lambda _event: self.chatbot_history_canvas.configure(scrollregion=self.chatbot_history_canvas.bbox("all"))
-        )
-        self.chatbot_history_canvas.bind(
-            "<Configure>",
-            lambda event: self.chatbot_history_canvas.itemconfig(self.chatbot_history_window_id, width=event.width)
-        )
-        self.chatbot_history_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.chatbot_history_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
         # ── Autonomous Mode Panel ──
-        self.chatbot_workspace_frame.grid_rowconfigure(2, weight=0)
         self.autonomous_section = self._create_collapsible_section(
             self.chatbot_workspace_frame,
             "autonomous_mode",
@@ -9703,7 +9818,7 @@ class LTXQueueManager:
             body_expand=False,
             body_background=self.colors["surface"],
         )
-        self.autonomous_section["container"].grid(row=2, column=0, sticky="ew", pady=(0, 12))
+        self.autonomous_section["container"].grid(row=0, column=0, sticky="ew", pady=(0, 12))
         self._style_panel(self.autonomous_section["container"], self.colors["surface"], border=True)
         self._style_panel(self.autonomous_section["header"], self.colors["surface"])
         self._style_panel(self.autonomous_section["body"], self.colors["surface"])
@@ -9797,61 +9912,8 @@ class LTXQueueManager:
             self._style_label(plbl, "muted", auto_body.cget("bg"))
             self.autonomous_phase_labels[phase_key] = plbl
 
-        self.chatbot_readiness_section = self._create_collapsible_section(
-            self.chatbot_shell,
-            "chatbot_readiness",
-            "Preflight",
-            meta_text=self._get_chatbot_readiness_summary(),
-            is_open=False,
-            body_expand=False,
-            body_background=self.colors["surface"],
-        )
-        self.chatbot_readiness_section["container"].pack(fill=tk.X, pady=(0, 12))
-        self._style_panel(self.chatbot_readiness_section["container"], self.colors["surface"], border=True)
-        self._style_panel(self.chatbot_readiness_section["header"], self.colors["surface"])
-        self._style_panel(self.chatbot_readiness_section["body"], self.colors["surface"])
-        self._style_label(self.chatbot_readiness_section["title"], "section", self.chatbot_readiness_section["header"].cget("bg"))
-        self._style_label(self.chatbot_readiness_section["meta"], "muted", self.chatbot_readiness_section["header"].cget("bg"))
-        self._style_button(self.chatbot_readiness_section["toggle"], "ghost", compact=True)
-
-        self.chatbot_runtime_card = self.chatbot_readiness_section["body"]
-        self.chatbot_runtime_title_label = tk.Label(self.chatbot_runtime_card, text="Before you generate")
-        self.chatbot_runtime_title_label.pack(anchor="w")
-        self._style_label(self.chatbot_runtime_title_label, "section", self.chatbot_runtime_card.cget("bg"))
-        self.chatbot_readiness_summary_label = tk.Label(self.chatbot_runtime_card, text=self._get_chatbot_readiness_summary(), anchor="w")
-        self.chatbot_readiness_summary_label.pack(anchor="w", pady=(6, 0))
-        self._style_label(self.chatbot_readiness_summary_label, "body_strong", self.chatbot_runtime_card.cget("bg"))
-        self.chatbot_readiness_next_step_label = tk.Label(self.chatbot_runtime_card, text=self._get_chatbot_next_step_text(), anchor="w", justify=tk.LEFT, wraplength=860)
-        self.chatbot_readiness_next_step_label.pack(anchor="w", fill=tk.X, pady=(6, 8))
-        self._style_label(self.chatbot_readiness_next_step_label, "body", self.chatbot_runtime_card.cget("bg"))
-        self.chatbot_runtime_status_label = tk.Label(self.chatbot_runtime_card, text=self._get_chatbot_runtime_state_text(), anchor="w", justify=tk.LEFT, wraplength=820)
-        self.chatbot_runtime_status_label.pack(anchor="w", fill=tk.X, pady=(6, 10))
-        self._style_label(self.chatbot_runtime_status_label, "muted", self.chatbot_runtime_card.cget("bg"))
-
-        self.chatbot_runtime_actions_frame = tk.Frame(self.chatbot_runtime_card)
-        self.chatbot_runtime_actions_frame.pack(fill=tk.X)
-        self._style_panel(self.chatbot_runtime_actions_frame, self.chatbot_runtime_card.cget("bg"))
-        self.chatbot_setup_btn = tk.Button(self.chatbot_runtime_actions_frame, text="Set Up Model", command=lambda: self.ensure_chatbot_model_ready(interactive=True))
-        self.chatbot_setup_btn.pack(side=tk.LEFT)
-        self._style_button(self.chatbot_setup_btn, "primary", compact=True)
-        self.chatbot_download_btn = tk.Button(self.chatbot_runtime_actions_frame, text="Download Model", command=self.prompt_and_download_chatbot_model)
-        self.chatbot_download_btn.pack(side=tk.LEFT, padx=(10, 0))
-        self._style_button(self.chatbot_download_btn, "secondary", compact=True)
-        self.chatbot_runtime_btn = tk.Button(self.chatbot_runtime_actions_frame, text="Runtime Details", command=self.configure_chatbot_runtime)
-        self.chatbot_runtime_btn.pack(side=tk.LEFT, padx=(10, 0))
-        self._style_button(self.chatbot_runtime_btn, "ghost", compact=True)
-        self.chatbot_test_backend_btn = tk.Button(self.chatbot_runtime_actions_frame, text="Test Backend", command=self.test_chatbot_runtime_connection)
-        self.chatbot_test_backend_btn.pack(side=tk.LEFT, padx=(10, 0))
-        self._style_button(self.chatbot_test_backend_btn, "accent", compact=True)
-
-        self.chatbot_readiness_health_label = tk.Label(self.chatbot_runtime_card, text=self.chatbot_backend_health_text, anchor="w", justify=tk.LEFT, wraplength=820)
-        self.chatbot_readiness_health_label.pack(anchor="w", fill=tk.X, pady=(10, 0))
-        self._style_label(self.chatbot_readiness_health_label, "muted", self.chatbot_runtime_card.cget("bg"))
-
         self._update_chatbot_workspace_balance()
-        self._refresh_chatbot_runtime_ui()
         self._on_chatbot_task_changed()
-        self._refresh_chatbot_history_list()
 
     def _get_selected_video_profile_key(self):
         selected_label = self.video_profile_var.get()
@@ -10529,13 +10591,35 @@ class LTXQueueManager:
             env["CHECK_UPDATE"] = "false"
             env["ACESTEP_NO_INIT"] = "true"
             self.acestep_model_loaded = False
+
+            console_title = f"{APP_NAME} ACE-Step {uuid.uuid4().hex[:8]}"
+            # Wrap the command so the console window gets a discoverable title
+            if cmd[0] == "cmd":
+                launcher_expression = f'title {console_title} && ' + ' '.join(f'"{c}"' for c in cmd[1:])
+            else:
+                launcher_expression = 'title {} && {}'.format(console_title, ' '.join(f'"{c}"' for c in cmd))
+            launcher_command = f'"{os.environ.get("COMSPEC", "cmd.exe")}" /k {launcher_expression}'
+
+            startupinfo = None
+            if sys.platform == "win32":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = WINDOWS_HIDE
+
             self.acestep_api_process = subprocess.Popen(
-                cmd,
+                launcher_command,
                 cwd=acestep_dir,
                 env=env,
                 creationflags=subprocess.CREATE_NEW_CONSOLE,
+                startupinfo=startupinfo,
             )
-            self.log_debug("ACESTEP_API_SERVER_LAUNCHED", pid=self.acestep_api_process.pid, cwd=acestep_dir, cmd=str(cmd))
+            self.acestep_console_hwnd = None
+            self.acestep_console_visible = False
+            self.acestep_console_title = console_title
+            self.acestep_console_pending_visibility = False
+            self.log_debug("ACESTEP_API_SERVER_LAUNCHED", pid=self.acestep_api_process.pid, cwd=acestep_dir, cmd=str(cmd), console_title=console_title)
+            self._queue_acestep_console_visibility(False, source="launch")
+            self._refresh_acestep_terminal_button()
             return True
         except Exception as e:
             self.log_debug("ACESTEP_LAUNCH_ERROR", details=str(e))
@@ -15295,6 +15379,7 @@ class LTXQueueManager:
 
     def on_closing(self):
         self._cancel_comfyui_console_poll()
+        self._cancel_acestep_console_poll()
         self.save_global_settings()
         self.save_project_state()
         if self.chatbot_server_managed_by_app:
@@ -15309,6 +15394,16 @@ class LTXQueueManager:
         self.comfyui_console_visible = False
         self.comfyui_console_title = None
         self.comfyui_console_pending_visibility = None
+        if self.acestep_api_process:
+            try:
+                subprocess.run(['TASKKILL', '/F', '/T', '/PID', str(self.acestep_api_process.pid)], creationflags=subprocess.CREATE_NO_WINDOW)
+            except Exception:
+                pass
+        self.acestep_api_process = None
+        self.acestep_console_hwnd = None
+        self.acestep_console_visible = False
+        self.acestep_console_title = None
+        self.acestep_console_pending_visibility = None
         self.root.destroy()
 
 if __name__ == "__main__":
