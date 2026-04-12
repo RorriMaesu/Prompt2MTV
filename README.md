@@ -10,6 +10,7 @@
 - **AI Music** — Compose original tracks with ACE-Step 1.5-XL (Turbo or SFT variants)
 - **AI Chatbot** — Plan and refine scene prompts, brainstorm song concepts, and generate structured lyrics with a local Qwen 3 or Gemma 4 assistant
 - **Autonomous Mode** — One-click pipeline that takes a creative brief and automatically generates all scenes, composes music, and merges the final video
+- **Agentic Quality Control** — Selective thinking mode, per-scene confidence scoring with auto-retry, and batch continuity review with targeted regeneration
 - **One-click merge** — Stitch clips, sync audio, and export final music videos
 - **Project management** — Batch prompt queue, media gallery, drag-and-drop import, per-project settings
 
@@ -94,15 +95,34 @@ If ComfyUI is in a non-default location, use **Project → Configure Runtime Pat
 
 ### Autonomous Mode
 
-Autonomous mode lives in the Chatbot tab under the collapsible **Autonomous Mode** section. Write a short creative brief describing the music video you want, set the target duration in seconds, and click **Start**. The app will:
+Autonomous mode lives in the Chatbot tab under the collapsible **Autonomous Mode** section. Write a short creative brief describing the music video you want, set the target duration in seconds, choose an **AI Quality** preset, and click **Start**. The app will:
 
-1. Expand your brief into a full scene plan using the AI chatbot
-2. Generate video scenes through ComfyUI
-3. Stitch them together
-4. Compose a matching soundtrack with ACE-Step
-5. Merge audio and video into the final music video
+1. Expand your brief into a full creative concept (visual style, color palette, motifs, narrative arc)
+2. Generate image and video prompts for each scene — enriched with concept context, song lyrics, and continuity from previous scenes
+3. Self-assess each prompt with a confidence score and auto-retry weak results
+4. *(Quality preset)* Run a batch continuity review across all prompts and regenerate up to 3 weak scenes
+5. Generate images and videos through ComfyUI
+6. Stitch clips together
+7. Compose a matching soundtrack with ACE-Step
+8. Merge audio and video into the final music video
+
+#### AI Quality Presets
+
+| Preset | Thinking | Confidence Check | Batch Review |
+|--------|----------|-------------------|--------------|
+| **Fast** | Off | Off | Off |
+| **Balanced** | Planning tasks only | ≥ 6 (auto-retry once) | Off |
+| **Quality** | Planning tasks only | ≥ 7 (auto-retry once) | Full review + targeted regen |
+
+- **Thinking mode** uses Gemma 4's native thinking capability on concept expansion, scene outlining, and song brainstorming — giving the model time to reason before committing to an answer.
+- **Confidence scoring** asks the model to rate each generated prompt (1–10). Prompts below the threshold are automatically regenerated once.
+- **Batch review** examines all prompts together for visual coherence, narrative flow, and style consistency, then regenerates the weakest scenes.
 
 A readiness indicator shows when ComfyUI is online. If you click Start before it's ready, the status label flashes to let you know. Once ComfyUI history is available, an ETA countdown appears during startup based on previous launch times.
+
+#### VRAM Management
+
+The autonomous pipeline is strictly sequential — the LLM is fully unloaded from VRAM before ComfyUI starts generating, and ComfyUI memory is freed between image and video phases. This means a 16 GB GPU can run the full pipeline without running out of memory. On first launch the app logs Ollama tuning tips (Flash Attention, KV cache quantization) if applicable.
 
 ## Required Models (~62 GB)
 
@@ -169,7 +189,7 @@ python ltx_queue_manager.py
 
 ```powershell
 .\build_exe.bat              # → dist\Prompt2MTV\Prompt2MTV.exe
-.\.build_installer.bat        # → dist_installer\Prompt2MTV-Setup-1.5.2.exe
+.\.build_installer.bat        # → dist_installer\Prompt2MTV-Setup-2.0.0.exe
 ```
 
 ### Upgrade helper

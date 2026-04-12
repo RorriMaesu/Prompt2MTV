@@ -206,7 +206,7 @@ WINDOWS_HIDE = 0
 WINDOWS_SHOW = 5
 WINDOWS_RESTORE = 9
 APP_NAME = "Prompt2MTV"
-APP_VERSION = "1.5.2"
+APP_VERSION = "2.0.0"
 APP_PUBLISHER = "Prompt2MTV"
 APP_TAGLINE = "Local AI Music Video Studio"
 ENV_COMFYUI_ROOT_KEYS = ("PROMPT2MTV_COMFYUI_ROOT", "COMFYUI_ROOT")
@@ -278,6 +278,7 @@ CHATBOT_TASK_JIT_IMAGE_PROMPT = "Generate Image Prompt (JIT)"
 CHATBOT_TASK_JIT_VIDEO_PROMPT = "Generate Video Prompt (JIT)"
 CHATBOT_TASK_SONG_BRAINSTORM = "Brainstorm Song (Lyrics & Style)"
 CHATBOT_TASK_CONCEPT_EXPAND = "Expand Creative Concept"
+CHATBOT_TASK_BATCH_REVIEW = "Review Prompt Batch"
 BUNDLED_MODEL_DIR = "bundled_models"
 MODEL_SUBDIRECTORIES = {
     "checkpoint_name": "checkpoints",
@@ -1143,33 +1144,6 @@ class LTXQueueManager:
         if self.chatbot_model_path:
             return "Model not found. Run model setup to download Qwen or point Prompt2MTV to an existing GGUF file."
         return "Model not configured. Run setup to download Qwen locally."
-
-    def _get_chatbot_readiness_summary(self):
-        if self.chatbot_generation_in_progress:
-            return "Generating"
-        if self._chatbot_requires_local_model() and not self._chatbot_model_is_ready():
-            return "Model missing"
-        if not self._chatbot_model_is_ready() and self.chatbot_backend_mode != CHATBOT_BACKEND_MODE_CONNECT:
-            return "Model not linked"
-        health_text = str(self.chatbot_backend_health_text or "").lower()
-        if "backend check: online" in health_text:
-            return "Ready"
-        if self.chatbot_backend_mode == CHATBOT_BACKEND_MODE_CONNECT:
-            return "Needs backend"
-        if self.chatbot_auto_launch_server:
-            return "Ready to start backend"
-        return "Needs runtime"
-
-    def _get_chatbot_next_step_text(self):
-        if self._chatbot_requires_local_model() and not self._chatbot_model_is_ready():
-            return "Set up the local Qwen GGUF first."
-        if self.chatbot_backend_mode == CHATBOT_BACKEND_MODE_CONNECT:
-            return "Test the configured local server before generating."
-        if self.chatbot_backend_mode == CHATBOT_BACKEND_MODE_OLLAMA:
-            return "Prompt2MTV can start Ollama for you when generation begins."
-        if self.chatbot_backend_mode == CHATBOT_BACKEND_MODE_MANAGED:
-            return "Prompt2MTV can start llama-server for you when generation begins."
-        return "Start chatting, then generate a prompt draft when you are ready."
 
     def _get_chatbot_task_options(self):
         return [
@@ -2351,8 +2325,6 @@ class LTXQueueManager:
 
     def _set_chatbot_backend_health_text(self, text):
         self.chatbot_backend_health_text = str(text or "Backend check: Not tested yet.")
-        if hasattr(self, "chatbot_readiness_health_label"):
-            self.chatbot_readiness_health_label.config(text=self.chatbot_backend_health_text)
 
     def _set_chatbot_output_preview(self, text):
         self.chatbot_output_preview_cache = str(text or "")
@@ -2690,6 +2662,7 @@ class LTXQueueManager:
                 "non_empty_fields": ["task", "title", "mood", "color_palette", "visual_style",
                                      "narrative_arc", "genre_direction", "expanded_brief"],
                 "json_schema": json_schema,
+                "allow_thinking": True,
                 "system_prompt": (
                     "You are a music video creative director with a strong visual imagination. "
                     "Your job is to take a brief idea — even a single phrase — and expand it into a rich, specific creative concept "
@@ -2842,6 +2815,7 @@ class LTXQueueManager:
                 "required_fields": ["task", "title", "lyrics", "style_tags", "rationale"],
                 "non_empty_fields": ["task", "title", "lyrics", "style_tags"],
                 "json_schema": json_schema,
+                "allow_thinking": True,
                 "system_prompt": (
                     "You are a talented songwriter creating original music for a music video. "
                     "You write lyrics that complement visual storytelling — vivid, emotional, and rhythmically strong. "
@@ -2920,6 +2894,7 @@ class LTXQueueManager:
                 "non_empty_fields": ["task", "title", "planning_rationale"],
                 "max_tokens": 4096,
                 "json_schema": json_schema,
+                "allow_thinking": True,
                 "system_prompt": (
                     "You are an expert music video director. "
                     "You plan concise scene outlines — short titles, shot types, moods, and one visual hook per scene. "
@@ -2933,7 +2908,9 @@ class LTXQueueManager:
             schema_hint = {
                 "task": "jit_image_prompt",
                 "image_prompt": "Detailed text-to-image prompt for generating a still frame",
-                "negative_prompt": "Optional negative prompt, can be empty"
+                "negative_prompt": "Optional negative prompt, can be empty",
+                "confidence": "1-10 integer: how well this prompt captures the scene concept and visual style",
+                "self_critique": "One sentence: what could be improved or what creative risk was taken"
             }
             json_schema = {
                 "name": "prompt2mtv_jit_image_prompt",
@@ -2943,9 +2920,11 @@ class LTXQueueManager:
                     "properties": {
                         "task": {"type": "string", "const": "jit_image_prompt"},
                         "image_prompt": {"type": "string"},
-                        "negative_prompt": {"type": "string"}
+                        "negative_prompt": {"type": "string"},
+                        "confidence": {"type": "integer"},
+                        "self_critique": {"type": "string"}
                     },
-                    "required": ["task", "image_prompt", "negative_prompt"]
+                    "required": ["task", "image_prompt", "negative_prompt", "confidence", "self_critique"]
                 }
             }
             user_prompt_template = (
@@ -2959,13 +2938,15 @@ class LTXQueueManager:
                 "- Be visually specific: 'a lone astronaut on a crimson dune under a violet sky with two moons' "
                 "not 'a space scene'.\n"
                 "- The prompt should be 2-4 sentences of vivid visual direction.\n"
+                "- Rate your confidence 1-10 on how well your prompt captures the scene's concept and mood.\n"
+                "- In self_critique, note one thing that could be stronger or a creative risk you took.\n"
                 "- If you reason internally, do not expose reasoning in the visible answer.\n"
                 "- Avoid markdown and avoid prose outside JSON.\n"
             )
             return {
                 "label": CHATBOT_TASK_JIT_IMAGE_PROMPT,
                 "output_task": "jit_image_prompt",
-                "required_fields": ["task", "image_prompt", "negative_prompt"],
+                "required_fields": ["task", "image_prompt", "negative_prompt", "confidence", "self_critique"],
                 "non_empty_fields": ["task", "image_prompt"],
                 "max_tokens": 1024,
                 "json_schema": json_schema,
@@ -2980,7 +2961,9 @@ class LTXQueueManager:
         if task_label == CHATBOT_TASK_JIT_VIDEO_PROMPT:
             schema_hint = {
                 "task": "jit_video_prompt",
-                "video_prompt": "Motion description for animating the still image into video"
+                "video_prompt": "Motion description for animating the still image into video",
+                "confidence": "1-10 integer: how well this prompt will animate the scene with appropriate motion",
+                "self_critique": "One sentence: what could be improved or what creative risk was taken"
             }
             json_schema = {
                 "name": "prompt2mtv_jit_video_prompt",
@@ -2989,35 +2972,117 @@ class LTXQueueManager:
                     "additionalProperties": False,
                     "properties": {
                         "task": {"type": "string", "const": "jit_video_prompt"},
-                        "video_prompt": {"type": "string"}
+                        "video_prompt": {"type": "string"},
+                        "confidence": {"type": "integer"},
+                        "self_critique": {"type": "string"}
                     },
-                    "required": ["task", "video_prompt"]
+                    "required": ["task", "video_prompt", "confidence", "self_critique"]
                 }
             }
             user_prompt_template = (
-                "Task: write a motion description for animating a still image into a ~5 second video clip.\n\n"
+                "Task: write a video prompt for animating a still image into a ~5 second video clip.\n\n"
                 "__BRIEFING_TEXT__\n\n"
                 "Produce exactly this JSON schema:\n"
                 f"{json.dumps(schema_hint, indent=2)}\n\n"
                 "VIDEO PROMPT GUIDELINES:\n"
-                "- Describe how the still image comes alive — what moves and how the camera behaves.\n"
-                "- Focus on: camera movement (dolly in, slow pan, crane up, tracking shot), "
-                "subject motion, atmospheric effects.\n"
-                "- The scene is ~5 seconds. Keep motion achievable for that duration.\n"
-                "- 1-3 sentences of focused camera direction.\n"
+                "- Describe only changes from the image — do NOT reiterate established visual details.\n"
+                "- Use present-progressive verbs (\"is walking\", \"glances at\", \"reaches for\").\n"
+                "- Use temporal connectors for chronological flow (\"as\", \"then\", \"while\").\n"
+                "- Include an audio/soundscape layer alongside actions — be specific "
+                "(e.g. \"soft footsteps on tile\", \"wind rustling through leaves\") not vague.\n"
+                "- DO NOT invent camera motion unless the creative brief specifically requests it.\n"
+                "- Keep the description under 200 words as a single flowing paragraph.\n"
+                "- Use restrained, natural language — avoid dramatic or exaggerated terms.\n"
+                "- Describe only what is seen and heard. No smell, taste, or tactile sensations.\n"
+                "- DO NOT use phrases like \"The scene opens with...\" or \"The video starts...\". "
+                "Start directly with the action.\n"
+                "- Rate your confidence 1-10 on how well this prompt will animate the scene with appropriate motion.\n"
+                "- In self_critique, note one thing that could be stronger or a creative risk you took.\n"
                 "- If you reason internally, do not expose reasoning in the visible answer.\n"
                 "- Avoid markdown and avoid prose outside JSON.\n"
             )
             return {
                 "label": CHATBOT_TASK_JIT_VIDEO_PROMPT,
                 "output_task": "jit_video_prompt",
-                "required_fields": ["task", "video_prompt"],
+                "required_fields": ["task", "video_prompt", "confidence", "self_critique"],
                 "non_empty_fields": ["task", "video_prompt"],
-                "max_tokens": 512,
+                "max_tokens": 768,
                 "json_schema": json_schema,
                 "system_prompt": (
-                    "You are a camera director writing motion instructions for animating a still image into video. "
-                    "Focus on camera movement, subject motion, and atmospheric effects. "
+                    "You are a creative assistant writing concise, action-focused image-to-video prompts. "
+                    "Given an image (first frame) description and a creative brief, generate a prompt to guide "
+                    "video generation from that image. Describe scene changes chronologically with integrated "
+                    "audio descriptions. Use present-progressive verbs and restrained language. "
+                    "Return only a JSON object with no markdown fences, no prose outside JSON, and no extra keys."
+                ),
+                "user_prompt_template": user_prompt_template,
+            }
+
+        if task_label == CHATBOT_TASK_BATCH_REVIEW:
+            schema_hint = {
+                "task": "batch_review",
+                "overall_coherence": "1-10 rating of visual/narrative coherence across all scenes",
+                "weak_scenes": [
+                    {
+                        "scene_number": 1,
+                        "issue": "Brief description of the problem",
+                        "suggestion": "Brief fix suggestion"
+                    }
+                ],
+                "summary": "One sentence overall assessment"
+            }
+            json_schema = {
+                "name": "prompt2mtv_batch_review",
+                "schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "task": {"type": "string", "const": "batch_review"},
+                        "overall_coherence": {"type": "integer"},
+                        "weak_scenes": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "scene_number": {"type": "integer"},
+                                    "issue": {"type": "string"},
+                                    "suggestion": {"type": "string"}
+                                },
+                                "required": ["scene_number", "issue", "suggestion"]
+                            }
+                        },
+                        "summary": {"type": "string"}
+                    },
+                    "required": ["task", "overall_coherence", "weak_scenes", "summary"]
+                }
+            }
+            user_prompt_template = (
+                "Task: review ALL image and video prompts for a music video and identify weak scenes.\n\n"
+                "__BRIEFING_TEXT__\n\n"
+                "Produce exactly this JSON schema:\n"
+                f"{json.dumps(schema_hint, indent=2)}\n\n"
+                "REVIEW GUIDELINES:\n"
+                "- Rate overall_coherence 1-10: do the scenes form a cohesive visual narrative?\n"
+                "- List weak_scenes (may be empty if all are strong): scenes that break continuity, "
+                "repeat motifs excessively, lack visual specificity, or clash with the concept.\n"
+                "- Only flag scenes with genuine problems — do not pad the list.\n"
+                "- Each suggestion should be a concrete, actionable fix (not vague advice).\n"
+                "- If you reason internally, do not expose reasoning in the visible answer.\n"
+                "- Avoid markdown and avoid prose outside JSON.\n"
+            )
+            return {
+                "label": CHATBOT_TASK_BATCH_REVIEW,
+                "output_task": "batch_review",
+                "required_fields": ["task", "overall_coherence", "weak_scenes", "summary"],
+                "non_empty_fields": ["task", "summary"],
+                "max_tokens": 4096,
+                "json_schema": json_schema,
+                "allow_thinking": True,
+                "system_prompt": (
+                    "You are a music video creative director reviewing a batch of scene prompts. "
+                    "You evaluate visual coherence, narrative flow, variety of shot types, and alignment "
+                    "with the creative concept. You flag weak scenes with specific, actionable suggestions. "
                     "Return only a JSON object with no markdown fences, no prose outside JSON, and no extra keys."
                 ),
                 "user_prompt_template": user_prompt_template,
@@ -3145,6 +3210,24 @@ class LTXQueueManager:
             validated_output["scenes"] = validated_scenes
             return validated_output
 
+        # ── Batch review has an array field (weak_scenes) — handle specially ──
+        if str(task_config.get("output_task") or "").strip() == "batch_review":
+            validated_output = {}
+            for field_name in task_config.get("required_fields", []):
+                if field_name not in parsed_output:
+                    raise ValueError(f"The chatbot response is missing required field '{field_name}'.")
+            validated_output["task"] = "batch_review"
+            validated_output["overall_coherence"] = int(parsed_output.get("overall_coherence") or 5)
+            validated_output["summary"] = str(parsed_output.get("summary") or "").strip()
+            weak_scenes = parsed_output.get("weak_scenes")
+            if not isinstance(weak_scenes, list):
+                weak_scenes = []
+            validated_output["weak_scenes"] = [
+                ws for ws in weak_scenes
+                if isinstance(ws, dict) and ws.get("scene_number")
+            ]
+            return validated_output
+
         validated_output = {}
         for field_name in task_config.get("required_fields", []):
             if field_name not in parsed_output:
@@ -3177,7 +3260,9 @@ class LTXQueueManager:
         return response_payload
 
     def _build_chatbot_completion_payload_variants(self, task_config, briefing_text, model_id, keep_alive=None):
-        force_non_thinking = self._chatbot_should_force_non_thinking(model_id=model_id)
+        # Determine thinking mode: allow_thinking in task config overrides global default
+        task_allows_thinking = task_config.get("allow_thinking", False) and getattr(self, "autonomous_quality_thinking", True)
+        force_non_thinking = self._chatbot_should_force_non_thinking(model_id=model_id) and not task_allows_thinking
         base_payload = {
             "model": model_id,
             "messages": self._build_chatbot_request_messages(
@@ -3192,10 +3277,13 @@ class LTXQueueManager:
             "stream": False,
         }
         base_payload.update(self._build_chatbot_sampling_payload())
-        if force_non_thinking and self._chatbot_request_targets_gemma4(model_id=model_id):
-            base_payload["think"] = False
+        if self._chatbot_request_targets_gemma4(model_id=model_id):
+            base_payload["think"] = task_allows_thinking and not force_non_thinking
         if keep_alive is not None and self.chatbot_backend_mode == CHATBOT_BACKEND_MODE_OLLAMA:
             base_payload["keep_alive"] = keep_alive
+        # Increase context window for thinking tasks to accommodate reasoning tokens
+        if task_allows_thinking and not force_non_thinking and self.chatbot_backend_mode == CHATBOT_BACKEND_MODE_OLLAMA:
+            base_payload.setdefault("options", {})["num_ctx"] = 32768
         return [
             dict(base_payload, response_format={"type": "json_schema", "json_schema": task_config["json_schema"]}),
             dict(base_payload, response_format={"type": "json_object"}),
@@ -3785,36 +3873,12 @@ class LTXQueueManager:
         self._refresh_chatbot_runtime_ui()
 
     def _refresh_chatbot_runtime_ui(self):
-        runtime_ready = self._chatbot_generation_prerequisites_ready()
-        if hasattr(self, "chatbot_runtime_state_value_label"):
-            self.chatbot_runtime_state_value_label.config(text=self._get_chatbot_readiness_summary())
-        if hasattr(self, "chatbot_model_value_label"):
-            if self._chatbot_model_is_ready():
-                self.chatbot_model_value_label.config(text=os.path.basename(self.chatbot_model_path))
-            elif self._chatbot_can_generate_without_local_model():
-                self.chatbot_model_value_label.config(text="Server-managed")
-            else:
-                self.chatbot_model_value_label.config(text="Not installed")
-        if hasattr(self, "chatbot_destination_value_label"):
-            self.chatbot_destination_value_label.config(text=self.chatbot_model_root or "Unset")
-        if hasattr(self, "chatbot_backend_value_label"):
-            self.chatbot_backend_value_label.config(text=self._get_chatbot_backend_mode_label())
         if hasattr(self, "chatbot_model_family_var"):
             self.chatbot_model_family_var.set(self.chatbot_model_family or DEFAULT_CHATBOT_MODEL_FAMILY)
         if hasattr(self, "chatbot_gemma4_tag_var"):
             self.chatbot_gemma4_tag_var.set(self.chatbot_gemma4_ollama_tag or DEFAULT_GEMMA4_OLLAMA_TAG)
-        if hasattr(self, "chatbot_next_step_value_label"):
-            self.chatbot_next_step_value_label.config(text=self._get_chatbot_next_step_text())
         if hasattr(self, "chatbot_runtime_status_label"):
             self.chatbot_runtime_status_label.config(text=self._get_chatbot_runtime_state_text())
-        if hasattr(self, "chatbot_readiness_summary_label"):
-            self.chatbot_readiness_summary_label.config(text=self._get_chatbot_readiness_summary())
-        if hasattr(self, "chatbot_readiness_next_step_label"):
-            self.chatbot_readiness_next_step_label.config(text=self._get_chatbot_next_step_text())
-        if hasattr(self, "chatbot_readiness_health_label"):
-            self.chatbot_readiness_health_label.config(text=self.chatbot_backend_health_text)
-        if "chatbot_readiness" in self.collapsible_sections:
-            self._update_collapsible_section_meta("chatbot_readiness", self._get_chatbot_readiness_summary())
         if "chatbot_history" in self.collapsible_sections:
             history_count = len(self.chatbot_result_history)
             self._update_collapsible_section_meta("chatbot_history", f"{history_count} saved" if history_count else "No saved results")
@@ -7224,9 +7288,8 @@ class LTXQueueManager:
             "music_actions": False,
             "music_media_state": False,
             "music_preview": False,
-            "chatbot_focus_workspace": True,
+            "chatbot_focus_workspace": False,
             "chatbot_history": False,
-            "chatbot_readiness": False,
         }
 
     def _apply_collapsible_launch_defaults(self):
@@ -9572,20 +9635,6 @@ class LTXQueueManager:
         )
         self.chatbot_header_eyebrow_label, self.chatbot_header_title_label, self.chatbot_header_copy_label = chatbot_intro
 
-        self.chatbot_header_stats_frame = tk.Frame(self.chatbot_header_frame)
-        self.chatbot_header_stats_frame.pack(fill=tk.X, pady=(14, 0))
-        self._style_panel(self.chatbot_header_stats_frame, self.colors["bg"])
-        _, self.chatbot_runtime_state_value_label = self._create_metric_chip(self.chatbot_header_stats_frame, "Readiness", self._get_chatbot_readiness_summary())
-        self.chatbot_runtime_state_value_label.master.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        _, self.chatbot_backend_value_label = self._create_metric_chip(self.chatbot_header_stats_frame, "Backend", self._get_chatbot_backend_mode_label())
-        self.chatbot_backend_value_label.master.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
-        _, self.chatbot_next_step_value_label = self._create_metric_chip(self.chatbot_header_stats_frame, "Next Step", self._get_chatbot_next_step_text())
-        self.chatbot_next_step_value_label.master.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
-        _, self.chatbot_model_value_label = self._create_metric_chip(self.chatbot_header_stats_frame, "Model", "Not installed")
-        self.chatbot_model_value_label.master.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
-        _, self.chatbot_destination_value_label = self._create_metric_chip(self.chatbot_header_stats_frame, "Storage", self.chatbot_model_root or "Unset")
-        self.chatbot_destination_value_label.master.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
         self.chatbot_workspace_frame = tk.Frame(self.chatbot_shell)
         self.chatbot_workspace_frame.pack(fill=tk.BOTH, expand=True)
         self._style_panel(self.chatbot_workspace_frame, self.colors["bg"])
@@ -9598,7 +9647,7 @@ class LTXQueueManager:
             "chatbot_focus_workspace",
             "Creative Workspace",
             meta_text=self._get_chatbot_focus_section_meta(),
-            is_open=True,
+            is_open=False,
             body_expand=True,
             body_background=self.colors["surface"],
         )
@@ -9814,7 +9863,7 @@ class LTXQueueManager:
             "autonomous_mode",
             "🚀 Autonomous Music Video",
             meta_text="One-click pipeline",
-            is_open=False,
+            is_open=True,
             body_expand=False,
             body_background=self.colors["surface"],
         )
@@ -9871,6 +9920,58 @@ class LTXQueueManager:
         self.autonomous_estimate_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self._style_label(self.autonomous_estimate_label, "muted", auto_body.cget("bg"))
         self._update_autonomous_scene_estimate()
+
+        # ── Aspect Ratio selector ──
+        auto_aspect_row = tk.Frame(auto_body)
+        auto_aspect_row.pack(fill=tk.X, pady=(0, 8))
+        self._style_panel(auto_aspect_row, auto_body.cget("bg"))
+
+        aspect_label = tk.Label(auto_aspect_row, text="Aspect Ratio:")
+        aspect_label.pack(side=tk.LEFT, padx=(0, 6))
+        self._style_label(aspect_label, "body_strong", auto_body.cget("bg"))
+
+        self.autonomous_aspect_ratio_var = tk.StringVar(value="16:9 (1280×720)")
+        self.autonomous_aspect_combo = ttk.Combobox(
+            auto_aspect_row, textvariable=self.autonomous_aspect_ratio_var,
+            values=[
+                "16:9 (1920×1080)",
+                "16:9 (1280×720)",
+                "16:9 (960×544)",
+                "9:16 (1080×1920)",
+                "9:16 (720×1280)",
+                "1:1 (1024×1024)",
+                "1:1 (768×768)",
+                "4:3 (1280×960)",
+                "3:4 (960×1280)",
+            ],
+            state="readonly", width=22,
+        )
+        self.autonomous_aspect_combo.pack(side=tk.LEFT, padx=(0, 12))
+
+        aspect_hint = tk.Label(auto_aspect_row, text="Sets image + video resolution", anchor="w")
+        aspect_hint.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._style_label(aspect_hint, "muted", auto_body.cget("bg"))
+
+        # ── Quality Preset selector ──
+        auto_quality_row = tk.Frame(auto_body)
+        auto_quality_row.pack(fill=tk.X, pady=(0, 8))
+        self._style_panel(auto_quality_row, auto_body.cget("bg"))
+
+        quality_label = tk.Label(auto_quality_row, text="AI Quality:")
+        quality_label.pack(side=tk.LEFT, padx=(0, 6))
+        self._style_label(quality_label, "body_strong", auto_body.cget("bg"))
+
+        self.autonomous_quality_preset_var = tk.StringVar(value="Balanced")
+        self.autonomous_quality_combo = ttk.Combobox(
+            auto_quality_row, textvariable=self.autonomous_quality_preset_var,
+            values=["Fast", "Balanced", "Quality"],
+            state="readonly", width=12,
+        )
+        self.autonomous_quality_combo.pack(side=tk.LEFT, padx=(0, 12))
+
+        quality_hint = tk.Label(auto_quality_row, text="Controls LLM thinking depth and prompt review", anchor="w")
+        quality_hint.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._style_label(quality_hint, "muted", auto_body.cget("bg"))
 
         auto_btn_row = tk.Frame(auto_body)
         auto_btn_row.pack(fill=tk.X, pady=(0, 8))
@@ -14574,6 +14675,9 @@ class LTXQueueManager:
         self.autonomous_scene_count = scene_count
         self.autonomous_actual_duration = actual_dur
 
+        # Apply quality preset settings
+        self._apply_autonomous_quality_preset()
+
         self._set_autonomous_ui_running(True)
         self._update_autonomous_progress(AUTONOMOUS_STATE_EXPANDING_CONCEPT, "Starting autonomous pipeline...", 0.0)
 
@@ -14593,6 +14697,8 @@ class LTXQueueManager:
                 self.autonomous_cancel_btn.config(state=tk.NORMAL if is_running else tk.DISABLED)
             if hasattr(self, "autonomous_duration_entry"):
                 self.autonomous_duration_entry.config(state="readonly" if is_running else tk.NORMAL)
+            if hasattr(self, "autonomous_aspect_combo"):
+                self.autonomous_aspect_combo.config(state="disabled" if is_running else "readonly")
             if hasattr(self, "autonomous_brief_text"):
                 self.autonomous_brief_text.config(state=tk.DISABLED if is_running else tk.NORMAL)
             if hasattr(self, "chatbot_send_btn"):
@@ -14632,6 +14738,9 @@ class LTXQueueManager:
         brief = self.autonomous_creative_brief
         scene_count = self.autonomous_scene_count
         actual_duration = self.autonomous_actual_duration
+
+        # Log Ollama performance tuning recommendations
+        self._log_ollama_tuning_recommendations()
 
         try:
             # ═══════════════════════════════════════════════════════════════
@@ -14687,6 +14796,13 @@ class LTXQueueManager:
             self._autonomous_generate_all_prompts()
             if self.autonomous_cancel_requested:
                 raise InterruptedError("Cancelled by user.")
+
+            # ── Phase 3c: Batch review + targeted regen (if quality preset enables it) ──
+            if getattr(self, "autonomous_quality_batch_review", False):
+                self._update_autonomous_progress(AUTONOMOUS_STATE_PLANNING_SCENES, "Reviewing prompt batch...", 0.95)
+                if self.autonomous_cancel_requested:
+                    raise InterruptedError("Cancelled by user.")
+                self._autonomous_batch_review_and_regen()
 
             # ── Unload LLM to free VRAM for ComfyUI ──
             self._unload_chatbot_model()
@@ -14756,6 +14872,9 @@ class LTXQueueManager:
             # ── Free video models before music generation ──
             self._free_comfyui_vram()
 
+            # ── Sync music duration to actual stitched video length ──
+            self._sync_music_duration_to_stitched_video()
+
             # ═══════════════════════════════════════════════════════════════
             # MUSIC BLOCK — ACE-Step loads its own model.
             # ═══════════════════════════════════════════════════════════════
@@ -14808,6 +14927,54 @@ class LTXQueueManager:
 
     # ── Autonomous sub-phase implementations ──
 
+    def _log_ollama_tuning_recommendations(self):
+        """Log performance tuning tips for Ollama users."""
+        if self.chatbot_backend_mode != CHATBOT_BACKEND_MODE_OLLAMA:
+            return
+        tips = []
+        tips.append("TIP: Set OLLAMA_FLASH_ATTENTION=1 environment variable to reduce KV cache memory usage.")
+        tips.append("TIP: Set OLLAMA_KV_CACHE_TYPE=q8_0 environment variable to halve KV cache memory.")
+        # Warn about large models on 16GB cards
+        model_tag = str(getattr(self, "chatbot_gemma4_ollama_tag", "") or DEFAULT_GEMMA4_OLLAMA_TAG).strip().lower()
+        if "26b" in model_tag or "31b" in model_tag:
+            tips.append(
+                f"WARNING: Model '{model_tag}' is very large and may not fit in 16GB VRAM alongside ComfyUI. "
+                "Consider gemma4:e4b (~5-6GB) for autonomous mode."
+            )
+        for tip in tips:
+            self.log_debug("OLLAMA_TUNING", message=tip)
+
+    def _apply_autonomous_quality_preset(self):
+        """Translate the quality dropdown into pipeline control attributes.
+
+        Fast:     No thinking, no self-assessment, no batch review.
+        Balanced: Thinking for planning tasks, self-assessment (confidence >= 6), no batch review.
+        Quality:  Thinking for planning tasks, strict self-assessment (confidence >= 7), batch review + regen.
+        """
+        preset = getattr(self, "autonomous_quality_preset_var", None)
+        preset = preset.get() if preset else "Balanced"
+
+        if preset == "Fast":
+            self.autonomous_quality_thinking = False
+            self.autonomous_quality_min_confidence = 0
+            self.autonomous_quality_batch_review = False
+        elif preset == "Quality":
+            self.autonomous_quality_thinking = True
+            self.autonomous_quality_min_confidence = 7
+            self.autonomous_quality_batch_review = True
+        else:  # Balanced (default)
+            self.autonomous_quality_thinking = True
+            self.autonomous_quality_min_confidence = 6
+            self.autonomous_quality_batch_review = False
+
+        self.log_debug(
+            "AUTONOMOUS_QUALITY_PRESET",
+            preset=preset,
+            thinking=self.autonomous_quality_thinking,
+            min_confidence=self.autonomous_quality_min_confidence,
+            batch_review=self.autonomous_quality_batch_review,
+        )
+
     def _unload_chatbot_model(self):
         """Explicitly unload the LLM from VRAM to free memory for ComfyUI."""
         try:
@@ -14857,6 +15024,7 @@ class LTXQueueManager:
             raise RuntimeError("Concept expansion failed — no expanded brief was generated.")
 
         self.autonomous_expanded_concept = expanded_brief
+        self.autonomous_concept_result = result
 
         conversation_id = self._ensure_active_chatbot_conversation()
         self._append_chatbot_turn("user", f"[Autonomous] Expand concept: {brief[:200]}", kind="chat", conversation_id=conversation_id)
@@ -14902,6 +15070,7 @@ class LTXQueueManager:
 
     def _autonomous_generate_single_image_prompt(self, outline_entry, scene_index, total_scenes, previous_image_prompt="", keep_alive=None):
         concept = self.autonomous_expanded_concept or self.autonomous_creative_brief
+        concept_result = getattr(self, "autonomous_concept_result", None) or {}
         title = str(outline_entry.get("title") or "").strip()
         shot_type = str(outline_entry.get("shot_type") or "").strip()
         mood = str(outline_entry.get("mood") or "").strip()
@@ -14910,8 +15079,15 @@ class LTXQueueManager:
 
         briefing = (
             f"Scene {scene_index} of {total_scenes} in a music video.\n\n"
-            f"Overall concept: {concept[:300]}\n\n"
-            f"This scene:\n"
+            f"Overall concept: {concept[:2000]}\n"
+        )
+        for field_name, label in [("color_palette", "Color palette"), ("visual_style", "Visual style"),
+                                   ("visual_motifs", "Recurring motifs"), ("camera_style", "Camera style")]:
+            val = str(concept_result.get(field_name) or "").strip()
+            if val:
+                briefing += f"{label}: {val}\n"
+        briefing += (
+            f"\nThis scene:\n"
             f"- Title: {title}\n"
             f"- Shot type: {shot_type}\n"
             f"- Mood: {mood}\n"
@@ -14919,30 +15095,54 @@ class LTXQueueManager:
         )
         if notes:
             briefing += f"- Notes: {notes}\n"
+        lyrics = getattr(self, "autonomous_music_lyrics", "") or ""
+        if lyrics:
+            briefing += f"\nSong lyrics (for thematic reference):\n{lyrics[:600]}\n"
         if previous_image_prompt:
-            briefing += f"\nPrevious scene's image direction (for visual continuity):\n{previous_image_prompt[:200]}\n"
+            briefing += f"\nPrevious scene's image direction (for visual continuity):\n{previous_image_prompt[:800]}\n"
 
         result = self._request_chatbot_structured_output(CHATBOT_TASK_JIT_IMAGE_PROMPT, briefing, keep_alive=keep_alive)
-        return str(result.get("image_prompt") or "").strip()
+        return result
 
-    def _autonomous_generate_single_video_prompt(self, outline_entry, image_prompt_used, scene_index, total_scenes, keep_alive=None):
+    def _autonomous_generate_single_video_prompt(self, outline_entry, image_prompt_used, scene_index, total_scenes, keep_alive=None, previous_video_prompt=""):
+        concept = self.autonomous_expanded_concept or self.autonomous_creative_brief
+        concept_result = getattr(self, "autonomous_concept_result", None) or {}
         title = str(outline_entry.get("title") or "").strip()
         shot_type = str(outline_entry.get("shot_type") or "").strip()
         mood = str(outline_entry.get("mood") or "").strip()
         visual_hook = str(outline_entry.get("visual_hook") or "").strip()
+        notes = str(outline_entry.get("notes") or "").strip()
 
         briefing = (
             f"Scene {scene_index} of {total_scenes}.\n\n"
-            f"Scene outline:\n"
+            f"Overall concept: {concept[:2000]}\n"
+        )
+        for field_name, label in [("camera_style", "Camera style"), ("narrative_arc", "Narrative arc"),
+                                   ("tempo_energy", "Tempo/energy")]:
+            val = str(concept_result.get(field_name) or "").strip()
+            if val:
+                briefing += f"{label}: {val}\n"
+        briefing += (
+            f"\nScene outline:\n"
             f"- Title: {title}\n"
             f"- Shot type: {shot_type}\n"
             f"- Mood: {mood}\n"
-            f"- Visual hook: {visual_hook}\n\n"
-            f"The still image that will be animated shows:\n{image_prompt_used[:300]}\n"
+            f"- Visual hook: {visual_hook}\n"
         )
+        if notes:
+            briefing += f"- Notes: {notes}\n"
+        briefing += f"\nThe still image that will be animated shows:\n{image_prompt_used[:1200]}\n"
+        lyrics = getattr(self, "autonomous_music_lyrics", "") or ""
+        if lyrics:
+            briefing += f"\nSong lyrics (for thematic reference):\n{lyrics[:600]}\n"
+        if previous_video_prompt:
+            briefing += (
+                f"\nPrevious scene's camera direction (avoid repeating the same movement):\n"
+                f"{previous_video_prompt[:800]}\n"
+            )
 
         result = self._request_chatbot_structured_output(CHATBOT_TASK_JIT_VIDEO_PROMPT, briefing, keep_alive=keep_alive)
-        return str(result.get("video_prompt") or "").strip()
+        return result
 
     def _autonomous_apply_scene_plan(self, result):
         scenes = result.get("scenes") if isinstance(result.get("scenes"), list) else []
@@ -15019,6 +15219,7 @@ class LTXQueueManager:
         # ── Generate all image prompts ──
         self.autonomous_image_prompts = []
         previous_image_prompt = ""
+        min_confidence = getattr(self, "autonomous_quality_min_confidence", 0)
 
         for index, outline_entry in enumerate(scene_outline, start=1):
             if self.autonomous_cancel_requested:
@@ -15036,11 +15237,16 @@ class LTXQueueManager:
             prompt_text = ""
             for attempt in range(2):
                 try:
-                    prompt_text = self._autonomous_generate_single_image_prompt(
+                    result = self._autonomous_generate_single_image_prompt(
                         outline_entry, index, total, previous_image_prompt, keep_alive=keep_alive
                     )
-                    if prompt_text:
+                    prompt_text = str(result.get("image_prompt") or "").strip() if isinstance(result, dict) else ""
+                    confidence = int(result.get("confidence") or 0) if isinstance(result, dict) else 0
+                    if prompt_text and (confidence >= min_confidence or min_confidence <= 0 or attempt >= 1):
                         break
+                    if prompt_text and confidence < min_confidence and attempt == 0:
+                        self.log_debug("AUTONOMOUS_LOW_CONFIDENCE_RETRY", scene=index, type="image", confidence=confidence, critique=str(result.get("self_critique") or ""))
+                        continue
                 except Exception:
                     if attempt >= 1:
                         pass  # Give up on this scene's prompt
@@ -15051,6 +15257,7 @@ class LTXQueueManager:
 
         # ── Generate all video prompts ──
         self.autonomous_video_prompts = []
+        previous_video_prompt = ""
 
         for index, outline_entry in enumerate(scene_outline, start=1):
             if self.autonomous_cancel_requested:
@@ -15070,19 +15277,41 @@ class LTXQueueManager:
             prompt_text = ""
             for attempt in range(2):
                 try:
-                    prompt_text = self._autonomous_generate_single_video_prompt(
-                        outline_entry, image_prompt_used, index, total, keep_alive=keep_alive
+                    result = self._autonomous_generate_single_video_prompt(
+                        outline_entry, image_prompt_used, index, total, keep_alive=keep_alive,
+                        previous_video_prompt=previous_video_prompt,
                     )
-                    if prompt_text:
+                    prompt_text = str(result.get("video_prompt") or "").strip() if isinstance(result, dict) else ""
+                    confidence = int(result.get("confidence") or 0) if isinstance(result, dict) else 0
+                    if prompt_text and (confidence >= min_confidence or min_confidence <= 0 or attempt >= 1):
                         break
+                    if prompt_text and confidence < min_confidence and attempt == 0:
+                        self.log_debug("AUTONOMOUS_LOW_CONFIDENCE_RETRY", scene=index, type="video", confidence=confidence, critique=str(result.get("self_critique") or ""))
+                        continue
                 except Exception:
                     if attempt >= 1:
                         pass
 
             self.autonomous_video_prompts.append(prompt_text)
+            if prompt_text:
+                previous_video_prompt = prompt_text
 
         image_count = sum(1 for p in self.autonomous_image_prompts if p)
         video_count = sum(1 for p in self.autonomous_video_prompts if p)
+
+        # ── Warn about scenes with failed prompt generation ──
+        failed_image_indices = [i + 1 for i, p in enumerate(self.autonomous_image_prompts) if not p]
+        failed_video_indices = [i + 1 for i, p in enumerate(self.autonomous_video_prompts) if not p]
+        if failed_image_indices or failed_video_indices:
+            parts = []
+            if failed_image_indices:
+                parts.append(f"image prompts failed for scene(s) {failed_image_indices}")
+            if failed_video_indices:
+                parts.append(f"video prompts failed for scene(s) {failed_video_indices}")
+            warning_msg = "Prompt generation warning: " + "; ".join(parts) + ". These scenes will be skipped during rendering."
+            self.root.after(0, lambda msg=warning_msg: self.update_status(f"[Autonomous] {msg}", "orange"))
+            self.log_debug("AUTONOMOUS_PROMPT_GENERATION_GAPS", failed_image=failed_image_indices, failed_video=failed_video_indices)
+
         self.log_debug(
             "AUTONOMOUS_ALL_PROMPTS_GENERATED",
             image_prompts=image_count,
@@ -15094,6 +15323,92 @@ class LTXQueueManager:
             f"Generated {image_count} image + {video_count} video prompts.",
             1.0,
         )
+
+    def _autonomous_batch_review_and_regen(self):
+        """Review ALL prompts as a batch, then regenerate weak scenes."""
+        scene_outline = getattr(self, "autonomous_scene_outline", None) or []
+        image_prompts = getattr(self, "autonomous_image_prompts", None) or []
+        video_prompts = getattr(self, "autonomous_video_prompts", None) or []
+        concept = self.autonomous_expanded_concept or self.autonomous_creative_brief
+
+        if not image_prompts and not video_prompts:
+            return
+
+        # Build a summary of all prompts for the reviewer
+        prompt_summary = f"Creative concept: {concept[:1500]}\n\n"
+        for i, outline_entry in enumerate(scene_outline):
+            scene_num = i + 1
+            title = str(outline_entry.get("title") or "").strip()
+            img = image_prompts[i] if i < len(image_prompts) else ""
+            vid = video_prompts[i] if i < len(video_prompts) else ""
+            prompt_summary += (
+                f"Scene {scene_num}: {title}\n"
+                f"  Image prompt: {img[:300]}\n"
+                f"  Video prompt: {vid[:300]}\n\n"
+            )
+
+        try:
+            review_result = self._request_chatbot_structured_output(
+                CHATBOT_TASK_BATCH_REVIEW, prompt_summary, keep_alive="30m"
+            )
+        except Exception as exc:
+            self.log_debug("AUTONOMOUS_BATCH_REVIEW_FAILED", error=str(exc))
+            return
+
+        weak_scenes = review_result.get("weak_scenes") or []
+        coherence = int(review_result.get("overall_coherence") or 10)
+        self.log_debug(
+            "AUTONOMOUS_BATCH_REVIEW",
+            coherence=coherence,
+            weak_count=len(weak_scenes),
+            summary=str(review_result.get("summary") or ""),
+        )
+
+        if not weak_scenes or coherence >= 8:
+            return
+
+        # Regenerate only the flagged scenes (up to 3 to avoid stalling)
+        regen_indices = []
+        for ws in weak_scenes[:3]:
+            scene_num = int(ws.get("scene_number") or 0)
+            if 1 <= scene_num <= len(scene_outline):
+                regen_indices.append(scene_num)
+
+        total = len(scene_outline)
+        for scene_num in regen_indices:
+            if self.autonomous_cancel_requested:
+                break
+            idx = scene_num - 1
+            outline_entry = scene_outline[idx]
+            prev_img = image_prompts[idx - 1] if idx > 0 else ""
+            prev_vid = video_prompts[idx - 1] if idx > 0 else ""
+
+            self.root.after(0, lambda sn=scene_num: self.update_status(
+                f"[Autonomous] Regenerating scene {sn} (batch review)...", "blue"))
+
+            try:
+                img_result = self._autonomous_generate_single_image_prompt(
+                    outline_entry, scene_num, total, prev_img, keep_alive="30m"
+                )
+                new_img = str(img_result.get("image_prompt") or "").strip() if isinstance(img_result, dict) else ""
+                if new_img:
+                    self.autonomous_image_prompts[idx] = new_img
+            except Exception:
+                pass
+
+            try:
+                img_used = self.autonomous_image_prompts[idx]
+                vid_result = self._autonomous_generate_single_video_prompt(
+                    outline_entry, img_used, scene_num, total, keep_alive="30m",
+                    previous_video_prompt=prev_vid,
+                )
+                new_vid = str(vid_result.get("video_prompt") or "").strip() if isinstance(vid_result, dict) else ""
+                if new_vid:
+                    self.autonomous_video_prompts[idx] = new_vid
+            except Exception:
+                pass
+
+        self.log_debug("AUTONOMOUS_BATCH_REGEN_COMPLETE", regenerated_scenes=regen_indices)
 
     def _autonomous_apply_song(self, result, actual_duration):
         lyrics = str(result.get("lyrics") or "").strip()
@@ -15111,6 +15426,24 @@ class LTXQueueManager:
         except (ValueError, tk.TclError):
             pass
 
+    def _get_resolution_from_aspect_ratio(self, aspect_label=None):
+        """Map an aspect-ratio dropdown label to (width, height)."""
+        presets = {
+            "16:9 (1920\u00d71080)": (1920, 1080),
+            "16:9 (1280\u00d7720)": (1280, 720),
+            "16:9 (960\u00d7544)": (960, 544),
+            "9:16 (1080\u00d71920)": (1080, 1920),
+            "9:16 (720\u00d71280)": (720, 1280),
+            "1:1 (1024\u00d71024)": (1024, 1024),
+            "1:1 (768\u00d7768)": (768, 768),
+            "4:3 (1280\u00d7960)": (1280, 960),
+            "3:4 (960\u00d71280)": (960, 1280),
+        }
+        if aspect_label is None:
+            aspect_label = getattr(self, "autonomous_aspect_ratio_var", None)
+            aspect_label = aspect_label.get() if aspect_label else None
+        return presets.get(aspect_label, (1280, 720))
+
     def _autonomous_generate_images(self):
         """Render all scene images using pre-planned prompts (no LLM calls)."""
         image_prompts = getattr(self, "autonomous_image_prompts", None) or []
@@ -15123,6 +15456,13 @@ class LTXQueueManager:
             raise RuntimeError("No image workflow loaded. Load a Z-Image workflow first.")
 
         image_settings = self._get_default_image_settings()
+
+        # ── Set image dimensions from the autonomous aspect-ratio selector
+        #    so images match the I2V video resolution exactly. ──
+        ar_width, ar_height = self._get_resolution_from_aspect_ratio()
+        image_settings["width"] = ar_width
+        image_settings["height"] = ar_height
+
         total = len(image_prompts)
         self.autonomous_image_asset_map = {}
 
@@ -15216,6 +15556,11 @@ class LTXQueueManager:
         if validation_error:
             raise RuntimeError(f"Video settings validation error: {validation_error}")
 
+        # ── Override video dimensions from autonomous aspect-ratio selector ──
+        ar_width, ar_height = self._get_resolution_from_aspect_ratio()
+        video_settings["width"] = ar_width
+        video_settings["height"] = ar_height
+
         video_prompts = getattr(self, "autonomous_video_prompts", None) or []
         total = len(scene_timeline)
         rendered_paths = []
@@ -15305,6 +15650,15 @@ class LTXQueueManager:
         # Preserve timeline order — paths are already in scene sequence from the render loop
         filepaths = list(paths)
 
+        # Resolve target resolution and fps from video settings for normalisation
+        try:
+            video_settings, _ = self._collect_validated_video_settings()
+            target_w = int(video_settings["width"])
+            target_h = int(video_settings["height"])
+            target_fps = int(video_settings["fps"])
+        except Exception:
+            target_w, target_h, target_fps = 1920, 1080, 24
+
         timestamp = int(time.time())
         list_file = os.path.join(self.stitched_dir, f"concat_auto_{timestamp}.txt")
         output_file = os.path.join(self.stitched_dir, f"final_master_render_{timestamp}.mp4")
@@ -15313,7 +15667,19 @@ class LTXQueueManager:
                 for path in filepaths:
                     formatted_path = path.replace('\\', '/')
                     f.write(f"file '{formatted_path}'\n")
-            cmd = [FFMPEG_PATH, '-y', '-f', 'concat', '-safe', '0', '-i', list_file, '-c:v', 'copy', '-an', output_file]
+            # Re-encode with explicit resolution and fps to guarantee uniform
+            # dimensions across all clips — prevents aspect-ratio mismatches
+            # when the concat demuxer encounters slightly different streams.
+            cmd = [
+                FFMPEG_PATH, '-y',
+                '-f', 'concat', '-safe', '0', '-i', list_file,
+                '-vf', f'scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,'
+                       f'pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,'
+                       f'fps={target_fps}',
+                '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+                '-pix_fmt', 'yuv420p',
+                '-an', output_file,
+            ]
             subprocess.run(cmd, creationflags=subprocess.CREATE_NO_WINDOW, capture_output=True, text=True, check=True)
         except Exception as exc:
             raise RuntimeError(f"Stitching failed: {exc}")
@@ -15331,6 +15697,41 @@ class LTXQueueManager:
         self._update_autonomous_progress(AUTONOMOUS_STATE_STITCHING, f"Stitched {len(filepaths)} clips.", 1.0)
         self.root.after(0, self.refresh_gallery)
         return True
+
+    def _sync_music_duration_to_stitched_video(self):
+        """Probe the stitched video for its actual duration and update music_duration_var
+        so the generated soundtrack matches the real video length."""
+        video_path = getattr(self, "selected_video_for_music", None)
+        if not video_path or not os.path.exists(video_path):
+            return
+        try:
+            # Derive ffprobe path from ffmpeg path
+            ffmpeg_dir = os.path.dirname(FFMPEG_PATH)
+            ffmpeg_name = os.path.basename(FFMPEG_PATH)
+            ffprobe_name = ffmpeg_name.replace("ffmpeg", "ffprobe")
+            ffprobe_path = os.path.join(ffmpeg_dir, ffprobe_name) if ffmpeg_dir else ffprobe_name
+            if not os.path.exists(ffprobe_path):
+                ffprobe_path = shutil.which("ffprobe") or "ffprobe"
+
+            probe_cmd = [
+                ffprobe_path,
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                video_path,
+            ]
+            result = subprocess.run(
+                probe_cmd, capture_output=True, text=True, timeout=30,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            probed_duration = float(result.stdout.strip())
+            if probed_duration > 0:
+                rounded = int(round(probed_duration))
+                self.autonomous_actual_duration = probed_duration
+                self.root.after(0, lambda d=rounded: self.music_duration_var.set(d))
+                self.log_debug("AUTONOMOUS_MUSIC_DURATION_SYNCED", probed=probed_duration, rounded=rounded)
+        except Exception as exc:
+            self.log_debug("AUTONOMOUS_MUSIC_DURATION_PROBE_FAILED", error=str(exc))
 
     def _autonomous_generate_music(self):
         tags = self.autonomous_music_tags
