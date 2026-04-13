@@ -1,4 +1,7 @@
 
+
+![Prompt2MTV Logo](prompt2MTV_logo.jpg)
+
 ## 🎬 Demo Video
 
 <p align="center">
@@ -10,8 +13,6 @@
 **Watch a full music video generated in about 8 hours on an RTX 5060 Ti, using Autonomous mode with a single click.**
 
 ---
-
-![Prompt2MTV Logo](prompt2MTV_logo.jpg)
 
 # Prompt2MTV
 
