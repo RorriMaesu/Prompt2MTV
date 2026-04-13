@@ -1,3 +1,16 @@
+
+## 🎬 Demo Video
+
+<p align="center">
+	<a href="https://youtu.be/i6K0E86aFZw" target="_blank">
+		<img src="https://img.youtube.com/vi/i6K0E86aFZw/hqdefault.jpg" alt="Prompt2MTV Demo Video" width="480"/>
+	</a>
+</p>
+
+**Watch a full music video generated in about 8 hours on an RTX 5060 Ti, using Autonomous mode with a single click.**
+
+---
+
 ![Prompt2MTV Logo](prompt2MTV_logo.jpg)
 
 # Prompt2MTV
