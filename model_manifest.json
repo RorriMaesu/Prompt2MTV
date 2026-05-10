@@ -103,6 +103,258 @@
             ]
         },
         {
+            "id": "video_gguf_unet_q3",
+            "workflow": "video_gguf",
+            "label": "GGUF UNET Q3 (Fast)",
+            "variant_group": "video_gguf_unet",
+            "source_name": "Hugging Face",
+            "source_page_url": "https://huggingface.co/unsloth/LTX-2.3-GGUF",
+            "filename": "ltx-2.3-22b-dev-Q3_K_M.gguf",
+            "dest_subdir": "diffusion_models",
+            "size_bytes": 10770199584,
+            "preset": "gguf_q3_fast",
+            "node_refs": [
+                {
+                    "node_id": "gguf_unet",
+                    "input": "unet_name"
+                }
+            ],
+            "sources": [
+                {
+                    "type": "download",
+                    "url": "https://huggingface.co/unsloth/LTX-2.3-GGUF/resolve/main/ltx-2.3-22b-dev-Q3_K_M.gguf"
+                }
+            ]
+        },
+        {
+            "id": "video_gguf_unet_q4",
+            "workflow": "video_gguf",
+            "label": "GGUF UNET Q4 (Balanced)",
+            "variant_group": "video_gguf_unet",
+            "source_name": "Hugging Face",
+            "source_page_url": "https://huggingface.co/unsloth/LTX-2.3-GGUF",
+            "filename": "ltx-2.3-22b-dev-Q4_K_M.gguf",
+            "dest_subdir": "diffusion_models",
+            "size_bytes": 14326856736,
+            "preset": "gguf_q4_balanced",
+            "node_refs": [
+                {
+                    "node_id": "gguf_unet",
+                    "input": "unet_name"
+                }
+            ],
+            "sources": [
+                {
+                    "type": "download",
+                    "url": "https://huggingface.co/unsloth/LTX-2.3-GGUF/resolve/main/ltx-2.3-22b-dev-Q4_K_M.gguf"
+                }
+            ]
+        },
+        {
+            "id": "video_gguf_vae",
+            "workflow": "video_gguf",
+            "label": "GGUF Video VAE",
+            "source_name": "Hugging Face",
+            "source_page_url": "https://huggingface.co/unsloth/LTX-2.3-GGUF",
+            "filename": "ltx-2.3-22b-dev_video_vae.safetensors",
+            "dest_subdir": "vae",
+            "size_bytes": 1452256522,
+            "node_refs": [
+                {
+                    "node_id": "gguf_vae",
+                    "input": "vae_name"
+                }
+            ],
+            "sources": [
+                {
+                    "type": "download",
+                    "url": "https://huggingface.co/unsloth/LTX-2.3-GGUF/resolve/main/vae/ltx-2.3-22b-dev_video_vae.safetensors"
+                }
+            ]
+        },
+        {
+            "id": "video_gguf_connectors_dev",
+            "workflow": "video_gguf",
+            "label": "GGUF Connectors (Dev)",
+            "source_name": "Hugging Face",
+            "source_page_url": "https://huggingface.co/unsloth/LTX-2.3-GGUF",
+            "filename": "ltx-2.3-22b-dev_embeddings_connectors.safetensors",
+            "dest_subdir": "checkpoints",
+            "size_bytes": 2312144712,
+            "node_refs": [
+                {
+                    "node_id": "267:243",
+                    "input": "ckpt_name"
+                }
+            ],
+            "sources": [
+                {
+                    "type": "download",
+                    "url": "https://huggingface.co/unsloth/LTX-2.3-GGUF/resolve/main/text_encoders/ltx-2.3-22b-dev_embeddings_connectors.safetensors"
+                }
+            ]
+        },
+        {
+            "id": "video_gguf_audio_vae_dev",
+            "workflow": "video_gguf",
+            "label": "GGUF Audio VAE (Dev)",
+            "source_name": "Hugging Face",
+            "source_page_url": "https://huggingface.co/unsloth/LTX-2.3-GGUF",
+            "filename": "ltx-2.3-22b-dev_audio_vae.safetensors",
+            "dest_subdir": "checkpoints",
+            "size_bytes": 364853140,
+            "node_refs": [
+                {
+                    "node_id": "267:221",
+                    "input": "ckpt_name"
+                }
+            ],
+            "sources": [
+                {
+                    "type": "download",
+                    "url": "https://huggingface.co/unsloth/LTX-2.3-GGUF/resolve/main/vae/ltx-2.3-22b-dev_audio_vae.safetensors"
+                }
+            ]
+        },
+        {
+            "id": "video_gguf_distilled_unet_q2",
+            "workflow": "video_gguf_distilled",
+            "label": "GGUF Distilled UNET Q2 (Fastest)",
+            "variant_group": "video_gguf_distilled_unet",
+            "source_name": "Hugging Face",
+            "source_page_url": "https://huggingface.co/unsloth/LTX-2.3-GGUF",
+            "filename": "ltx-2.3-22b-distilled-1.1-Q2_K.gguf",
+            "dest_subdir": "diffusion_models",
+            "size_bytes": 7935826976,
+            "preset": "gguf_q2_distilled_fastest",
+            "node_refs": [
+                {
+                    "node_id": "gguf_unet",
+                    "input": "unet_name"
+                }
+            ],
+            "sources": [
+                {
+                    "type": "download",
+                    "url": "https://huggingface.co/unsloth/LTX-2.3-GGUF/resolve/main/distilled-1.1/ltx-2.3-22b-distilled-1.1-Q2_K.gguf"
+                }
+            ]
+        },
+        {
+            "id": "video_gguf_distilled_unet_q3",
+            "workflow": "video_gguf_distilled",
+            "label": "GGUF Distilled UNET Q3 (Fast)",
+            "variant_group": "video_gguf_distilled_unet",
+            "source_name": "Hugging Face",
+            "source_page_url": "https://huggingface.co/unsloth/LTX-2.3-GGUF",
+            "filename": "ltx-2.3-22b-distilled-1.1-Q3_K_M.gguf",
+            "dest_subdir": "diffusion_models",
+            "size_bytes": 10629508128,
+            "preset": "gguf_q3_distilled_fast",
+            "node_refs": [
+                {
+                    "node_id": "gguf_unet",
+                    "input": "unet_name"
+                }
+            ],
+            "sources": [
+                {
+                    "type": "download",
+                    "url": "https://huggingface.co/unsloth/LTX-2.3-GGUF/resolve/main/distilled-1.1/ltx-2.3-22b-distilled-1.1-Q3_K_M.gguf"
+                }
+            ]
+        },
+        {
+            "id": "video_gguf_distilled_unet_q4",
+            "workflow": "video_gguf_distilled",
+            "label": "GGUF Distilled UNET Q4 (Balanced)",
+            "variant_group": "video_gguf_distilled_unet",
+            "source_name": "Hugging Face",
+            "source_page_url": "https://huggingface.co/unsloth/LTX-2.3-GGUF",
+            "filename": "ltx-2.3-22b-distilled-1.1-Q4_K_M.gguf",
+            "dest_subdir": "diffusion_models",
+            "size_bytes": 14194441248,
+            "preset": "gguf_q4_distilled_balanced",
+            "node_refs": [
+                {
+                    "node_id": "gguf_unet",
+                    "input": "unet_name"
+                }
+            ],
+            "sources": [
+                {
+                    "type": "download",
+                    "url": "https://huggingface.co/unsloth/LTX-2.3-GGUF/resolve/main/distilled-1.1/ltx-2.3-22b-distilled-1.1-Q4_K_M.gguf"
+                }
+            ]
+        },
+        {
+            "id": "video_gguf_connectors_distilled",
+            "workflow": "video_gguf_distilled",
+            "label": "GGUF Connectors (Distilled)",
+            "source_name": "Hugging Face",
+            "source_page_url": "https://huggingface.co/unsloth/LTX-2.3-GGUF",
+            "filename": "ltx-2.3-22b-distilled_embeddings_connectors.safetensors",
+            "dest_subdir": "checkpoints",
+            "size_bytes": 2312144712,
+            "node_refs": [
+                {
+                    "node_id": "267:243",
+                    "input": "ckpt_name"
+                }
+            ],
+            "sources": [
+                {
+                    "type": "download",
+                    "url": "https://huggingface.co/unsloth/LTX-2.3-GGUF/resolve/main/text_encoders/ltx-2.3-22b-distilled_embeddings_connectors.safetensors"
+                }
+            ]
+        },
+        {
+            "id": "video_gguf_audio_vae_distilled",
+            "workflow": "video_gguf_distilled",
+            "label": "GGUF Audio VAE (Distilled)",
+            "source_name": "Hugging Face",
+            "source_page_url": "https://huggingface.co/unsloth/LTX-2.3-GGUF",
+            "filename": "ltx-2.3-22b-distilled_audio_vae.safetensors",
+            "dest_subdir": "checkpoints",
+            "size_bytes": 364853140,
+            "node_refs": [
+                {
+                    "node_id": "267:221",
+                    "input": "ckpt_name"
+                }
+            ],
+            "sources": [
+                {
+                    "type": "download",
+                    "url": "https://huggingface.co/unsloth/LTX-2.3-GGUF/resolve/main/vae/ltx-2.3-22b-distilled_audio_vae.safetensors"
+                }
+            ]
+        },
+        {
+            "id": "video_gguf_vae_distilled",
+            "workflow": "video_gguf_distilled",
+            "label": "GGUF Video VAE (Distilled)",
+            "source_name": "Hugging Face",
+            "source_page_url": "https://huggingface.co/unsloth/LTX-2.3-GGUF",
+            "filename": "ltx-2.3-22b-distilled_video_vae.safetensors",
+            "dest_subdir": "vae",
+            "size_bytes": 1452256522,
+            "node_refs": [
+                {
+                    "node_id": "gguf_vae",
+                    "input": "vae_name"
+                }
+            ],
+            "sources": [
+                {
+                    "type": "download",
+                    "url": "https://huggingface.co/unsloth/LTX-2.3-GGUF/resolve/main/vae/ltx-2.3-22b-distilled_video_vae.safetensors"
+                }
+            ]
+        },
+        {
             "id": "music_unet_turbo",
             "workflow": "music",
             "label": "Music DiT Turbo",

@@ -16,6 +16,7 @@ import subprocess
 import shutil
 import tempfile
 import ctypes
+import queue
 import uuid
 from datetime import datetime
 from PIL import Image, ImageTk
@@ -206,7 +207,7 @@ WINDOWS_HIDE = 0
 WINDOWS_SHOW = 5
 WINDOWS_RESTORE = 9
 APP_NAME = "Prompt2MTV"
-APP_VERSION = "2.0.0"
+APP_VERSION = "3.0.0"
 APP_PUBLISHER = "Prompt2MTV"
 APP_TAGLINE = "Local AI Music Video Studio"
 ENV_COMFYUI_ROOT_KEYS = ("PROMPT2MTV_COMFYUI_ROOT", "COMFYUI_ROOT")
@@ -289,8 +290,99 @@ MODEL_SUBDIRECTORIES = {
     "vae_name": "vae",
     "unet_name": "diffusion_models"
 }
+
+# ── Video Model Presets ─────────────────────────────────────────────
+# Each preset bundles a compatible set of models, workflow type, and VRAM tier.
+# "workflow_type" determines which workflow JSON + profile to use:
+#   "safetensors" → standard CheckpointLoaderSimple-based workflow
+#   "gguf"        → UnetLoaderGGUF-based workflow (requires ComfyUI-GGUF custom node)
+VIDEO_MODEL_PRESETS = {
+    "gguf_q2_distilled_fastest": {
+        "label": "GGUF Q2 Distilled — Fastest (8-12 GB VRAM)",
+        "vram_tier": "8-12 GB",
+        "workflow_type": "gguf_distilled",
+        "unet_name": "ltx-2.3-22b-distilled-1.1-Q2_K.gguf",
+        "vae_name": "ltx-2.3-22b-distilled_video_vae.safetensors",
+        "connectors_name": "ltx-2.3-22b-distilled_embeddings_connectors.safetensors",
+        "audio_vae_name": "ltx-2.3-22b-distilled_audio_vae.safetensors",
+        "checkpoint_name": "ltx-2.3-22b-distilled_embeddings_connectors.safetensors",
+        "text_encoder_name": "gemma_3_12B_it_fp4_mixed.safetensors",
+        "lora_name": "none",
+        "upscaler_name": "ltx-2.3-spatial-upscaler-x2-1.0.safetensors",
+    },
+    "gguf_q3_distilled_fast": {
+        "label": "GGUF Q3 Distilled — Fast (10-16 GB VRAM)",
+        "vram_tier": "10-16 GB",
+        "workflow_type": "gguf_distilled",
+        "unet_name": "ltx-2.3-22b-distilled-1.1-Q3_K_M.gguf",
+        "vae_name": "ltx-2.3-22b-distilled_video_vae.safetensors",
+        "connectors_name": "ltx-2.3-22b-distilled_embeddings_connectors.safetensors",
+        "audio_vae_name": "ltx-2.3-22b-distilled_audio_vae.safetensors",
+        "checkpoint_name": "ltx-2.3-22b-distilled_embeddings_connectors.safetensors",
+        "text_encoder_name": "gemma_3_12B_it_fp4_mixed.safetensors",
+        "lora_name": "none",
+        "upscaler_name": "ltx-2.3-spatial-upscaler-x2-1.0.safetensors",
+    },
+    "gguf_q4_distilled_balanced": {
+        "label": "GGUF Q4 Distilled — Balanced (12-20 GB VRAM)",
+        "vram_tier": "12-20 GB",
+        "workflow_type": "gguf_distilled",
+        "unet_name": "ltx-2.3-22b-distilled-1.1-Q4_K_M.gguf",
+        "vae_name": "ltx-2.3-22b-distilled_video_vae.safetensors",
+        "connectors_name": "ltx-2.3-22b-distilled_embeddings_connectors.safetensors",
+        "audio_vae_name": "ltx-2.3-22b-distilled_audio_vae.safetensors",
+        "checkpoint_name": "ltx-2.3-22b-distilled_embeddings_connectors.safetensors",
+        "text_encoder_name": "gemma_3_12B_it_fp4_mixed.safetensors",
+        "lora_name": "none",
+        "upscaler_name": "ltx-2.3-spatial-upscaler-x2-1.0.safetensors",
+    },
+    "gguf_q3_fast": {
+        "label": "GGUF Q3 Dev — Fast (12-16 GB VRAM)",
+        "vram_tier": "12-16 GB",
+        "workflow_type": "gguf",
+        "unet_name": "ltx-2.3-22b-dev-Q3_K_M.gguf",
+        "vae_name": "ltx-2.3-22b-dev_video_vae.safetensors",
+        "connectors_name": "ltx-2.3-22b-dev_embeddings_connectors.safetensors",
+        "audio_vae_name": "ltx-2.3-22b-dev_audio_vae.safetensors",
+        "checkpoint_name": "ltx-2.3-22b-dev_embeddings_connectors.safetensors",
+        "text_encoder_name": "gemma_3_12B_it_fp4_mixed.safetensors",
+        "lora_name": "ltx-2.3-22b-distilled-lora-384.safetensors",
+        "upscaler_name": "ltx-2.3-spatial-upscaler-x2-1.0.safetensors",
+    },
+    "gguf_q4_balanced": {
+        "label": "GGUF Q4 Dev — Balanced (16-24 GB VRAM)",
+        "vram_tier": "16-24 GB",
+        "workflow_type": "gguf",
+        "unet_name": "ltx-2.3-22b-dev-Q4_K_M.gguf",
+        "vae_name": "ltx-2.3-22b-dev_video_vae.safetensors",
+        "connectors_name": "ltx-2.3-22b-dev_embeddings_connectors.safetensors",
+        "audio_vae_name": "ltx-2.3-22b-dev_audio_vae.safetensors",
+        "checkpoint_name": "ltx-2.3-22b-dev_embeddings_connectors.safetensors",
+        "text_encoder_name": "gemma_3_12B_it_fp4_mixed.safetensors",
+        "lora_name": "ltx-2.3-22b-distilled-lora-384.safetensors",
+        "upscaler_name": "ltx-2.3-spatial-upscaler-x2-1.0.safetensors",
+    },
+    "fp8_quality": {
+        "label": "FP8 — Quality (24+ GB VRAM)",
+        "vram_tier": "24+ GB",
+        "workflow_type": "safetensors",
+        "checkpoint_name": "ltx-2.3-22b-dev-fp8.safetensors",
+        "text_encoder_name": "gemma_3_12B_it_fp4_mixed.safetensors",
+        "lora_name": "ltx-2.3-22b-distilled-lora-384.safetensors",
+        "upscaler_name": "ltx-2.3-spatial-upscaler-x2-1.0.safetensors",
+    },
+    "custom": {
+        "label": "Custom",
+        "vram_tier": "",
+        "workflow_type": "safetensors",
+    },
+}
+DEFAULT_VIDEO_MODEL_PRESET = "fp8_quality"
+
 WORKFLOW_MODEL_LABELS = {
     "video": "Video Workflow",
+    "video_gguf": "Video GGUF Workflow",
+    "video_gguf_distilled": "Video GGUF Distilled Workflow",
     "music": "Music Workflow",
     "image": "Image Workflow"
 }
@@ -329,6 +421,7 @@ VIDEO_WORKFLOW_PROFILES = {
     "ltx_2_3_t2v": {
         "label": "LTX 2.3 Text to Video",
         "workflow_path": "video_ltx2_3_t2v.json",
+        "workflow_type": "safetensors",
         "roles": {
             "prompt": {"node_id": "267:240", "input": "text"},
             "negative_prompt": {"node_id": "267:247", "input": "text"},
@@ -349,6 +442,59 @@ VIDEO_WORKFLOW_PROFILES = {
             ],
             "text_encoder_name": {"node_id": "267:243", "input": "text_encoder"},
             "lora_name": {"node_id": "267:232", "input": "lora_name"},
+            "upscaler_name": {"node_id": "267:233", "input": "model_name"}
+        }
+    },
+    "ltx_2_3_t2v_gguf": {
+        "label": "LTX 2.3 Text to Video (GGUF)",
+        "workflow_path": "video_ltx2_3_t2v_gguf.json",
+        "workflow_type": "gguf",
+        "roles": {
+            "prompt": {"node_id": "267:240", "input": "text"},
+            "negative_prompt": {"node_id": "267:247", "input": "text"},
+            "width": {"node_id": "267:257", "input": "value"},
+            "height": {"node_id": "267:258", "input": "value"},
+            "fps": {"node_id": "267:260", "input": "value"},
+            "length": {"node_id": "267:225", "input": "value"},
+            "t2v_enabled": {"node_id": "267:201", "input": "value"},
+            "filename_prefix": {"node_id": "75", "input": "filename_prefix"},
+            "noise_seed": [
+                {"node_id": "267:216", "input": "noise_seed"},
+                {"node_id": "267:237", "input": "noise_seed"}
+            ],
+            "checkpoint_name": [],
+            "connectors_name": {"node_id": "267:243", "input": "ckpt_name"},
+            "audio_vae_name": {"node_id": "267:221", "input": "ckpt_name"},
+            "unet_name": {"node_id": "gguf_unet", "input": "unet_name"},
+            "vae_name": {"node_id": "gguf_vae", "input": "vae_name"},
+            "text_encoder_name": {"node_id": "267:243", "input": "text_encoder"},
+            "lora_name": {"node_id": "267:232", "input": "lora_name"},
+            "upscaler_name": {"node_id": "267:233", "input": "model_name"}
+        }
+    },
+    "ltx_2_3_t2v_gguf_distilled": {
+        "label": "LTX 2.3 Text to Video (GGUF Distilled)",
+        "workflow_path": "video_ltx2_3_t2v_gguf_distilled.json",
+        "workflow_type": "gguf_distilled",
+        "roles": {
+            "prompt": {"node_id": "267:240", "input": "text"},
+            "negative_prompt": {"node_id": "267:247", "input": "text"},
+            "width": {"node_id": "267:257", "input": "value"},
+            "height": {"node_id": "267:258", "input": "value"},
+            "fps": {"node_id": "267:260", "input": "value"},
+            "length": {"node_id": "267:225", "input": "value"},
+            "t2v_enabled": {"node_id": "267:201", "input": "value"},
+            "filename_prefix": {"node_id": "75", "input": "filename_prefix"},
+            "noise_seed": [
+                {"node_id": "267:216", "input": "noise_seed"},
+                {"node_id": "267:237", "input": "noise_seed"}
+            ],
+            "checkpoint_name": [],
+            "connectors_name": {"node_id": "267:243", "input": "ckpt_name"},
+            "audio_vae_name": {"node_id": "267:221", "input": "ckpt_name"},
+            "unet_name": {"node_id": "gguf_unet", "input": "unet_name"},
+            "vae_name": {"node_id": "gguf_vae", "input": "vae_name"},
+            "text_encoder_name": {"node_id": "267:243", "input": "text_encoder"},
             "upscaler_name": {"node_id": "267:233", "input": "model_name"}
         }
     }
@@ -375,33 +521,91 @@ IMAGE_WORKFLOW_PROFILE = {
     }
 }
 
-I2V_WORKFLOW_PROFILE = {
-    "label": "LTX 2.3 Image to Video",
-    "workflow_path": "video_ltx2_3_i2v.json",
-    "roles": {
-        "prompt": {"node_id": "267:266", "input": "value"},
-        "negative_prompt": {"node_id": "267:247", "input": "text"},
-        "width": {"node_id": "267:257", "input": "value"},
-        "height": {"node_id": "267:258", "input": "value"},
-        "fps": {"node_id": "267:260", "input": "value"},
-        "length": {"node_id": "267:225", "input": "value"},
-        "t2v_enabled": {"node_id": "267:201", "input": "value"},
-        "filename_prefix": {"node_id": "273", "input": "filename_prefix"},
-        "noise_seed": [
-            {"node_id": "267:216", "input": "noise_seed"},
-            {"node_id": "267:237", "input": "noise_seed"}
-        ],
-        "checkpoint_name": [
-            {"node_id": "267:221", "input": "ckpt_name"},
-            {"node_id": "267:243", "input": "ckpt_name"},
-            {"node_id": "267:236", "input": "ckpt_name"}
-        ],
-        "text_encoder_name": {"node_id": "267:243", "input": "text_encoder"},
-        "lora_name": {"node_id": "267:232", "input": "lora_name"},
-        "upscaler_name": {"node_id": "267:233", "input": "model_name"},
-        "image_path": {"node_id": "269", "input": "image"}
+I2V_WORKFLOW_PROFILES = {
+    "safetensors": {
+        "label": "LTX 2.3 Image to Video",
+        "workflow_path": "video_ltx2_3_i2v.json",
+        "roles": {
+            "prompt": {"node_id": "267:266", "input": "value"},
+            "negative_prompt": {"node_id": "267:247", "input": "text"},
+            "width": {"node_id": "267:257", "input": "value"},
+            "height": {"node_id": "267:258", "input": "value"},
+            "fps": {"node_id": "267:260", "input": "value"},
+            "length": {"node_id": "267:225", "input": "value"},
+            "t2v_enabled": {"node_id": "267:201", "input": "value"},
+            "filename_prefix": {"node_id": "273", "input": "filename_prefix"},
+            "noise_seed": [
+                {"node_id": "267:216", "input": "noise_seed"},
+                {"node_id": "267:237", "input": "noise_seed"}
+            ],
+            "checkpoint_name": [
+                {"node_id": "267:221", "input": "ckpt_name"},
+                {"node_id": "267:243", "input": "ckpt_name"},
+                {"node_id": "267:236", "input": "ckpt_name"}
+            ],
+            "text_encoder_name": {"node_id": "267:243", "input": "text_encoder"},
+            "lora_name": {"node_id": "267:232", "input": "lora_name"},
+            "upscaler_name": {"node_id": "267:233", "input": "model_name"},
+            "image_path": {"node_id": "269", "input": "image"}
+        }
+    },
+    "gguf": {
+        "label": "LTX 2.3 Image to Video (GGUF)",
+        "workflow_path": "video_ltx2_3_i2v_gguf.json",
+        "roles": {
+            "prompt": {"node_id": "267:266", "input": "value"},
+            "negative_prompt": {"node_id": "267:247", "input": "text"},
+            "width": {"node_id": "267:257", "input": "value"},
+            "height": {"node_id": "267:258", "input": "value"},
+            "fps": {"node_id": "267:260", "input": "value"},
+            "length": {"node_id": "267:225", "input": "value"},
+            "t2v_enabled": {"node_id": "267:201", "input": "value"},
+            "filename_prefix": {"node_id": "273", "input": "filename_prefix"},
+            "noise_seed": [
+                {"node_id": "267:216", "input": "noise_seed"},
+                {"node_id": "267:237", "input": "noise_seed"}
+            ],
+            "checkpoint_name": [],
+            "connectors_name": {"node_id": "267:243", "input": "ckpt_name"},
+            "audio_vae_name": {"node_id": "267:221", "input": "ckpt_name"},
+            "unet_name": {"node_id": "gguf_unet", "input": "unet_name"},
+            "vae_name": {"node_id": "gguf_vae", "input": "vae_name"},
+            "text_encoder_name": {"node_id": "267:243", "input": "text_encoder"},
+            "lora_name": {"node_id": "267:232", "input": "lora_name"},
+            "upscaler_name": {"node_id": "267:233", "input": "model_name"},
+            "image_path": {"node_id": "269", "input": "image"}
+        }
+    },
+    "gguf_distilled": {
+        "label": "LTX 2.3 Image to Video (GGUF Distilled)",
+        "workflow_path": "video_ltx2_3_i2v_gguf_distilled.json",
+        "roles": {
+            "prompt": {"node_id": "267:266", "input": "value"},
+            "negative_prompt": {"node_id": "267:247", "input": "text"},
+            "width": {"node_id": "267:257", "input": "value"},
+            "height": {"node_id": "267:258", "input": "value"},
+            "fps": {"node_id": "267:260", "input": "value"},
+            "length": {"node_id": "267:225", "input": "value"},
+            "t2v_enabled": {"node_id": "267:201", "input": "value"},
+            "filename_prefix": {"node_id": "273", "input": "filename_prefix"},
+            "noise_seed": [
+                {"node_id": "267:216", "input": "noise_seed"},
+                {"node_id": "267:237", "input": "noise_seed"}
+            ],
+            "checkpoint_name": [],
+            "connectors_name": {"node_id": "267:243", "input": "ckpt_name"},
+            "audio_vae_name": {"node_id": "267:221", "input": "ckpt_name"},
+            "unet_name": {"node_id": "gguf_unet", "input": "unet_name"},
+            "vae_name": {"node_id": "gguf_vae", "input": "vae_name"},
+            "text_encoder_name": {"node_id": "267:243", "input": "text_encoder"},
+            "upscaler_name": {"node_id": "267:233", "input": "model_name"},
+            "image_path": {"node_id": "269", "input": "image"}
+        }
     }
 }
+
+# Backward-compatible alias for code that references I2V_WORKFLOW_PROFILE directly
+I2V_WORKFLOW_PROFILE = I2V_WORKFLOW_PROFILES["safetensors"]
 
 if DND_AVAILABLE:
     class Prompt2MTVWindow(tb.Window, TkinterDnD.DnDWrapper):
@@ -454,6 +658,26 @@ class LTXQueueManager:
         self.selected_video_for_music = None
         self.current_generated_audio = None
         self.current_audio_source = None
+        self.timeline_arrangement = []
+        self.timeline_px_per_second = 80
+        self._timeline_clip_durations = {}
+        self._timeline_drag_state = None
+        self._timeline_thumb_images = []
+        self.timeline_selected_audio = None
+        self._timeline_playback_active = False
+        self._timeline_playback_pos = 0.0
+        self._timeline_play_wall_start = 0.0
+        self._timeline_total_duration = 0.0
+        self._timeline_frame_queue = None
+        self._timeline_ffmpeg_proc = None
+        self._timeline_playback_after_id = None
+        self._timeline_preview_photo = None
+        self._timeline_mci_alias = "tlaudio"
+        self._timeline_mci_open_ok = False
+        self._timeline_wav_cache = {}  # normcase(src_path) -> temp_wav_path
+        self._timeline_current_clip_idx = 0
+        self._timeline_clip_list = []
+        self._timeline_stop_reader = False
         self.current_project_dir = None
         self.comfyui_console_hwnd = None
         self.comfyui_console_visible = False
@@ -475,9 +699,13 @@ class LTXQueueManager:
         self.model_manifest = {"version": 1, "models": []}
         self.last_model_audit = None
         self.video_model_choices = {field_name: [] for field_name in ["checkpoint_name", "text_encoder_name", "lora_name", "upscaler_name"]}
+        self.active_workflow_type = "safetensors"
+        self.active_video_model_preset = DEFAULT_VIDEO_MODEL_PRESET
         self.image_model_choices = {field_name: [] for field_name in ["clip_name", "vae_name", "unet_name"]}
         self.collapsible_sections = {}
         self.collapsible_section_groups = {}
+        self.gallery_collapse_states = {}
+        self.gallery_filter_mode = "all"
         self.responsive_layout_mode = None
         self.chatbot_workspace_layout_mode = None
         self.drag_drop_enabled = DND_AVAILABLE
@@ -506,6 +734,7 @@ class LTXQueueManager:
         self.chatbot_repeat_penalty = DEFAULT_CHATBOT_REPEAT_PENALTY
         self.chatbot_default_to_non_thinking = DEFAULT_CHATBOT_DEFAULT_TO_NON_THINKING
         self.chatbot_auto_launch_server = False
+        self.scene_render_in_progress = False
         self.chatbot_backend_health_text = "Backend check: Not tested yet."
         self.chatbot_discovered_model_ids = []
         self.chatbot_server_process = None
@@ -1521,6 +1750,13 @@ class LTXQueueManager:
     def _on_chatbot_transcript_scrollbar(self, *args):
         if hasattr(self, "chatbot_transcript_canvas"):
             self.chatbot_transcript_canvas.yview(*args)
+
+    def _redirect_scroll_to_scene_canvas(self, event):
+        """Redirect mousewheel from scene row widgets to the scene canvas, preventing accidental value changes."""
+        if hasattr(self, "scene_canvas") and self.scene_canvas.yview() != (0.0, 1.0):
+            delta = int(-1 * (event.delta / 120)) if getattr(event, "delta", 0) else (-1 if getattr(event, "num", None) == 4 else 1)
+            self.scene_canvas.yview_scroll(delta, "units")
+        return "break"
 
     def _on_chatbot_transcript_mousewheel(self, event):
         if not hasattr(self, "chatbot_transcript_canvas"):
@@ -3323,10 +3559,7 @@ class LTXQueueManager:
         if not resolved_prompt:
             raise ValueError("The optimized prompt is empty.")
 
-        self.add_image_prompt_entry()
-        target_widget = self.image_prompts[-1]
-        target_widget.delete("1.0", tk.END)
-        target_widget.insert("1.0", resolved_prompt)
+        self.add_image_prompt_entry({"prompt_text": resolved_prompt})
         self.notebook.select(self.image_tab)
         self.update_image_scroll_region()
         self._update_prompt_collection_summary()
@@ -4417,11 +4650,12 @@ class LTXQueueManager:
             return False
         except Exception as exc:
             self._close_chatbot_download_dialog(dialog_state)
-            if os.path.exists(dest_path):
-                try:
-                    os.remove(dest_path)
-                except OSError:
-                    pass
+            for cleanup_path in (dest_path, f"{dest_path}.partial"):
+                if os.path.exists(cleanup_path):
+                    try:
+                        os.remove(cleanup_path)
+                    except OSError:
+                        pass
             if interactive:
                 messagebox.showerror("Chatbot Runtime", f"Failed to download chatbot model:\n{exc}")
             self.update_status("Failed to download Qwen chatbot model.", "red")
@@ -4538,6 +4772,9 @@ class LTXQueueManager:
             self.chatbot_setup_prompted_this_session = True
             self.root.after(100, lambda: self.ensure_chatbot_model_ready(interactive=True))
 
+        if selected_tab == str(self.timeline_tab):
+            self.refresh_timeline_editor()
+
     def _handle_chatbot_generate(self):
         self._handle_chatbot_structured_task(
             CHATBOT_TASK_T2I_OPTIMIZE,
@@ -4602,6 +4839,167 @@ class LTXQueueManager:
             return "generated"
         return "linked"
 
+    def _coerce_image_version_count(self, version_count):
+        try:
+            return max(1, int(version_count or 1))
+        except (TypeError, ValueError):
+            return 1
+
+    def _create_image_output_version(self, path=None, version_id=None, version_number=None, created_at=None, status="ready", prompt_snapshot=""):
+        resolved_number = max(1, int(version_number or 1))
+        return {
+            "version_id": str(version_id or f"v{resolved_number:02d}").strip() or f"v{resolved_number:02d}",
+            "version_number": resolved_number,
+            "path": self._normalize_path(path),
+            "created_at": str(created_at or datetime.now().isoformat(timespec="seconds")).strip(),
+            "status": str(status or "ready").strip().lower(),
+            "prompt_snapshot": str(prompt_snapshot or "").strip(),
+        }
+
+    def _normalize_image_output_versions(self, output_versions=None, project_path=None, prompt_snapshot="", status="ready"):
+        normalized_versions = []
+        seen_version_ids = set()
+        for index, version_entry in enumerate(output_versions or [], start=1):
+            if not isinstance(version_entry, dict):
+                continue
+            normalized_version = self._create_image_output_version(
+                path=version_entry.get("path"),
+                version_id=version_entry.get("version_id"),
+                version_number=version_entry.get("version_number", index),
+                created_at=version_entry.get("created_at"),
+                status=version_entry.get("status", status),
+                prompt_snapshot=version_entry.get("prompt_snapshot", prompt_snapshot),
+            )
+            normalized_version_id = normalized_version["version_id"]
+            if normalized_version_id in seen_version_ids:
+                normalized_version["version_id"] = f"v{len(normalized_versions) + 1:02d}"
+            seen_version_ids.add(normalized_version["version_id"])
+            normalized_versions.append(normalized_version)
+
+        normalized_project_path = self._normalize_path(project_path)
+        if normalized_project_path and not any(os.path.normcase(str(version.get("path") or "")) == os.path.normcase(normalized_project_path) for version in normalized_versions):
+            normalized_versions.append(
+                self._create_image_output_version(
+                    path=normalized_project_path,
+                    version_number=len(normalized_versions) + 1,
+                    status=status,
+                    prompt_snapshot=prompt_snapshot,
+                )
+            )
+
+        return sorted(normalized_versions, key=lambda version: int(version.get("version_number") or 0))
+
+    def _get_image_output_version_by_id(self, image_asset, version_id):
+        normalized_version_id = str(version_id or "").strip()
+        if not normalized_version_id:
+            return None
+        for version_entry in self._normalize_image_output_versions(
+            (image_asset or {}).get("output_versions"),
+            project_path=(image_asset or {}).get("project_path"),
+            prompt_snapshot=(image_asset or {}).get("prompt_text", ""),
+            status=(image_asset or {}).get("status", "ready"),
+        ):
+            if str(version_entry.get("version_id") or "").strip() == normalized_version_id:
+                return version_entry
+        return None
+
+    def _get_image_active_output_version_id(self, image_asset):
+        versions = self._normalize_image_output_versions(
+            (image_asset or {}).get("output_versions"),
+            project_path=(image_asset or {}).get("project_path"),
+            prompt_snapshot=(image_asset or {}).get("prompt_text", ""),
+            status=(image_asset or {}).get("status", "ready"),
+        )
+        active_version_id = str((image_asset or {}).get("active_output_version_id") or "").strip()
+        if active_version_id and any(str(version.get("version_id") or "").strip() == active_version_id for version in versions):
+            return active_version_id
+        if versions:
+            return str(versions[0].get("version_id") or "").strip() or None
+        return None
+
+    def _sync_image_asset_output_fields(self, image_asset):
+        asset_copy = dict(image_asset or {})
+        versions = self._normalize_image_output_versions(
+            asset_copy.get("output_versions"),
+            project_path=asset_copy.get("project_path"),
+            prompt_snapshot=asset_copy.get("prompt_text", ""),
+            status=asset_copy.get("status", "ready"),
+        )
+        active_version_id = self._get_image_active_output_version_id({**asset_copy, "output_versions": versions})
+        active_version = self._get_image_output_version_by_id({**asset_copy, "output_versions": versions}, active_version_id)
+        active_project_path = self._normalize_path((active_version or {}).get("path") or asset_copy.get("project_path"))
+        asset_copy["output_versions"] = versions
+        asset_copy["active_output_version_id"] = active_version_id
+        asset_copy["project_path"] = active_project_path
+        asset_copy["filename"] = os.path.basename(active_project_path) if active_project_path else ""
+        asset_copy["status"] = str((active_version or {}).get("status") or asset_copy.get("status") or "ready").strip().lower()
+        asset_copy["version_count"] = self._coerce_image_version_count(asset_copy.get("version_count", 1))
+        return asset_copy
+
+    def _get_next_image_output_version_number(self, image_asset):
+        versions = self._normalize_image_output_versions(
+            (image_asset or {}).get("output_versions"),
+            project_path=(image_asset or {}).get("project_path"),
+            prompt_snapshot=(image_asset or {}).get("prompt_text", ""),
+            status=(image_asset or {}).get("status", "ready"),
+        )
+        if not versions:
+            return 1
+        return max(int(version.get("version_number") or 0) for version in versions) + 1
+
+    def _set_image_active_output_version(self, image_asset, version_id):
+        asset_copy = self._sync_image_asset_output_fields(image_asset)
+        target_version = self._get_image_output_version_by_id(asset_copy, version_id)
+        if target_version:
+            asset_copy["active_output_version_id"] = target_version.get("version_id")
+            asset_copy["project_path"] = self._normalize_path(target_version.get("path"))
+        return self._sync_image_asset_output_fields(asset_copy)
+
+    def _append_image_output_version(self, image_asset, output_path):
+        asset_copy = self._sync_image_asset_output_fields(image_asset)
+        next_version_number = self._get_next_image_output_version_number(asset_copy)
+        new_version = self._create_image_output_version(
+            path=output_path,
+            version_number=next_version_number,
+            status=asset_copy.get("status", "ready"),
+            prompt_snapshot=asset_copy.get("prompt_text", ""),
+        )
+        asset_copy["output_versions"] = list(asset_copy.get("output_versions") or []) + [new_version]
+        if not asset_copy.get("active_output_version_id"):
+            asset_copy["active_output_version_id"] = new_version.get("version_id")
+        return self._sync_image_asset_output_fields(asset_copy), new_version
+
+    def _remove_image_output_version(self, image_asset, version_id):
+        asset_copy = self._sync_image_asset_output_fields(image_asset)
+        normalized_version_id = str(version_id or "").strip()
+        remaining_versions = [
+            version for version in asset_copy.get("output_versions") or []
+            if str(version.get("version_id") or "").strip() != normalized_version_id
+        ]
+        asset_copy["output_versions"] = remaining_versions
+        if str(asset_copy.get("active_output_version_id") or "").strip() == normalized_version_id:
+            asset_copy["active_output_version_id"] = str(remaining_versions[0].get("version_id") or "").strip() if remaining_versions else None
+        if not remaining_versions:
+            asset_copy["project_path"] = None
+            asset_copy["filename"] = ""
+            asset_copy["status"] = "stale"
+        return self._sync_image_asset_output_fields(asset_copy)
+
+    def _replace_image_asset_by_id(self, updated_asset):
+        normalized_asset_id = str((updated_asset or {}).get("asset_id") or "").strip()
+        updated_assets = []
+        replaced = False
+        for existing_asset in self._normalize_image_assets(self.image_assets):
+            if str(existing_asset.get("asset_id") or "").strip() == normalized_asset_id:
+                updated_assets.append(self._sync_image_asset_output_fields(updated_asset))
+                replaced = True
+            else:
+                updated_assets.append(existing_asset)
+        if not replaced and updated_asset:
+            updated_assets.append(self._sync_image_asset_output_fields(updated_asset))
+        self.image_assets = self._reindex_ordered_entries(updated_assets)
+        return self.image_assets
+
     def _create_image_asset_record(self, project_path, source="generated", prompt_text="", original_path=None, asset_id=None, order_index=None, status="ready"):
         normalized_project_path = self._normalize_path(project_path)
         normalized_original_path = self._normalize_path(original_path)
@@ -4620,6 +5018,13 @@ class LTXQueueManager:
             "original_path": normalized_original_path,
             "filename": filename,
             "status": str(status or "ready").strip().lower(),
+            "version_count": 1,
+            "output_versions": self._normalize_image_output_versions(
+                project_path=normalized_project_path,
+                prompt_snapshot=prompt_text,
+                status=status,
+            ),
+            "active_output_version_id": "v01" if normalized_project_path else None,
             "created_at": timestamp,
             "updated_at": timestamp
         }
@@ -4654,7 +5059,15 @@ class LTXQueueManager:
             normalized_asset["updated_at"] = str(asset.get("updated_at") or normalized_asset["updated_at"])
             normalized_asset["label"] = str(asset.get("label") or normalized_asset.get("label") or "").strip()
             normalized_asset["notes"] = str(asset.get("notes") or "").strip()
-            normalized_assets.append(normalized_asset)
+            normalized_asset["version_count"] = self._coerce_image_version_count(asset.get("version_count", 1))
+            normalized_asset["output_versions"] = self._normalize_image_output_versions(
+                asset.get("output_versions"),
+                project_path=project_path,
+                prompt_snapshot=normalized_asset.get("prompt_text", ""),
+                status=normalized_asset.get("status", "ready"),
+            )
+            normalized_asset["active_output_version_id"] = str(asset.get("active_output_version_id") or "").strip() or None
+            normalized_assets.append(self._sync_image_asset_output_fields(normalized_asset))
 
         return self._reindex_ordered_entries(normalized_assets)
 
@@ -4667,6 +5080,7 @@ class LTXQueueManager:
         for asset in self.image_assets:
             if os.path.normcase(asset.get("project_path", "")) != os.path.normcase(normalized_project_path):
                 continue
+            synced_asset = self._sync_image_asset_output_fields(asset)
             asset["source"] = str(source or asset.get("source") or "generated").strip().lower()
             asset["filename"] = os.path.basename(normalized_project_path)
             asset["project_path"] = normalized_project_path
@@ -4674,12 +5088,20 @@ class LTXQueueManager:
             asset["updated_at"] = timestamp
             asset["label"] = str(asset.get("label") or os.path.splitext(asset["filename"])[0]).strip()
             asset["notes"] = str(asset.get("notes") or "").strip()
+            asset["version_count"] = self._coerce_image_version_count(asset.get("version_count", 1))
             if prompt_text:
                 asset["prompt_text"] = str(prompt_text).strip()
             if original_path:
                 asset["original_path"] = self._normalize_path(original_path)
-            self.image_assets = self._reindex_ordered_entries(self.image_assets)
-            return asset
+            if os.path.normcase(normalized_project_path) == os.path.normcase(synced_asset.get("project_path") or ""):
+                asset = self._set_image_active_output_version(asset, synced_asset.get("active_output_version_id"))
+            else:
+                asset, _new_version = self._append_image_output_version(asset, normalized_project_path)
+            self.image_assets = self._reindex_ordered_entries([
+                self._sync_image_asset_output_fields(existing_asset if str(existing_asset.get("asset_id") or "").strip() != str(asset.get("asset_id") or "").strip() else asset)
+                for existing_asset in self.image_assets
+            ])
+            return self._get_image_asset_by_id(asset.get("asset_id"))
 
         image_asset = self._create_image_asset_record(
             normalized_project_path,
@@ -4690,8 +5112,8 @@ class LTXQueueManager:
             status=status
         )
         self.image_assets.append(image_asset)
-        self.image_assets = self._reindex_ordered_entries(self.image_assets)
-        return image_asset
+        self.image_assets = self._reindex_ordered_entries([self._sync_image_asset_output_fields(existing_asset) for existing_asset in self.image_assets])
+        return self._get_image_asset_by_id(image_asset.get("asset_id"))
 
     def _get_image_asset_by_id(self, asset_id):
         normalized_asset_id = str(asset_id or "").strip()
@@ -4709,8 +5131,225 @@ class LTXQueueManager:
             return None
 
         for asset in self.image_assets:
-            if os.path.normcase(asset.get("project_path", "")) == os.path.normcase(normalized_image_path):
-                return asset
+            synced_asset = self._sync_image_asset_output_fields(asset)
+            if os.path.normcase(synced_asset.get("project_path", "")) == os.path.normcase(normalized_image_path):
+                return synced_asset
+            for version_entry in synced_asset.get("output_versions") or []:
+                if os.path.normcase(self._normalize_path(version_entry.get("path")) or "") == os.path.normcase(normalized_image_path):
+                    return synced_asset
+        return None
+
+    def _build_image_output_version_label(self, version_entry, is_active=False):
+        if not version_entry:
+            return ""
+        version_number = int((version_entry or {}).get("version_number") or 0)
+        filename = os.path.basename((version_entry or {}).get("path") or "") or "Missing file"
+        label = f"v{version_number:02d} | {filename}"
+        if is_active:
+            label += " | Favorite"
+        return label
+
+    def _get_image_output_version_lookup(self, image_assets=None):
+        lookup = {}
+        for image_asset in self._normalize_image_assets(image_assets if image_assets is not None else self.image_assets):
+            active_version_id = str(image_asset.get("active_output_version_id") or "").strip()
+            for version_entry in image_asset.get("output_versions") or []:
+                version_path = self._normalize_path(version_entry.get("path"))
+                if not version_path:
+                    continue
+                lookup[os.path.normcase(version_path)] = {
+                    "asset_id": str(image_asset.get("asset_id") or "").strip(),
+                    "asset_label": str(image_asset.get("label") or "").strip(),
+                    "order_index": int(image_asset.get("order_index") or 0),
+                    "prompt_text": str(image_asset.get("prompt_text") or "").strip(),
+                    "version_id": str(version_entry.get("version_id") or "").strip(),
+                    "version_number": int(version_entry.get("version_number") or 0),
+                    "is_active": str(version_entry.get("version_id") or "").strip() == active_version_id,
+                    "path": version_path,
+                }
+        return lookup
+
+    def _delete_image_version_file(self, image_path):
+        normalized_image_path = self._normalize_path(image_path)
+        if normalized_image_path and os.path.exists(normalized_image_path):
+            os.remove(normalized_image_path)
+
+    def _sync_image_prompt_entry_asset_binding(self, asset_id, clear_binding=False):
+        normalized_asset_id = str(asset_id or "").strip()
+        if not normalized_asset_id:
+            return
+
+        updated_entries = []
+        for prompt_entry in self._normalize_image_prompt_queue_entries(self.image_prompt_queue):
+            entry_copy = self._create_image_prompt_queue_entry(
+                prompt_text=prompt_entry.get("prompt_text", ""),
+                prompt_id=prompt_entry.get("prompt_id"),
+                version_count=prompt_entry.get("version_count", 1),
+                asset_id=None if clear_binding and str(prompt_entry.get("asset_id") or "").strip() == normalized_asset_id else prompt_entry.get("asset_id"),
+                created_at=prompt_entry.get("created_at"),
+                updated_at=datetime.now().isoformat(timespec="seconds") if clear_binding and str(prompt_entry.get("asset_id") or "").strip() == normalized_asset_id else prompt_entry.get("updated_at"),
+            )
+            updated_entries.append(entry_copy)
+        self.image_prompt_queue = updated_entries
+
+        if not hasattr(self, "image_scrollable_frame"):
+            return
+        for frame in self.image_scrollable_frame.winfo_children():
+            if str(getattr(frame, "bound_asset_id", "") or "").strip() != normalized_asset_id:
+                continue
+            if clear_binding:
+                frame.bound_asset_id = None
+            prompt_entry = self._get_image_prompt_entry_from_frame(frame)
+            if clear_binding:
+                prompt_entry["asset_id"] = None
+            self._apply_image_prompt_entry_to_frame(frame, prompt_entry)
+
+    def select_image_output_version(self, asset_id, version_id):
+        asset = self._get_image_asset_by_id(asset_id)
+        if not asset:
+            return
+        updated_asset = self._set_image_active_output_version(asset, version_id)
+        self._replace_image_asset_by_id(updated_asset)
+        self._sync_image_prompt_entry_asset_binding(asset_id)
+        self._refresh_scene_asset_summaries()
+        self.save_project_state()
+        self.refresh_gallery()
+
+    def delete_image_output_version(self, asset_id, version_id, confirm=True):
+        asset = self._get_image_asset_by_id(asset_id)
+        if not asset:
+            return
+        version_entry = self._get_image_output_version_by_id(asset, version_id)
+        if not version_entry:
+            return
+        version_path = self._normalize_path(version_entry.get("path"))
+        versions = asset.get("output_versions") or []
+        remaining_versions = [
+            version for version in versions
+            if str(version.get("version_id") or "").strip() != str(version_id or "").strip()
+        ]
+        scene_numbers = self._get_image_asset_scene_numbers(asset_id) if len(remaining_versions) == 0 else []
+        prompt_lines = [f"Delete {os.path.basename(version_path or 'selected version')}?"]
+        if scene_numbers:
+            prompt_lines.extend([
+                "",
+                f"This is the last saved version for an image assigned to scenes {', '.join(str(number) for number in scene_numbers)}.",
+                "Deleting it will clear those scene assignments.",
+            ])
+        if confirm and not messagebox.askyesno("Delete Image Version", "\n".join(prompt_lines)):
+            return
+
+        try:
+            self._delete_image_version_file(version_path)
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not delete image version:\n{e}")
+            return
+
+        updated_asset = self._remove_image_output_version(asset, version_id)
+        if updated_asset.get("output_versions"):
+            self._replace_image_asset_by_id(updated_asset)
+            self._sync_image_prompt_entry_asset_binding(asset_id)
+        else:
+            self._clear_image_asset_references(asset_id)
+            self.image_assets = [
+                existing_asset for existing_asset in self.image_assets
+                if str(existing_asset.get("asset_id") or "").strip() != str(asset_id or "").strip()
+            ]
+            self.image_assets = self._normalize_image_assets(self.image_assets)
+            self._sync_image_prompt_entry_asset_binding(asset_id, clear_binding=True)
+        self._refresh_scene_asset_summaries()
+        self.save_project_state()
+        self.refresh_gallery()
+
+    def prune_image_output_versions(self, asset_id, keep_version_id, confirm=True):
+        asset = self._get_image_asset_by_id(asset_id)
+        if not asset:
+            return
+        keep_version = self._get_image_output_version_by_id(asset, keep_version_id)
+        if not keep_version:
+            return
+        removable_versions = [
+            version for version in asset.get("output_versions") or []
+            if str(version.get("version_id") or "").strip() != str(keep_version_id or "").strip()
+        ]
+        if not removable_versions:
+            return
+        if confirm and not messagebox.askyesno("Prune Image Versions", f"Delete {len(removable_versions)} non-selected version(s) for this image?"):
+            return
+
+        try:
+            for version_entry in removable_versions:
+                self._delete_image_version_file(version_entry.get("path"))
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not prune image versions:\n{e}")
+            return
+
+        updated_asset = dict(asset)
+        updated_asset["output_versions"] = [copy.deepcopy(keep_version)]
+        updated_asset = self._set_image_active_output_version(updated_asset, keep_version_id)
+        self._replace_image_asset_by_id(updated_asset)
+        self._sync_image_prompt_entry_asset_binding(asset_id)
+        self._refresh_scene_asset_summaries()
+        self.save_project_state()
+        self.refresh_gallery()
+
+    def _get_image_prompt_selected_version_id(self, frame):
+        if not frame or not hasattr(frame, "version_option_map"):
+            return None
+        return frame.version_option_map.get(frame.version_var.get())
+
+    def _handle_image_prompt_version_selected(self, frame):
+        selected_version_id = self._get_image_prompt_selected_version_id(frame)
+        asset_id = str(getattr(frame, "bound_asset_id", "") or "").strip()
+        if not asset_id or not selected_version_id:
+            return
+        self.select_image_output_version(asset_id, selected_version_id)
+
+    def delete_selected_image_version(self, frame):
+        selected_version_id = self._get_image_prompt_selected_version_id(frame)
+        asset_id = str(getattr(frame, "bound_asset_id", "") or "").strip()
+        if not asset_id or not selected_version_id:
+            return
+        self.delete_image_output_version(asset_id, selected_version_id)
+
+    def prune_image_versions(self, frame):
+        selected_version_id = self._get_image_prompt_selected_version_id(frame)
+        asset_id = str(getattr(frame, "bound_asset_id", "") or "").strip()
+        if not asset_id or not selected_version_id:
+            return
+        self.prune_image_output_versions(asset_id, selected_version_id)
+
+    def _refresh_image_prompt_version_controls(self, frame, prompt_entry=None):
+        if not frame:
+            return
+        resolved_entry = prompt_entry or self._get_image_prompt_entry_from_frame(frame)
+        asset = self._get_image_asset_by_id((resolved_entry or {}).get("asset_id"))
+        asset = self._sync_image_asset_output_fields(asset) if asset else None
+        versions = list((asset or {}).get("output_versions") or [])
+        active_version_id = str((asset or {}).get("active_output_version_id") or "").strip()
+
+        option_map = {}
+        option_values = []
+        for version_entry in versions:
+            is_active = str(version_entry.get("version_id") or "").strip() == active_version_id
+            option_label = self._build_image_output_version_label(version_entry, is_active=is_active)
+            option_map[option_label] = str(version_entry.get("version_id") or "").strip()
+            option_values.append(option_label)
+
+        frame.version_option_map = option_map
+        frame.version_combo["values"] = option_values
+        if option_values:
+            active_label = next((label for label, version_id in option_map.items() if version_id == active_version_id), option_values[0])
+            frame.version_var.set(active_label)
+            frame.version_combo.configure(state="readonly")
+        else:
+            frame.version_var.set("")
+            frame.version_combo.configure(state=tk.DISABLED)
+
+        has_versions = bool(option_values)
+        frame.favorite_version_btn.config(state=tk.NORMAL if has_versions and len(option_values) > 1 else tk.DISABLED)
+        frame.delete_version_btn.config(state=tk.NORMAL if has_versions else tk.DISABLED)
+        frame.prune_versions_btn.config(state=tk.NORMAL if len(option_values) > 1 else tk.DISABLED)
         return None
 
     def _get_image_asset_display_name(self, asset):
@@ -4858,7 +5497,173 @@ class LTXQueueManager:
             return None
         return max(new_files, key=os.path.getmtime)
 
-    def _create_scene_entry(self, order_index, mode=SCENE_MODE_T2V, prompt="", prompt_text="", image_asset_id=None, i2v_prompt_text="", scene_id=None, output_path=None, render_status="pending"):
+    def _coerce_scene_version_count(self, version_count):
+        try:
+            return max(1, int(version_count or 1))
+        except (TypeError, ValueError):
+            return 1
+
+    def _create_scene_output_version(self, path=None, version_id=None, version_number=None, created_at=None, render_status="ready", prompt_snapshot="", mode=None):
+        resolved_number = max(1, int(version_number or 1))
+        return {
+            "version_id": str(version_id or f"v{resolved_number:02d}").strip() or f"v{resolved_number:02d}",
+            "version_number": resolved_number,
+            "path": self._normalize_path(path),
+            "created_at": str(created_at or datetime.now().isoformat(timespec="seconds")).strip(),
+            "render_status": self._normalize_scene_render_status(render_status),
+            "prompt_snapshot": str(prompt_snapshot or "").strip(),
+            "mode": str(mode or "").strip().lower(),
+        }
+
+    def _normalize_scene_output_versions(self, output_versions=None, output_path=None, prompt_snapshot="", mode=None):
+        normalized_versions = []
+        seen_version_ids = set()
+        for index, version_entry in enumerate(output_versions or [], start=1):
+            if not isinstance(version_entry, dict):
+                continue
+            normalized_version = self._create_scene_output_version(
+                path=version_entry.get("path"),
+                version_id=version_entry.get("version_id"),
+                version_number=version_entry.get("version_number", index),
+                created_at=version_entry.get("created_at"),
+                render_status=version_entry.get("render_status", "ready"),
+                prompt_snapshot=version_entry.get("prompt_snapshot", prompt_snapshot),
+                mode=version_entry.get("mode", mode),
+            )
+            normalized_version_id = normalized_version["version_id"]
+            if normalized_version_id in seen_version_ids:
+                normalized_version["version_id"] = f"v{len(normalized_versions) + 1:02d}"
+            seen_version_ids.add(normalized_version["version_id"])
+            normalized_versions.append(normalized_version)
+
+        normalized_output_path = self._normalize_path(output_path)
+        if normalized_output_path and not any(os.path.normcase(str(version.get("path") or "")) == os.path.normcase(normalized_output_path) for version in normalized_versions):
+            normalized_versions.append(
+                self._create_scene_output_version(
+                    path=normalized_output_path,
+                    version_number=len(normalized_versions) + 1,
+                    prompt_snapshot=prompt_snapshot,
+                    mode=mode,
+                )
+            )
+
+        return sorted(normalized_versions, key=lambda version: int(version.get("version_number") or 0))
+
+    def _get_scene_output_version_by_id(self, scene_entry, version_id):
+        normalized_version_id = str(version_id or "").strip()
+        if not normalized_version_id:
+            return None
+        for version_entry in self._normalize_scene_output_versions(
+            scene_entry.get("output_versions"),
+            output_path=scene_entry.get("output_path"),
+            prompt_snapshot=self._get_scene_prompt_text(scene_entry),
+            mode=scene_entry.get("mode"),
+        ):
+            if str(version_entry.get("version_id") or "").strip() == normalized_version_id:
+                return version_entry
+        return None
+
+    def _get_scene_active_output_version_id(self, scene_entry):
+        versions = self._normalize_scene_output_versions(
+            scene_entry.get("output_versions"),
+            output_path=scene_entry.get("output_path"),
+            prompt_snapshot=self._get_scene_prompt_text(scene_entry),
+            mode=scene_entry.get("mode"),
+        )
+        active_version_id = str(scene_entry.get("active_output_version_id") or "").strip()
+        if active_version_id and any(str(version.get("version_id") or "").strip() == active_version_id for version in versions):
+            return active_version_id
+        if versions:
+            return str(versions[0].get("version_id") or "").strip() or None
+        return None
+
+    def _sync_scene_entry_output_fields(self, scene_entry):
+        entry_copy = dict(scene_entry or {})
+        versions = self._normalize_scene_output_versions(
+            entry_copy.get("output_versions"),
+            output_path=entry_copy.get("output_path"),
+            prompt_snapshot=self._get_scene_prompt_text(entry_copy),
+            mode=entry_copy.get("mode"),
+        )
+        active_version_id = self._get_scene_active_output_version_id({**entry_copy, "output_versions": versions})
+        active_version = self._get_scene_output_version_by_id({**entry_copy, "output_versions": versions}, active_version_id)
+        entry_copy["output_versions"] = versions
+        entry_copy["active_output_version_id"] = active_version_id
+        entry_copy["output_path"] = self._normalize_path((active_version or {}).get("path") or entry_copy.get("output_path"))
+        return entry_copy
+
+    def _get_next_scene_output_version_number(self, scene_entry):
+        versions = self._normalize_scene_output_versions(
+            scene_entry.get("output_versions"),
+            output_path=scene_entry.get("output_path"),
+            prompt_snapshot=self._get_scene_prompt_text(scene_entry),
+            mode=scene_entry.get("mode"),
+        )
+        if not versions:
+            return 1
+        return max(int(version.get("version_number") or 0) for version in versions) + 1
+
+    def _set_scene_active_output_version(self, scene_entry, version_id):
+        entry_copy = self._sync_scene_entry_output_fields(scene_entry)
+        target_version = self._get_scene_output_version_by_id(entry_copy, version_id)
+        if target_version:
+            entry_copy["active_output_version_id"] = target_version.get("version_id")
+            entry_copy["output_path"] = self._normalize_path(target_version.get("path"))
+        return self._sync_scene_entry_output_fields(entry_copy)
+
+    def _append_scene_output_version(self, scene_entry, output_path):
+        entry_copy = self._sync_scene_entry_output_fields(scene_entry)
+        next_version_number = self._get_next_scene_output_version_number(entry_copy)
+        new_version = self._create_scene_output_version(
+            path=output_path,
+            version_number=next_version_number,
+            prompt_snapshot=self._get_scene_prompt_text(entry_copy),
+            mode=entry_copy.get("mode"),
+        )
+        entry_copy["output_versions"] = list(entry_copy.get("output_versions") or []) + [new_version]
+        if not entry_copy.get("active_output_version_id"):
+            entry_copy["active_output_version_id"] = new_version.get("version_id")
+        entry_copy = self._sync_scene_entry_output_fields(entry_copy)
+        return entry_copy, new_version
+
+    def _remove_scene_output_version(self, scene_entry, version_id):
+        entry_copy = self._sync_scene_entry_output_fields(scene_entry)
+        normalized_version_id = str(version_id or "").strip()
+        remaining_versions = [
+            version for version in entry_copy.get("output_versions") or []
+            if str(version.get("version_id") or "").strip() != normalized_version_id
+        ]
+        entry_copy["output_versions"] = remaining_versions
+        if str(entry_copy.get("active_output_version_id") or "").strip() == normalized_version_id:
+            entry_copy["active_output_version_id"] = str(remaining_versions[0].get("version_id") or "").strip() if remaining_versions else None
+        if not remaining_versions:
+            entry_copy["output_path"] = None
+            entry_copy["render_status"] = "stale"
+        return self._sync_scene_entry_output_fields(entry_copy)
+
+    def _replace_scene_entry_by_id(self, scene_timeline, updated_entry):
+        normalized_scene_id = str((updated_entry or {}).get("scene_id") or "").strip()
+        updated_timeline = []
+        replaced = False
+        for existing_entry in self._normalize_scene_timeline(scene_timeline or []):
+            if str(existing_entry.get("scene_id") or "").strip() == normalized_scene_id:
+                updated_timeline.append(self._sync_scene_entry_output_fields(updated_entry))
+                replaced = True
+            else:
+                updated_timeline.append(existing_entry)
+        if not replaced and updated_entry:
+            updated_timeline.append(self._sync_scene_entry_output_fields(updated_entry))
+        return self._reindex_ordered_entries(updated_timeline)
+
+    def _build_scene_output_version_label(self, version_entry, is_active=False):
+        version_number = int(version_entry.get("version_number") or 0)
+        basename = os.path.basename(str(version_entry.get("path") or "").strip()) or "Missing file"
+        label = f"v{version_number:02d} | {basename}"
+        if is_active:
+            label += " | Favorite"
+        return label
+
+    def _create_scene_entry(self, order_index, mode=SCENE_MODE_T2V, prompt="", prompt_text="", image_asset_id=None, i2v_prompt_text="", scene_id=None, output_path=None, render_status="pending", version_count=1, output_versions=None, active_output_version_id=None):
         resolved_mode = str(mode or SCENE_MODE_T2V).strip().lower()
         if resolved_mode not in {SCENE_MODE_T2V, SCENE_MODE_I2V}:
             resolved_mode = SCENE_MODE_T2V
@@ -4868,7 +5673,7 @@ class LTXQueueManager:
         if not canonical_prompt:
             canonical_prompt = legacy_i2v_prompt or legacy_t2v_prompt if resolved_mode == SCENE_MODE_I2V else legacy_t2v_prompt or legacy_i2v_prompt
         timestamp = datetime.now().isoformat(timespec="seconds")
-        return {
+        scene_entry = {
             "scene_id": str(scene_id or self._generate_entity_id("scene")),
             "order_index": int(order_index),
             "mode": resolved_mode,
@@ -4878,8 +5683,12 @@ class LTXQueueManager:
             "i2v_prompt_text": canonical_prompt,
             "output_path": self._normalize_path(output_path),
             "render_status": str(render_status or "pending").strip().lower(),
+            "version_count": self._coerce_scene_version_count(version_count),
+            "output_versions": self._normalize_scene_output_versions(output_versions, output_path=output_path, prompt_snapshot=canonical_prompt, mode=resolved_mode),
+            "active_output_version_id": str(active_output_version_id or "").strip() or None,
             "updated_at": timestamp
         }
+        return self._sync_scene_entry_output_fields(scene_entry)
 
     def _get_scene_prompt_text(self, scene_entry):
         if not isinstance(scene_entry, dict):
@@ -4918,7 +5727,10 @@ class LTXQueueManager:
                     i2v_prompt_text=entry.get("i2v_prompt_text", ""),
                     scene_id=entry.get("scene_id"),
                     output_path=entry.get("output_path"),
-                    render_status=entry.get("render_status", "pending")
+                    render_status=entry.get("render_status", "pending"),
+                    version_count=entry.get("version_count", 1),
+                    output_versions=entry.get("output_versions"),
+                    active_output_version_id=entry.get("active_output_version_id")
                 )
             )
 
@@ -5004,12 +5816,159 @@ class LTXQueueManager:
         parsed_entry["prompt_text"] = "\n".join(lines[1:]).strip()
         return parsed_entry
 
+    def _create_image_prompt_queue_entry(self, prompt_text="", prompt_id=None, version_count=1, asset_id=None, created_at=None, updated_at=None):
+        timestamp = datetime.now().isoformat(timespec="seconds")
+        return {
+            "prompt_id": str(prompt_id or self._generate_entity_id("imgprompt")).strip(),
+            "prompt_text": str(prompt_text or "").strip(),
+            "version_count": self._coerce_image_version_count(version_count),
+            "asset_id": str(asset_id or "").strip() or None,
+            "created_at": str(created_at or timestamp).strip(),
+            "updated_at": str(updated_at or timestamp).strip(),
+        }
+
+    def _normalize_image_prompt_queue_entries(self, prompt_entries=None):
+        normalized_entries = []
+        seen_prompt_ids = set()
+        for entry in prompt_entries or []:
+            if isinstance(entry, str):
+                normalized_entry = self._create_image_prompt_queue_entry(prompt_text=entry)
+            elif isinstance(entry, dict):
+                normalized_entry = self._create_image_prompt_queue_entry(
+                    prompt_text=entry.get("prompt_text", ""),
+                    prompt_id=entry.get("prompt_id"),
+                    version_count=entry.get("version_count", 1),
+                    asset_id=entry.get("asset_id"),
+                    created_at=entry.get("created_at"),
+                    updated_at=entry.get("updated_at"),
+                )
+            else:
+                continue
+
+            if not normalized_entry.get("prompt_text"):
+                continue
+            if normalized_entry["prompt_id"] in seen_prompt_ids:
+                normalized_entry["prompt_id"] = self._generate_entity_id("imgprompt")
+            seen_prompt_ids.add(normalized_entry["prompt_id"])
+            normalized_entries.append(normalized_entry)
+        return normalized_entries
+
+    def _get_image_prompt_entry_by_id(self, prompt_id, prompt_entries=None):
+        normalized_prompt_id = str(prompt_id or "").strip()
+        if not normalized_prompt_id:
+            return None
+        for entry in self._normalize_image_prompt_queue_entries(prompt_entries if prompt_entries is not None else self.image_prompt_queue):
+            if str(entry.get("prompt_id") or "").strip() == normalized_prompt_id:
+                return entry
+        return None
+
+    def _replace_image_prompt_entry_by_id(self, updated_entry):
+        normalized_prompt_id = str((updated_entry or {}).get("prompt_id") or "").strip()
+        updated_entries = []
+        replaced = False
+        for existing_entry in self._normalize_image_prompt_queue_entries(self.image_prompt_queue):
+            if str(existing_entry.get("prompt_id") or "").strip() == normalized_prompt_id:
+                updated_entries.append(self._create_image_prompt_queue_entry(
+                    prompt_text=updated_entry.get("prompt_text", ""),
+                    prompt_id=updated_entry.get("prompt_id"),
+                    version_count=updated_entry.get("version_count", 1),
+                    asset_id=updated_entry.get("asset_id"),
+                    created_at=updated_entry.get("created_at"),
+                    updated_at=updated_entry.get("updated_at"),
+                ))
+                replaced = True
+            else:
+                updated_entries.append(existing_entry)
+        if not replaced and updated_entry:
+            updated_entries.append(self._create_image_prompt_queue_entry(
+                prompt_text=updated_entry.get("prompt_text", ""),
+                prompt_id=updated_entry.get("prompt_id"),
+                version_count=updated_entry.get("version_count", 1),
+                asset_id=updated_entry.get("asset_id"),
+                created_at=updated_entry.get("created_at"),
+                updated_at=updated_entry.get("updated_at"),
+            ))
+        self.image_prompt_queue = updated_entries
+        return self.image_prompt_queue
+
+    def _build_image_prompt_entry_summary(self, prompt_entry):
+        asset = self._get_image_asset_by_id((prompt_entry or {}).get("asset_id"))
+        if not asset:
+            return "No renders yet"
+        asset = self._sync_image_asset_output_fields(asset)
+        versions = asset.get("output_versions") or []
+        active_version = self._get_image_output_version_by_id(asset, asset.get("active_output_version_id"))
+        if not versions:
+            return "No renders yet"
+        active_label = f"favorite v{int((active_version or {}).get('version_number') or 0):02d}" if active_version else "no favorite"
+        return f"{len(versions)} version{'s' if len(versions) != 1 else ''} | {active_label}"
+
+    def _apply_image_prompt_entry_to_frame(self, frame, prompt_entry):
+        if not frame or not prompt_entry:
+            return
+        frame.prompt_entry_id = str(prompt_entry.get("prompt_id") or "").strip()
+        frame.bound_asset_id = str(prompt_entry.get("asset_id") or "").strip() or None
+        frame.prompt_entry_created_at = str(prompt_entry.get("created_at") or "").strip() or None
+        frame.prompt_entry_updated_at = str(prompt_entry.get("updated_at") or datetime.now().isoformat(timespec="seconds")).strip()
+        frame.version_count_sync_in_progress = True
+        frame.version_count_var.set(str(self._coerce_image_version_count(prompt_entry.get("version_count", 1))))
+        frame.version_count_sync_in_progress = False
+        self._refresh_image_prompt_version_controls(frame, prompt_entry)
+        if hasattr(frame, "asset_summary_label"):
+            frame.asset_summary_label.config(text=self._build_image_prompt_entry_summary(prompt_entry))
+
+    def _get_image_prompt_entry_from_frame(self, frame):
+        prompt_text = frame.prompt_text_widget.get("1.0", tk.END).strip() if hasattr(frame, "prompt_text_widget") else ""
+        return self._create_image_prompt_queue_entry(
+            prompt_text=prompt_text,
+            prompt_id=getattr(frame, "prompt_entry_id", None),
+            version_count=frame.version_count_var.get() if hasattr(frame, "version_count_var") else 1,
+            asset_id=getattr(frame, "bound_asset_id", None),
+            created_at=getattr(frame, "prompt_entry_created_at", None),
+            updated_at=datetime.now().isoformat(timespec="seconds"),
+        )
+
+    def _collect_image_prompt_queue_entries(self):
+        entries = []
+        for frame in self.image_scrollable_frame.winfo_children():
+            text_widget = getattr(frame, "prompt_text_widget", None)
+            if text_widget is None:
+                continue
+            try:
+                if int(text_widget.winfo_exists()) != 1:
+                    continue
+            except tk.TclError:
+                continue
+            prompt_entry = self._get_image_prompt_entry_from_frame(frame)
+            if prompt_entry.get("prompt_text"):
+                entries.append(prompt_entry)
+        self.image_prompt_queue = entries
+        return entries
+
+    def _handle_image_prompt_version_count_changed(self, frame):
+        if not frame or not hasattr(frame, "version_count_var"):
+            return
+        if getattr(frame, "version_count_sync_in_progress", False):
+            return
+        normalized_count = self._coerce_image_version_count(frame.version_count_var.get())
+        if frame.version_count_var.get() != str(normalized_count):
+            frame.version_count_var.set(str(normalized_count))
+        prompt_entry = self._get_image_prompt_entry_from_frame(frame)
+        self._apply_image_prompt_entry_to_frame(frame, prompt_entry)
+        self._replace_image_prompt_entry_by_id(prompt_entry)
+        self._schedule_project_state_save()
+
     def _update_scene_entry_prompt(self, scene_entry, prompt_text):
         updated_entry = dict(scene_entry or {})
         normalized_prompt = str(prompt_text or "").strip()
+        previous_prompt = self._get_scene_prompt_text(scene_entry)
         updated_entry["prompt"] = normalized_prompt
         updated_entry["prompt_text"] = normalized_prompt
         updated_entry["i2v_prompt_text"] = normalized_prompt
+        for version_entry in updated_entry.get("output_versions") or []:
+            version_entry["prompt_snapshot"] = normalized_prompt
+        if normalized_prompt != previous_prompt and self._normalize_scene_render_status(updated_entry.get("render_status", "pending")) != "rendering":
+            updated_entry["render_status"] = "stale"
         updated_entry["updated_at"] = datetime.now().isoformat(timespec="seconds")
         return updated_entry
 
@@ -5904,7 +6863,13 @@ class LTXQueueManager:
 
     def _get_workflow_payload_for_models(self, workflow_key):
         if workflow_key == "video":
+            if self.active_workflow_type in ("gguf", "gguf_distilled"):
+                return None
             return self.workflow
+        if workflow_key in ("video_gguf", "video_gguf_distilled"):
+            if self.active_workflow_type in ("gguf", "gguf_distilled"):
+                return self.workflow
+            return None
         if workflow_key == "image":
             return self.image_workflow
         if workflow_key == "music":
@@ -5939,7 +6904,7 @@ class LTXQueueManager:
                 observed_values.append(observed_value)
 
         manifest_filename = str(entry.get("filename", "")).strip()
-        active_filename = observed_values[0] if observed_values else manifest_filename
+        active_filename = manifest_filename or (observed_values[0] if observed_values else "")
 
         unique_observed_values = sorted(set(observed_values), key=str.lower)
         if len(unique_observed_values) > 1:
@@ -6065,6 +7030,8 @@ class LTXQueueManager:
         if hasattr(self, "music_model_variant_var"):
             active_music_manifest_id = self._get_active_music_manifest_id()
 
+        active_video_gguf_preset = getattr(self, "active_video_model_preset", None)
+
         for entry in self.model_manifest.get("models", []):
             if entry.get("required", True) is False:
                 continue
@@ -6079,6 +7046,15 @@ class LTXQueueManager:
                 elif active_music_manifest_id and entry_id != active_music_manifest_id:
                     continue
 
+            if variant_group and variant_group.startswith("video_gguf"):
+                if include_variant_ids is not None:
+                    if entry_id not in include_variant_ids:
+                        continue
+                elif active_video_gguf_preset:
+                    entry_preset = entry.get("preset", "")
+                    if entry_preset and entry_preset != active_video_gguf_preset:
+                        continue
+
             workflow_key = str(entry.get("workflow", "")).strip().lower()
             label = str(entry.get("label", entry_id)).strip() or entry_id
             dest_subdir = str(entry.get("dest_subdir", "")).strip().replace("/", os.sep).replace("\\", os.sep)
@@ -6090,6 +7066,20 @@ class LTXQueueManager:
                     f"Model manifest entry '{entry_id}' is missing workflow, filename, or destination folder."
                 )
                 continue
+
+            # Skip entries whose workflow type doesn't match the active configuration
+            if workflow_key.startswith("video"):
+                active_wft = getattr(self, "active_workflow_type", "safetensors")
+                if workflow_key == "video" and active_wft in ("gguf", "gguf_distilled") and active_video_gguf_preset:
+                    preset = VIDEO_MODEL_PRESETS.get(active_video_gguf_preset, {})
+                    preset_filenames = {v for k, v in preset.items()
+                                        if isinstance(v, str) and v.strip() and v.strip().lower() != "none"}
+                    if filename not in preset_filenames:
+                        continue
+                elif workflow_key == "video_gguf" and active_wft != "gguf":
+                    continue
+                elif workflow_key == "video_gguf_distilled" and active_wft != "gguf_distilled":
+                    continue
 
             resolved_path = self._find_model_file(filename)
             local_source_path = None
@@ -6489,7 +7479,10 @@ class LTXQueueManager:
             dialog_state = self._create_model_download_dialog(len(installable_reports))
 
         for index, report in enumerate(installable_reports, start=1):
-            dest_dir = os.path.join(destination_root, report["dest_subdir"])
+            dest_dir = os.path.normpath(os.path.join(destination_root, report["dest_subdir"]))
+            if not dest_dir.startswith(os.path.normpath(destination_root)):
+                failed_reports.append((report, "dest_subdir escapes the model root directory"))
+                continue
             dest_path = os.path.join(dest_dir, report["filename"])
             self.update_status(
                 f"Installing model {index}/{len(installable_reports)}: {report['filename']}",
@@ -6533,11 +7526,12 @@ class LTXQueueManager:
                 cancelled_install = True
                 break
             except Exception as exc:
-                if os.path.exists(dest_path):
-                    try:
-                        os.remove(dest_path)
-                    except OSError:
-                        pass
+                for cleanup_path in (dest_path, f"{dest_path}.partial"):
+                    if os.path.exists(cleanup_path):
+                        try:
+                            os.remove(cleanup_path)
+                        except OSError:
+                            pass
                 failed_reports.append((report, str(exc)))
 
         self._close_model_download_dialog(dialog_state)
@@ -7279,7 +8273,6 @@ class LTXQueueManager:
             "image_utilities": False,
             "image_workflow_settings": False,
             "image_prompt_queue": False,
-            "gallery_browser": False,
             "music_prompt": False,
             "music_lyrics": False,
             "music_playback": False,
@@ -7684,12 +8677,16 @@ class LTXQueueManager:
             self._update_collapsible_section_meta("scene_timeline", f"{scene_count} scenes • {i2v_count} i2v")
 
     def _update_video_selection_summary(self):
+        selection_count = len(self.selected_videos)
         if hasattr(self, "selection_count_value_label"):
-            selection_count = len(self.selected_videos)
             self.selection_count_value_label.config(text=f"{selection_count} selected")
             if hasattr(self, "prompt_count_value_label"):
                 scene_count_text = self.prompt_count_value_label.cget("text")
                 self._update_collapsible_section_meta("video_utilities", f"{scene_count_text} • {selection_count} selected")
+        if hasattr(self, "gallery_selection_label"):
+            self.gallery_selection_label.config(text=f"{selection_count} selected")
+        if hasattr(self, "gallery_stitch_btn"):
+            self.gallery_stitch_btn.config(state=tk.NORMAL if selection_count > 0 else tk.DISABLED)
 
     def _update_gallery_overview(self, final_count=0, stitched_count=0, scenes_count=0, image_count=0):
         if hasattr(self, "gallery_final_count_label"):
@@ -7707,7 +8704,6 @@ class LTXQueueManager:
             self.gallery_imported_count_label.config(text=str(imported_count))
         else:
             imported_count = (len(self._get_gallery_video_files(self.imported_video_dir)) if self.imported_video_dir else 0) + (len(self._get_gallery_image_files(self.imported_image_dir)) if self.imported_image_dir else 0)
-        self._update_collapsible_section_meta("gallery_browser", f"{scenes_count} scenes • {image_count} images • {imported_count} imports • {stitched_count} stitched • {final_count} finals")
 
     def _update_music_config_summary(self, *_args):
         if hasattr(self, "music_duration_value_label"):
@@ -7741,6 +8737,134 @@ class LTXQueueManager:
         self._update_collapsible_section_meta("music_media_state", media_meta)
         preview_meta = os.path.basename(self.selected_video_for_music) if self.selected_video_for_music else "Reference clip"
         self._update_collapsible_section_meta("music_preview", preview_meta)
+        self._refresh_music_songs_library()
+
+    def _refresh_music_songs_library(self):
+        """Repopulate the Songs Library listbox with all generated/imported audio files."""
+        if not hasattr(self, "music_songs_listbox"):
+            return
+        self._music_songs_paths = []
+        for d in [getattr(self, "audio_dir", None), getattr(self, "imported_audio_dir", None)]:
+            if d and os.path.isdir(d):
+                for fn in sorted(os.listdir(d)):
+                    if os.path.splitext(fn)[1].lower() in SUPPORTED_AUDIO_EXTENSIONS:
+                        self._music_songs_paths.append(os.path.join(d, fn))
+        self.music_songs_listbox.delete(0, tk.END)
+        active_norm = os.path.normcase(self.current_generated_audio or "")
+        active_idx = None
+        for i, p in enumerate(self._music_songs_paths):
+            label = os.path.basename(p)
+            source = "Generated" if (self.audio_dir and os.path.normcase(os.path.dirname(p)) == os.path.normcase(self.audio_dir)) else "Imported"
+            self.music_songs_listbox.insert(tk.END, f"{label}  [{source}]")
+            if os.path.normcase(p) == active_norm:
+                active_idx = i
+        if active_idx is not None:
+            self.music_songs_listbox.selection_set(active_idx)
+            self.music_songs_listbox.see(active_idx)
+        n = len(self._music_songs_paths)
+        if hasattr(self, "music_songs_count_label"):
+            self.music_songs_count_label.config(text=f"{n} song{'s' if n != 1 else ''}")
+        self._update_collapsible_section_meta("music_songs_library", f"{n} song{'s' if n != 1 else ''}")
+        self._music_songs_update_buttons()
+
+    def _music_songs_get_selected_path(self):
+        paths = getattr(self, "_music_songs_paths", [])
+        sel = self.music_songs_listbox.curselection()
+        if not sel or sel[0] >= len(paths):
+            return None
+        return paths[sel[0]]
+
+    def _music_songs_update_buttons(self):
+        has_sel = bool(self.music_songs_listbox.curselection())
+        state = tk.NORMAL if has_sel else tk.DISABLED
+        for btn in [
+            getattr(self, "music_songs_preview_btn", None),
+            getattr(self, "music_songs_rename_btn", None),
+            getattr(self, "music_songs_set_active_btn", None),
+            getattr(self, "music_songs_delete_btn", None),
+        ]:
+            if btn:
+                btn.config(state=state)
+
+    def _music_songs_preview(self):
+        p = self._music_songs_get_selected_path()
+        if not p or not os.path.exists(p):
+            return
+        try:
+            os.startfile(p)
+        except Exception as e:
+            messagebox.showerror("Preview Error", f"Could not play audio:\n{e}")
+
+    def _music_songs_rename(self):
+        from tkinter import simpledialog
+        p = self._music_songs_get_selected_path()
+        if not p or not os.path.exists(p):
+            return
+        old_stem = os.path.splitext(os.path.basename(p))[0]
+        ext = os.path.splitext(p)[1]
+        new_stem = simpledialog.askstring(
+            "Rename Song", "Enter a new name for this song:", initialvalue=old_stem, parent=self.root
+        )
+        if not new_stem or new_stem.strip() == old_stem:
+            return
+        new_stem = new_stem.strip()
+        # Reject names with path separators or null bytes
+        if any(c in new_stem for c in r'\/:*?"<>|'):
+            messagebox.showerror("Invalid Name", "Song name contains invalid characters.", parent=self.root)
+            return
+        new_path = os.path.join(os.path.dirname(p), new_stem + ext)
+        if os.path.exists(new_path):
+            messagebox.showerror("Name Taken", f"A file named '{new_stem + ext}' already exists.", parent=self.root)
+            return
+        try:
+            os.rename(p, new_path)
+        except OSError as e:
+            messagebox.showerror("Rename Failed", str(e), parent=self.root)
+            return
+        # Update active audio reference if this was the active song
+        if self.current_generated_audio and os.path.normcase(self.current_generated_audio) == os.path.normcase(p):
+            self.current_generated_audio = new_path
+        self._refresh_music_songs_library()
+        self._refresh_music_sidebar_state()
+
+    def _music_songs_set_active(self):
+        p = self._music_songs_get_selected_path()
+        if not p or not os.path.exists(p):
+            return
+        self.current_generated_audio = p
+        self.current_audio_source = self._infer_audio_source(p)
+        self._refresh_music_sidebar_state()
+        # Enable preview and merge buttons
+        if hasattr(self, "preview_music_btn"):
+            self.preview_music_btn.config(state=tk.NORMAL)
+        if self.selected_video_for_music and hasattr(self, "merge_music_btn"):
+            self.merge_music_btn.config(state=tk.NORMAL)
+
+    def _music_songs_delete(self):
+        p = self._music_songs_get_selected_path()
+        if not p:
+            return
+        fname = os.path.basename(p)
+        if not messagebox.askyesno(
+            "Delete Song",
+            f"Permanently delete '{fname}'?\n\nThis cannot be undone.",
+            parent=self.root
+        ):
+            return
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except OSError as e:
+            messagebox.showerror("Delete Failed", str(e), parent=self.root)
+            return
+        # Clear active audio reference if this was the active song
+        if self.current_generated_audio and os.path.normcase(self.current_generated_audio) == os.path.normcase(p):
+            self.current_generated_audio = None
+            self._refresh_music_sidebar_state()
+        self._refresh_music_songs_library()
+        # Keep timeline audio selector in sync
+        if hasattr(self, "_timeline_update_audio_selector"):
+            self._timeline_update_audio_selector()
 
     def _reset_selected_video_preview(self):
         self.selected_video_lbl.config(text="No video selected.\nGo to Video Generation tab\nand click 'Add Music'.")
@@ -7781,6 +8905,7 @@ class LTXQueueManager:
             self.video_tab,
             self.image_tab,
             self.gallery_tab,
+            self.timeline_tab,
             self.music_tab,
             self.chatbot_tab,
             self.left_frame,
@@ -7819,8 +8944,6 @@ class LTXQueueManager:
             self.post_process_frame,
             self.gallery_header_frame,
             self.gallery_actions_frame,
-            self.gallery_section["container"],
-            self.gallery_section["header"],
             self.gallery_shell_frame,
             self.gallery_inner_frame,
             self.music_left_frame,
@@ -7846,6 +8969,9 @@ class LTXQueueManager:
             self.music_actions_section["header"],
             self.music_actions_card,
             self.music_action_frame,
+            self.music_songs_library_section["container"],
+            self.music_songs_library_section["header"],
+            self.music_songs_library_card,
             self.music_media_state_section["container"],
             self.music_media_state_section["header"],
             self.music_preview_section["container"],
@@ -7864,8 +8990,14 @@ class LTXQueueManager:
             self.chatbot_output_card,
             self.chatbot_task_actions_frame,
             self.chatbot_output_actions_frame,
+            self.timeline_header_frame,
+            self.timeline_toolbar_frame,
+            self.timeline_audio_row,
+            self.timeline_canvas_shell,
+            self.timeline_status_row,
+            self.timeline_info_panel,
         ]:
-            self._style_panel(widget, self.colors["bg"] if widget in [self.video_tab, self.image_tab, self.gallery_tab, self.music_tab, self.chatbot_tab] else self.colors["surface"])
+            self._style_panel(widget, self.colors["bg"] if widget in [self.video_tab, self.image_tab, self.gallery_tab, self.timeline_tab, self.music_tab, self.chatbot_tab] else self.colors["surface"])
 
         self._style_panel(self.right_frame, self.colors["surface_alt"])
         if hasattr(self, "main_paned"):
@@ -7878,6 +9010,30 @@ class LTXQueueManager:
         self._style_panel(self.gallery_inner_frame, self.colors["surface_alt"])
         self._style_panel(self.music_scroll_shell, self.colors["bg"])
         self._style_panel(self.music_canvas, self.colors["bg"])
+        if hasattr(self, "timeline_canvas"):
+            self._style_panel(self.timeline_canvas, self.colors["surface"])
+            self._style_panel(self.timeline_canvas_shell, self.colors["bg"])
+            self._style_panel(self.timeline_preview_frame, self.colors["bg"])
+            self._style_panel(self.timeline_info_panel, self.colors["bg"])
+            self._style_panel(self.timeline_rail_frame, self.colors["bg"])
+            self._style_panel(self.timeline_body_frame, self.colors["bg"])
+            self._style_panel(self.timeline_preview_canvas, "#0a0a0a")
+            self._style_label(self.timeline_title_label, "title", self.colors["bg"])
+            self._style_label(self.timeline_subtitle_label, "muted", self.colors["bg"])
+            self._style_label(self.timeline_audio_static_label, "muted", self.colors["bg"])
+            self._style_label(self.timeline_audio_info_label, "muted", self.colors["bg"])
+            self._style_label(self.timeline_preview_scene_label, "body_strong", self.colors["bg"])
+            self._style_label(self.timeline_preview_time_label, "muted", self.colors["bg"])
+            self._style_label(self.timeline_status_label, "muted", self.colors["bg"])
+            self._style_button(self.timeline_refresh_btn, "ghost", compact=True)
+            self._style_button(self.timeline_zoom_in_btn, "ghost", compact=True)
+            self._style_button(self.timeline_zoom_out_btn, "ghost", compact=True)
+            self._style_button(self.timeline_play_btn, "primary", compact=True)
+            self._style_button(self.timeline_stop_btn, "ghost", compact=True)
+            self._style_button(self.timeline_export_btn, "primary", compact=True)
+            if hasattr(self, "timeline_follow_btn"):
+                on = getattr(self, "_timeline_follow_playhead", True)
+                self._style_button(self.timeline_follow_btn, "primary" if on else "ghost", compact=True)
         self._style_panel(self.music_right_frame, self.colors["surface_alt"], border=True)
         self._style_panel(self.music_sidebar_card, self.colors["surface_alt"], border=True)
         self._style_panel(self.music_media_state_card, self.colors["surface_alt"], border=True)
@@ -7889,10 +9045,15 @@ class LTXQueueManager:
         self._style_panel(self.image_prompt_section_frame, self.colors["surface"])
         self._style_panel(self.scene_timeline_frame, self.colors["surface"])
         self._style_panel(self.gallery_shell_frame, self.colors["surface_alt"], border=True)
+        if hasattr(self, "gallery_body_frame"):
+            self._style_panel(self.gallery_body_frame, self.colors["surface_alt"])
+        if hasattr(self, "gallery_filter_bar_frame"):
+            self._style_panel(self.gallery_filter_bar_frame, self.colors["surface_alt"])
+            self._apply_gallery_filter_style()
 
-        for key in ["image_utilities", "image_prompt_queue", "image_workflow_settings", "scene_timeline", "video_settings", "video_preflight", "video_debug", "video_utilities", "gallery_browser", "music_prompt", "music_lyrics", "music_playback", "music_generation", "music_advanced", "music_actions", "music_media_state", "music_preview"]:
+        for key in ["image_utilities", "image_prompt_queue", "image_workflow_settings", "scene_timeline", "video_settings", "video_preflight", "video_debug", "video_utilities", "music_prompt", "music_lyrics", "music_playback", "music_generation", "music_advanced", "music_actions", "music_songs_library", "music_media_state", "music_preview"]:
             section = self.collapsible_sections[key]
-            section_bg = self.colors["surface_alt"] if key in ["image_utilities", "video_utilities", "gallery_browser", "music_media_state", "music_preview"] else self.colors["surface"]
+            section_bg = self.colors["surface_alt"] if key in ["image_utilities", "video_utilities", "music_media_state", "music_preview"] else self.colors["surface"]
             self._style_panel(section["container"], section_bg, border=True)
             self._style_panel(section["header"], section_bg)
             self._style_panel(section["body"], section_bg)
@@ -7982,6 +9143,10 @@ class LTXQueueManager:
         self._style_label(self.chatbot_task_hint_label, "body", self.chatbot_briefing_card.cget("bg"))
         if hasattr(self, "gallery_drop_hint_label"):
             self._style_label(self.gallery_drop_hint_label, "muted", self.gallery_header_frame.cget("bg"))
+        if hasattr(self, "gallery_stitch_bar_frame"):
+            self._style_panel(self.gallery_stitch_bar_frame, self.colors["surface_alt"])
+            self._style_label(self.gallery_selection_label, "muted", self.colors["surface_alt"])
+            self._style_checkbutton(self.gallery_strip_audio_cb, self.colors["surface_alt"])
         if hasattr(self, "music_drop_hint_label"):
             self._style_label(self.music_drop_hint_label, "muted", self.music_actions_card.cget("bg"))
         self._style_label(self.selected_video_header_label, "section", self.music_right_frame.cget("bg"))
@@ -8009,11 +9174,18 @@ class LTXQueueManager:
             (self.select_all_btn, "secondary"),
             (self.gallery_import_image_btn, "secondary"),
             (self.gallery_import_btn, "secondary"),
+            (self.gallery_select_all_btn, "secondary"),
+            (self.gallery_clear_sel_btn, "ghost"),
+            (self.gallery_stitch_btn, "primary"),
             (self.gen_music_btn, "accent"),
             (self.import_audio_btn, "secondary"),
             (self.preview_music_btn, "secondary"),
             (self.preview_final_btn, "secondary"),
             (self.merge_music_btn, "primary"),
+            (self.music_songs_preview_btn, "secondary"),
+            (self.music_songs_rename_btn, "ghost"),
+            (self.music_songs_set_active_btn, "primary"),
+            (self.music_songs_delete_btn, "danger"),
             (self.chatbot_output_mode_btn, "ghost"),
             (self.chatbot_copy_output_btn, "secondary"),
             (self.chatbot_apply_btn, "accent"),
@@ -8093,6 +9265,25 @@ class LTXQueueManager:
         self._update_video_selection_summary()
         self._update_music_config_summary()
         self._refresh_music_sidebar_state()
+        # Style Songs Library widgets
+        if hasattr(self, "music_songs_listbox"):
+            surf = self.colors["surface"]
+            self.music_songs_listbox.configure(
+                bg=self.colors.get("input_bg", surf),
+                fg=self.colors["text"],
+                selectbackground=self.colors.get("accent", self.colors["text"]),
+                selectforeground=self.colors.get("bg", surf),
+                relief=tk.FLAT,
+                bd=1,
+                highlightthickness=1,
+                highlightbackground=self.colors["border"],
+                font=self.fonts.get("body", ("Segoe UI", 10)),
+            )
+        if hasattr(self, "music_songs_count_label"):
+            self._style_label(self.music_songs_count_label, "muted",
+                              self.colors["surface"])
+        if hasattr(self, "music_songs_library_card"):
+            self._style_panel(self.music_songs_library_card, self.colors["surface"])
 
     def _theme_existing_entries(self, parent):
         for child in parent.winfo_children():
@@ -8114,7 +9305,7 @@ class LTXQueueManager:
 
     def set_project(self, project_dir):
         # Save current project state before switching
-        if self.current_project_dir:
+        if self.current_project_dir and not self.project_state_restore_in_progress:
             self.save_project_state()
             
         self.current_project_dir = self._normalize_path(project_dir)
@@ -8474,7 +9665,11 @@ class LTXQueueManager:
         self.gallery_tab = tk.Frame(self.notebook)
         self.notebook.add(self.gallery_tab, text="Gallery")
 
-        # Tab 5: Music Studio
+        # Tab 5: Timeline Editor
+        self.timeline_tab = tk.Frame(self.notebook)
+        self.notebook.add(self.timeline_tab, text="Timeline Editor")
+
+        # Tab 6: Music Studio
         self.music_tab = tk.Frame(self.notebook)
         self.notebook.add(self.music_tab, text="Music Studio")
         
@@ -8528,6 +9723,14 @@ class LTXQueueManager:
         self.settings_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.settings_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
+        self.video_preset_key_to_label = {
+            key: preset["label"] for key, preset in VIDEO_MODEL_PRESETS.items()
+        }
+        self.video_preset_label_to_key = {
+            label: key for key, label in self.video_preset_key_to_label.items()
+        }
+        self.video_model_preset_var = tk.StringVar(value=self.video_preset_key_to_label.get(self.active_video_model_preset, "Custom"))
+
         self.video_profile_key_to_label = {
             key: profile["label"] for key, profile in VIDEO_WORKFLOW_PROFILES.items()
         }
@@ -8563,8 +9766,26 @@ class LTXQueueManager:
         settings_header_frame.pack(fill=tk.X, pady=(0, 4))
         settings_header_frame.grid_columnconfigure((0, 1, 2, 3), weight=1)
 
+        preset_group = tk.Frame(settings_header_frame)
+        preset_group.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+
+        tk.Label(preset_group, text="Model Preset").pack(anchor="w")
+        self.video_preset_combo = ttk.Combobox(
+            preset_group,
+            textvariable=self.video_model_preset_var,
+            values=list(self.video_preset_key_to_label.values()),
+            state="readonly",
+            width=24
+        )
+        self.video_preset_combo.pack(fill=tk.X, pady=(2, 0))
+        self.video_preset_combo.bind("<<ComboboxSelected>>", self.on_video_model_preset_changed)
+
+        self.video_preset_vram_label = tk.Label(preset_group, text="", font=UI_FONTS.get("micro", ("Segoe UI", 8)), fg=UI_COLORS.get("text_muted", "gray"))
+        self.video_preset_vram_label.pack(anchor="w", pady=(1, 0))
+        self._update_preset_vram_label()
+
         workflow_group = tk.Frame(settings_header_frame)
-        workflow_group.grid(row=0, column=0, columnspan=2, sticky="ew", padx=(0, 8))
+        workflow_group.grid(row=0, column=1, sticky="ew", padx=(0, 8))
 
         self.workflow_label = tk.Label(workflow_group, text="Workflow")
         self.workflow_label.pack(anchor="w")
@@ -8885,6 +10106,7 @@ class LTXQueueManager:
         # --- Image and Music Tab Content ---
         self.setup_image_tab()
         self.setup_gallery_tab()
+        self.setup_timeline_editor_tab()
         self.setup_music_tab()
         self.setup_chatbot_tab()
         self._reflow_video_left_panel()
@@ -9145,18 +10367,37 @@ class LTXQueueManager:
         self.gallery_drop_hint_label = tk.Label(self.gallery_actions_frame, text=gallery_drop_text, anchor="w", justify=tk.LEFT)
         self.gallery_drop_hint_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 0))
 
-        self.gallery_section = self._create_collapsible_section(
-            self.right_frame,
-            "gallery_browser",
-            "Gallery Browser",
-            meta_text="Project media",
-            is_open=False,
-            body_expand=True,
-            body_background=self.colors["surface_alt"]
-        )
-        self.gallery_section["container"].pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=18, pady=(0, 18))
+        self.gallery_body_frame = tk.Frame(self.right_frame)
+        self.gallery_body_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=18, pady=(0, 18))
 
-        self.gallery_shell_frame = tk.Frame(self.gallery_section["body"], padx=0, pady=0)
+        self.gallery_filter_bar_frame = tk.Frame(self.gallery_body_frame)
+        self.gallery_filter_bar_frame.pack(fill=tk.X, pady=(0, 10))
+        self.gallery_filter_all_btn = tk.Button(self.gallery_filter_bar_frame, text="All", command=lambda: self._set_gallery_filter("all"))
+        self.gallery_filter_all_btn.pack(side=tk.LEFT)
+        self.gallery_filter_videos_btn = tk.Button(self.gallery_filter_bar_frame, text="Videos", command=lambda: self._set_gallery_filter("videos"))
+        self.gallery_filter_videos_btn.pack(side=tk.LEFT, padx=(6, 0))
+        self.gallery_filter_images_btn = tk.Button(self.gallery_filter_bar_frame, text="Images", command=lambda: self._set_gallery_filter("images"))
+        self.gallery_filter_images_btn.pack(side=tk.LEFT, padx=(6, 0))
+
+        self.gallery_stitch_bar_frame = tk.Frame(self.gallery_body_frame, padx=0, pady=8)
+        self.gallery_stitch_bar_frame.pack(side=tk.BOTTOM, fill=tk.X)
+
+        self.gallery_selection_label = tk.Label(self.gallery_stitch_bar_frame, text="0 selected")
+        self.gallery_selection_label.pack(side=tk.LEFT, padx=(4, 12))
+
+        self.gallery_strip_audio_cb = tk.Checkbutton(self.gallery_stitch_bar_frame, text="Strip Audio", variable=self.strip_audio_var)
+        self.gallery_strip_audio_cb.pack(side=tk.LEFT)
+
+        self.gallery_stitch_btn = tk.Button(self.gallery_stitch_bar_frame, text="Stitch Selected", command=self.stitch_selected_videos, state=tk.DISABLED)
+        self.gallery_stitch_btn.pack(side=tk.RIGHT)
+
+        self.gallery_clear_sel_btn = tk.Button(self.gallery_stitch_bar_frame, text="Clear", command=self.clear_selection)
+        self.gallery_clear_sel_btn.pack(side=tk.RIGHT, padx=(0, 6))
+
+        self.gallery_select_all_btn = tk.Button(self.gallery_stitch_bar_frame, text="Select All", command=self.select_all_videos)
+        self.gallery_select_all_btn.pack(side=tk.RIGHT, padx=(0, 6))
+
+        self.gallery_shell_frame = tk.Frame(self.gallery_body_frame, padx=0, pady=0)
         self.gallery_shell_frame.pack(fill=tk.BOTH, expand=True)
 
         self.gallery_canvas = tk.Canvas(self.gallery_shell_frame, bd=0, highlightthickness=0)
@@ -9178,6 +10419,1258 @@ class LTXQueueManager:
 
         self.gallery_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.gallery_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+    # ── Timeline Editor ───────────────────────────────────────────────────
+    # Constants
+    _TL_PREVIEW_W  = 480
+    _TL_PREVIEW_H  = 270
+    _TL_PREVIEW_FPS = 12
+    _TL_RULER_H    = 26
+    _TL_AUDIO_H    = 22
+    _TL_CARD_H     = 130
+    _TL_PADDING    = 16
+    _TL_GAP        = 4
+    _TL_MIN_CARD_W = 80
+
+    # ── helpers (unchanged from original) ────────────────────────────────
+
+    def _probe_clip_duration(self, path):
+        """Return duration of a video clip in seconds (float), cached by path."""
+        norm = os.path.normcase(os.path.abspath(path))
+        if norm in self._timeline_clip_durations:
+            return self._timeline_clip_durations[norm]
+        try:
+            ffmpeg_dir = os.path.dirname(FFMPEG_PATH)
+            ffmpeg_name = os.path.basename(FFMPEG_PATH)
+            ffprobe_name = ffmpeg_name.replace("ffmpeg", "ffprobe")
+            ffprobe_path = os.path.join(ffmpeg_dir, ffprobe_name) if ffmpeg_dir else ffprobe_name
+            if not os.path.exists(ffprobe_path):
+                ffprobe_path = shutil.which("ffprobe") or "ffprobe"
+            probe_cmd = [
+                ffprobe_path, "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                path,
+            ]
+            result = subprocess.run(
+                probe_cmd, capture_output=True, text=True, timeout=30,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            dur = float(result.stdout.strip())
+            self._timeline_clip_durations[norm] = dur
+            return dur
+        except Exception:
+            return 5.0
+
+    def _get_timeline_ordered_scenes(self):
+        """Return ordered list of scene dicts for the timeline canvas."""
+        scene_infos = {}
+        for scene in (self.scene_timeline or []):
+            sid = scene.get("scene_id", "")
+            if not sid:
+                continue
+            output_path = scene.get("output_path", "") or ""
+            if not output_path:
+                for v in (scene.get("output_versions") or []):
+                    if v.get("is_active"):
+                        output_path = v.get("path", "")
+                        break
+                if not output_path and scene.get("output_versions"):
+                    output_path = scene["output_versions"][0].get("path", "")
+            if not output_path or not os.path.exists(output_path):
+                continue
+            thumb_path = os.path.join(self.thumbs_dir, f"{os.path.basename(output_path)}.jpg")
+            norm_path = os.path.normcase(os.path.abspath(output_path))
+            scene_infos[sid] = {
+                "scene_id": sid,
+                "scene_order": int(scene.get("order_index") or 0),
+                "clip_path": output_path,
+                "thumb_path": thumb_path if os.path.exists(thumb_path) else "",
+                "duration": self._timeline_clip_durations.get(norm_path, 5.0),
+                "prompt_excerpt": (scene.get("prompt_text") or "")[:80],
+                "is_active": True,
+            }
+        if not scene_infos:
+            return []
+        ordered = []
+        seen = set()
+        for sid in (self.timeline_arrangement or []):
+            if sid in scene_infos and sid not in seen:
+                ordered.append(scene_infos[sid])
+                seen.add(sid)
+        remainder = sorted(
+            [v for k, v in scene_infos.items() if k not in seen],
+            key=lambda s: s["scene_order"]
+        )
+        ordered.extend(remainder)
+        return ordered
+
+    def _save_timeline_arrangement(self):
+        self._sync_scene_tab_order_to_timeline()
+        self.refresh_gallery()
+        self.save_project_state()
+
+    def _sync_scene_tab_order_to_timeline(self):
+        """Reorder the scene frame widgets in the Video Generation tab to match
+        self.timeline_arrangement, then re-label them so 'Scene N' numbers reflect
+        the new order.  Frames for scenes not in the timeline (no video output yet)
+        are left at the end in their original relative order.
+        """
+        arrangement = self.timeline_arrangement or []
+        if not arrangement:
+            return
+        if not hasattr(self, "scene_scrollable_frame"):
+            return
+
+        frames = self._collect_scene_entry_frames()
+        if not frames:
+            return
+
+        # Build lookup: scene_id → frame
+        frame_map = {f.scene_id: f for f in frames if getattr(f, "scene_id", None)}
+
+        # Determine new frame order: arranged first, then remaining in original order
+        seen = set()
+        ordered_frames = []
+        for sid in arrangement:
+            if sid in frame_map and sid not in seen:
+                ordered_frames.append(frame_map[sid])
+                seen.add(sid)
+        for f in frames:
+            if f.scene_id not in seen:
+                ordered_frames.append(f)
+                seen.add(f.scene_id)
+
+        # Repack in new order (pack_forget + pack is the standard tkinter reorder)
+        for f in ordered_frames:
+            f.pack_forget()
+            f.pack(fill=tk.X, expand=True)
+
+        # Refresh scene number labels in the Video Generation tab
+        self._refresh_scene_entry_rows()
+
+    # ── Audio helpers ─────────────────────────────────────────────────────
+
+    def _get_timeline_audio_choices(self):
+        """Return list of audio file paths available for the current project."""
+        paths = []
+        for d in [getattr(self, "audio_dir", None), getattr(self, "imported_audio_dir", None)]:
+            if d and os.path.isdir(d):
+                for fn in sorted(os.listdir(d)):
+                    if os.path.splitext(fn)[1].lower() in SUPPORTED_AUDIO_EXTENSIONS:
+                        paths.append(os.path.join(d, fn))
+        return paths
+
+    def _timeline_update_audio_selector(self):
+        """Populate the song combobox and select the active audio."""
+        if not hasattr(self, "timeline_song_combo"):
+            return
+        choices = self._get_timeline_audio_choices()
+        display = [os.path.basename(p) for p in choices]
+        self._timeline_audio_paths = choices
+        self.timeline_song_combo["values"] = display
+        if not choices:
+            self.timeline_song_combo.set("No songs generated yet")
+            self.timeline_play_btn.config(state=tk.DISABLED)
+            self.timeline_no_audio_label.config(text="Generate a song in Music Studio first, then return here.")
+            self.timeline_no_audio_label.pack(side=tk.LEFT, padx=(8, 0))
+            self.timeline_selected_audio = None
+            return
+        self.timeline_no_audio_label.pack_forget()
+        self.timeline_play_btn.config(state=tk.NORMAL)
+        # Prefer the project's active audio; fall back to first file
+        active = self.current_generated_audio or self.timeline_selected_audio
+        if active and os.path.exists(active):
+            try:
+                idx = [os.path.normcase(p) for p in choices].index(os.path.normcase(active))
+                self.timeline_song_combo.current(idx)
+                self.timeline_selected_audio = choices[idx]
+                self._timeline_mci_open(self.timeline_selected_audio)
+                return
+            except ValueError:
+                pass
+        self.timeline_song_combo.current(0)
+        self.timeline_selected_audio = choices[0]
+        self._timeline_mci_open(self.timeline_selected_audio)
+
+    def _timeline_on_audio_selected(self, _event=None):
+        idx = self.timeline_song_combo.current()
+        paths = getattr(self, "_timeline_audio_paths", [])
+        if 0 <= idx < len(paths):
+            self.timeline_selected_audio = paths[idx]
+            self._timeline_mci_close()
+            self._timeline_mci_open(self.timeline_selected_audio)
+
+    # ── MCI (Windows audio) ───────────────────────────────────────────────
+
+    def _mci_send(self, cmd):
+        """Send an MCI command string; return (error_code, return_string)."""
+        winmm = ctypes.windll.winmm
+        winmm.mciSendStringW.restype = ctypes.c_uint32
+        buf = ctypes.create_unicode_buffer(512)
+        ret = winmm.mciSendStringW(cmd, buf, 512, 0)
+        return ret, buf.value
+
+    def _timeline_mci_open(self, path):
+        """Open audio for timeline playback via Windows MCI.
+        Non-WAV formats (MP3, FLAC, etc.) are converted to a temp WAV using ffmpeg
+        so the reliable 'waveaudio' MCI driver can be used on all Windows versions.
+        Converted WAVs are cached per source path to keep subsequent opens instant.
+        """
+        # Always close first — clears any stale MCI alias from a previous crash.
+        self._timeline_mci_close()
+        self._timeline_mci_open_ok = False
+
+        play_path = path
+
+        # Always transcode to a known-good 16-bit PCM WAV via ffmpeg.
+        # WAV files from generators (e.g. ACE Step) may use 32-bit float or other
+        # encodings that the Windows 'waveaudio' MCI driver cannot open.
+        cache_key = os.path.normcase(path)
+        cached = self._timeline_wav_cache.get(cache_key)
+        if cached and os.path.exists(cached):
+            play_path = cached
+        else:
+            import tempfile
+            try:
+                tf = tempfile.NamedTemporaryFile(
+                    suffix='.wav', delete=False,
+                    dir=tempfile.gettempdir(), prefix='p2mtv_audio_'
+                )
+                tmp_path = tf.name
+                tf.close()
+                result = subprocess.run(
+                    [FFMPEG_PATH, '-y', '-i', path,
+                     '-ar', '44100', '-ac', '2', '-sample_fmt', 's16', '-f', 'wav', tmp_path],
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                    timeout=60,
+                )
+                if result.returncode != 0:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                    raise RuntimeError(f'ffmpeg exit {result.returncode}')
+                self._timeline_wav_cache[cache_key] = tmp_path
+                play_path = tmp_path
+            except Exception as e:
+                print(f'[TIMELINE-AUDIO] WAV conversion failed: {e}')
+                if hasattr(self, 'timeline_status_label'):
+                    self.timeline_status_label.config(text=f'Audio prep failed: {e}')
+                return
+
+        alias = self._timeline_mci_alias
+        ret, _ = self._mci_send(f'open "{play_path}" type waveaudio alias {alias}')
+        print(f'[TIMELINE-AUDIO] MCI open ret={ret}  path={play_path!r}')
+        if ret == 0:
+            self._mci_send(f'set {alias} time format milliseconds')
+            self._timeline_mci_open_ok = True
+            return
+
+        # Report the MCI error to both console and status bar
+        err_buf = ctypes.create_unicode_buffer(256)
+        ctypes.windll.winmm.mciGetErrorStringW(ret, err_buf, 256)
+        err = err_buf.value or f'MCI error {ret}'
+        print(f'[TIMELINE-AUDIO] MCI open failed: {err}')
+        if hasattr(self, 'timeline_status_label'):
+            self.root.after(0, lambda m=err: self.timeline_status_label.config(
+                text=f'Audio open failed: {m}'))
+
+    def _timeline_mci_play(self, from_ms):
+        """Seek to from_ms milliseconds and start playback."""
+        if not self._timeline_mci_open_ok:
+            return
+        alias = self._timeline_mci_alias
+        self._mci_send(f'seek {alias} to {int(from_ms)}')
+        self._mci_send(f'play {alias}')
+
+    def _timeline_mci_stop(self):
+        if not self._timeline_mci_open_ok:
+            return
+        self._mci_send(f'stop {self._timeline_mci_alias}')
+
+    def _timeline_mci_close(self):
+        # Always attempt close regardless of _timeline_mci_open_ok — clears any stale alias.
+        self._mci_send(f'close {self._timeline_mci_alias}')
+        self._timeline_mci_open_ok = False
+
+    # ── Video frame reader thread ─────────────────────────────────────────
+
+    def _timeline_frame_reader(self, clip_path, skip_seconds, clip_idx):
+        """Background thread: pipe raw video frames into _timeline_frame_queue."""
+        W, H, FPS = self._TL_PREVIEW_W, self._TL_PREVIEW_H, self._TL_PREVIEW_FPS
+        frame_bytes = W * H * 3
+        vf = (f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
+              f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black")
+        cmd = [
+            FFMPEG_PATH, "-ss", str(skip_seconds),
+            "-i", clip_path,
+            "-vf", vf,
+            "-f", "rawvideo", "-pix_fmt", "rgb24",
+            "-r", str(FPS),
+            "-an", "pipe:1",
+        ]
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            with self._timeline_proc_lock:
+                self._timeline_ffmpeg_proc = proc
+            while not self._timeline_stop_reader:
+                raw = proc.stdout.read(frame_bytes)
+                if len(raw) < frame_bytes:
+                    break
+                img = Image.frombytes("RGB", (W, H), raw)
+                q = self._timeline_frame_queue
+                if q is None:
+                    break
+                try:
+                    q.put((clip_idx, img), timeout=0.5)
+                except queue.Full:
+                    if self._timeline_stop_reader:
+                        break
+            proc.stdout.close()
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        except Exception:
+            pass
+        finally:
+            q = self._timeline_frame_queue
+            if q is not None:
+                try:
+                    q.put((clip_idx, None), timeout=0.2)
+                except Exception:
+                    pass
+
+    # ── Playback controls ─────────────────────────────────────────────────
+
+    def _timeline_cleanup_playback(self):
+        """Stop everything without resetting position."""
+        self._timeline_stop_reader = True
+        if self._timeline_playback_after_id:
+            try:
+                self.root.after_cancel(self._timeline_playback_after_id)
+            except Exception:
+                pass
+            self._timeline_playback_after_id = None
+        self._timeline_mci_stop()
+        with self._timeline_proc_lock:
+            proc = self._timeline_ffmpeg_proc
+            self._timeline_ffmpeg_proc = None
+        if proc:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        self._timeline_frame_queue = None
+
+    def _timeline_play(self):
+        """Start or resume playback from _timeline_playback_pos."""
+        scenes = self._get_timeline_ordered_scenes()
+        if not scenes:
+            return
+        # Build clip list
+        self._timeline_clip_list = []
+        t = 0.0
+        for sc in scenes:
+            dur = sc.get("duration") or 5.0
+            self._timeline_clip_list.append((sc.get("clip_path", ""), t, dur))
+            t += dur
+        self._timeline_total_duration = t
+        if not self._timeline_clip_list:
+            return
+
+        # Find which clip we're in
+        pos = self._timeline_playback_pos
+        clip_idx = 0
+        skip_sec = pos
+        for i, (cp, start, dur) in enumerate(self._timeline_clip_list):
+            if start <= pos < start + dur:
+                clip_idx = i
+                skip_sec = pos - start
+                break
+        else:
+            # Past end
+            self._timeline_playback_pos = 0.0
+            clip_idx = 0
+            skip_sec = 0.0
+
+        # Open audio
+        if self.timeline_selected_audio and os.path.exists(self.timeline_selected_audio):
+            self._timeline_mci_open(self.timeline_selected_audio)
+            self._timeline_mci_play(pos * 1000)
+            if self._timeline_mci_open_ok and hasattr(self, "timeline_status_label"):
+                self.timeline_status_label.config(
+                    text=f"Playing: {os.path.basename(self.timeline_selected_audio)}"
+                )
+        elif not self.timeline_selected_audio and hasattr(self, "timeline_status_label"):
+            self.timeline_status_label.config(text="No audio selected — video plays silently.")
+        elif self.timeline_selected_audio and not os.path.exists(self.timeline_selected_audio):
+            if hasattr(self, "timeline_status_label"):
+                self.timeline_status_label.config(
+                    text=f"Audio file not found: {os.path.basename(self.timeline_selected_audio)}"
+                )
+
+        # Start video reader
+        self._timeline_stop_reader = False
+        self._timeline_frame_queue = queue.Queue(maxsize=6)
+        self._timeline_current_clip_idx = clip_idx
+        cp, _, _ = self._timeline_clip_list[clip_idx]
+        # Wall-clock sync: track where in the timeline this reader started and
+        # how many frames have been consumed so we can gate display to real-time.
+        self._timeline_reader_start_pos = pos
+        self._timeline_reader_frames_consumed = 0
+        if cp and os.path.exists(cp):
+            threading.Thread(
+                target=self._timeline_frame_reader,
+                args=(cp, skip_sec, clip_idx),
+                daemon=True
+            ).start()
+
+        self._timeline_play_wall_start = time.monotonic() - pos
+        self._timeline_playback_active = True
+        self._update_transport_buttons()
+        self._timeline_display_tick()
+
+    def _timeline_pause(self):
+        """Pause: keep position."""
+        self._timeline_playback_active = False
+        self._timeline_cleanup_playback()
+        self._update_transport_buttons()
+
+    def _timeline_stop(self):
+        """Stop and reset to beginning."""
+        self._timeline_playback_active = False
+        self._timeline_cleanup_playback()
+        self._timeline_playback_pos = 0.0
+        self._timeline_draw_playhead(0.0)
+        self._timeline_autoscroll_to_pos(0.0)
+        self._timeline_update_time_label(0.0)
+        self._update_transport_buttons()
+
+    def _update_transport_buttons(self):
+        if not hasattr(self, "timeline_play_btn"):
+            return
+        if self._timeline_playback_active:
+            self.timeline_play_btn.config(text="\u23f8  Pause")
+        else:
+            self.timeline_play_btn.config(text="\u25b6  Play")
+
+    def _timeline_toggle_play(self):
+        if self._timeline_playback_active:
+            self._timeline_pause()
+        else:
+            self._timeline_play()
+
+    def _timeline_toggle_follow(self):
+        """Toggle whether the canvas auto-scrolls to keep the playhead visible."""
+        self._timeline_follow_playhead = not getattr(self, "_timeline_follow_playhead", True)
+        on = self._timeline_follow_playhead
+        if hasattr(self, "timeline_follow_btn"):
+            self.timeline_follow_btn.config(text="↦ Follow: ON" if on else "↦ Follow: OFF")
+            self._style_button(self.timeline_follow_btn, "primary" if on else "ghost", compact=True)
+
+    # ── Display tick (main-thread loop) ──────────────────────────────────
+
+    def _timeline_display_tick(self):
+        if not self._timeline_playback_active:
+            return
+        pos = time.monotonic() - self._timeline_play_wall_start
+        self._timeline_playback_pos = pos
+
+        # Consume frames from queue gated to wall-clock time so the preview
+        # plays at real-time speed and stays in sync with the MCI audio.
+        # target_frame = the index of the frame that *should* be on screen now
+        # based on how many seconds have elapsed since this reader started.
+        q = self._timeline_frame_queue
+        frame_img = None
+        clip_idx_got = None
+        if q:
+            target_frame = int(
+                (pos - getattr(self, "_timeline_reader_start_pos", pos))
+                * self._TL_PREVIEW_FPS
+            )
+            while self._timeline_reader_frames_consumed <= target_frame:
+                try:
+                    ci, img = q.get_nowait()
+                    if img is None:
+                        # Clip finished — start next reader
+                        next_idx = ci + 1
+                        if next_idx < len(self._timeline_clip_list):
+                            self._timeline_current_clip_idx = next_idx
+                            cp, start, dur = self._timeline_clip_list[next_idx]
+                            if cp and os.path.exists(cp):
+                                self._timeline_frame_queue = queue.Queue(maxsize=6)
+                                self._timeline_stop_reader = False
+                                # Reset counters so next clip syncs from its own start
+                                self._timeline_reader_start_pos = start
+                                self._timeline_reader_frames_consumed = 0
+                                threading.Thread(
+                                    target=self._timeline_frame_reader,
+                                    args=(cp, 0.0, next_idx),
+                                    daemon=True
+                                ).start()
+                        break
+                    clip_idx_got = ci
+                    frame_img = img
+                    self._timeline_reader_frames_consumed += 1
+                except queue.Empty:
+                    break
+
+        # Update preview
+        if frame_img is not None:
+            try:
+                photo = ImageTk.PhotoImage(frame_img)
+                self._timeline_preview_photo = photo
+                self.timeline_preview_canvas.create_image(0, 0, anchor="nw", image=photo)
+            except Exception:
+                pass
+
+        # Update scene label
+        scene_label = ""
+        for i, (cp, start, dur) in enumerate(self._timeline_clip_list):
+            if start <= pos < start + dur:
+                # Find scene name
+                scenes = self._get_timeline_ordered_scenes()
+                if i < len(scenes):
+                    sc = scenes[i]
+                    scene_label = f"Scene {sc.get('scene_order',0):02d}  ·  {sc.get('prompt_excerpt','')[:40]}"
+                break
+        if hasattr(self, "timeline_preview_scene_label"):
+            self.timeline_preview_scene_label.config(text=scene_label)
+
+        # Update time
+        self._timeline_update_time_label(pos)
+
+        # Move playhead
+        self._timeline_draw_playhead(pos)
+        self._timeline_autoscroll_to_pos(pos)
+
+        # End of timeline
+        if pos >= self._timeline_total_duration and self._timeline_total_duration > 0:
+            self._timeline_stop()
+            return
+
+        self._timeline_playback_after_id = self.root.after(
+            int(1000 / self._TL_PREVIEW_FPS), self._timeline_display_tick
+        )
+
+    def _timeline_update_time_label(self, pos):
+        if not hasattr(self, "timeline_preview_time_label"):
+            return
+        total = self._timeline_total_duration
+        def fmt(s):
+            s = max(0.0, s)
+            m = int(s) // 60
+            return f"{m}:{int(s) % 60:02d}"
+        self.timeline_preview_time_label.config(text=f"{fmt(pos)} / {fmt(total)}")
+
+    # ── Playhead + autoscroll ─────────────────────────────────────────────
+
+    def _timeline_pos_to_x(self, pos_sec):
+        pps = self.timeline_px_per_second
+        PAD = self._TL_PADDING
+        x = PAD
+        for cp, start, dur in self._timeline_clip_list:
+            w = max(self._TL_MIN_CARD_W, int(dur * pps))
+            if start <= pos_sec <= start + dur:
+                x += int((pos_sec - start) * pps)
+                return x
+            x += w + self._TL_GAP
+        return x
+
+    def _timeline_x_to_pos(self, canvas_x):
+        """Inverse of _timeline_pos_to_x: map a canvas x-coordinate to seconds."""
+        pps = self.timeline_px_per_second
+        PAD = self._TL_PADDING
+        x = PAD
+        for cp, start, dur in self._timeline_clip_list:
+            w = max(self._TL_MIN_CARD_W, int(dur * pps))
+            if canvas_x <= x + w:
+                offset = max(0.0, canvas_x - x) / pps
+                return min(start + offset, start + dur)
+            x += w + self._TL_GAP
+        # Past end — return total duration
+        return self._timeline_total_duration
+
+    def _timeline_canvas_motion(self, event):
+        """Change cursor to a scrub arrow when hovering over the ruler/audio zone
+        OR within grab-distance of the playhead line."""
+        if not hasattr(self, "timeline_canvas"):
+            return
+        c = self.timeline_canvas
+        cx = c.canvasx(event.x)
+        cy = c.canvasy(event.y)
+        SCRUB_ZONE = self._TL_RULER_H + self._TL_AUDIO_H
+        # Scrub cursor in ruler zone
+        if cy <= SCRUB_ZONE:
+            c.configure(cursor="sb_h_double_arrow")
+            return
+        # Scrub cursor near playhead line (anywhere vertically)
+        if getattr(self, "_timeline_clip_list", None):
+            ph_x = self._timeline_pos_to_x(self._timeline_playback_pos)
+            if abs(cx - ph_x) <= 7:
+                c.configure(cursor="sb_h_double_arrow")
+                return
+        c.configure(cursor="")
+
+    def _timeline_draw_playhead(self, pos_sec):
+        if not hasattr(self, "timeline_canvas"):
+            return
+        c = self.timeline_canvas
+        x = self._timeline_pos_to_x(pos_sec)
+        CARD_Y = self._TL_RULER_H + self._TL_AUDIO_H + 6
+        total_h = CARD_Y + self._TL_CARD_H + 30
+        c.delete("playhead")
+        c.create_line(x, 0, x, total_h, fill="#ff3b3b", width=2, tags="playhead")
+        # Triangle marker at top
+        c.create_polygon(x-6, 0, x+6, 0, x, 10, fill="#ff3b3b", outline="", tags="playhead")
+        c.tag_raise("playhead")
+
+    def _timeline_autoscroll_to_pos(self, pos_sec):
+        if not hasattr(self, "timeline_canvas"):
+            return
+        if not getattr(self, "_timeline_follow_playhead", True):
+            return
+        c = self.timeline_canvas
+        try:
+            sr = c.cget("scrollregion").split()
+            if len(sr) < 3:
+                return
+            total_w = float(sr[2])
+        except Exception:
+            return
+        if total_w <= 0:
+            return
+        x = self._timeline_pos_to_x(pos_sec)
+        canvas_w = c.winfo_width() or 400
+        frac = max(0.0, (x - canvas_w * 0.35) / total_w)
+        c.xview_moveto(frac)
+
+    # ── Canvas rendering ──────────────────────────────────────────────────
+
+    def refresh_timeline_editor(self):
+        if not hasattr(self, "timeline_canvas"):
+            return
+        self._timeline_update_audio_selector()
+        self.timeline_status_label.config(text="Loading clips…")
+        scenes = self._get_timeline_ordered_scenes()
+        if not scenes:
+            self.timeline_status_label.config(
+                text="No scenes with video output found. Generate videos in Video Generation tab first."
+            )
+            self._draw_timeline_canvas([])
+            return
+
+        def _probe():
+            for sc in scenes:
+                cp = sc.get("clip_path", "")
+                if cp and os.path.exists(cp):
+                    sc["duration"] = self._probe_clip_duration(cp)
+            self.root.after(0, lambda: self._draw_timeline_canvas(scenes))
+
+        threading.Thread(target=_probe, daemon=True).start()
+
+    def _draw_timeline_canvas(self, scenes):
+        c = self.timeline_canvas
+        c.delete("all")
+        self._timeline_thumb_images.clear()
+        colors = self.colors
+        pps     = self.timeline_px_per_second
+        RULER_H = self._TL_RULER_H
+        AUDIO_H = self._TL_AUDIO_H
+        CARD_Y  = RULER_H + AUDIO_H + 6
+        CARD_H  = self._TL_CARD_H
+        PAD     = self._TL_PADDING
+        GAP     = self._TL_GAP
+        MIN_W   = self._TL_MIN_CARD_W
+
+        if not scenes:
+            c.create_text(
+                PAD, CARD_Y + 30, text="No scenes available.",
+                anchor="nw", fill=colors["text_muted"], font=self.fonts["body"]
+            )
+            c.configure(scrollregion=(0, 0, 500, CARD_Y + CARD_H + 40))
+            self._timeline_clip_list = []
+            self._timeline_total_duration = 0.0
+            self.timeline_export_btn.config(state=tk.DISABLED)
+            self.timeline_status_label.config(text="No scenes found.")
+            return
+
+        # Compute positions
+        positions = []
+        x = PAD
+        total_dur = 0.0
+        for sc in scenes:
+            dur = sc.get("duration") or 5.0
+            w = max(MIN_W, int(dur * pps))
+            positions.append((sc, x, w))
+            x += w + GAP
+            total_dur += dur
+        total_w = x + PAD
+        total_h = CARD_Y + CARD_H + 30
+
+        # Rebuild clip list for playback engine
+        self._timeline_clip_list = []
+        t = 0.0
+        for sc, _, _ in positions:
+            dur = sc.get("duration") or 5.0
+            self._timeline_clip_list.append((sc.get("clip_path", ""), t, dur))
+            t += dur
+        self._timeline_total_duration = total_dur
+
+        # ── Time ruler ──
+        # Draw in a single pass over integer seconds to avoid duplicate labels at
+        # clip boundaries (where the last tick of clip N and first tick of clip N+1
+        # map to the same absolute second and would overlap).
+        ruler_bg = colors.get("surface_alt", "#2a2a2a")
+        c.create_rectangle(0, 0, total_w, RULER_H, fill=ruler_bg, outline="")
+        for ai in range(0, int(total_dur) + 2):
+            abs_s = float(ai)
+            if abs_s > total_dur + 0.01:
+                break
+            # Map absolute seconds → canvas x by finding the clip that contains it
+            t_acc = 0.0
+            tx = None
+            for sc, sc_x, sc_w in positions:
+                dur = sc.get("duration") or 5.0
+                if abs_s <= t_acc + dur + 0.001:
+                    tx = sc_x + int((abs_s - t_acc) * pps)
+                    break
+                t_acc += dur
+            if tx is None:
+                continue
+            if ai % 10 == 0:
+                c.create_line(tx, 0, tx, RULER_H, fill=colors["text"], width=1)
+                c.create_text(tx + 2, 3, text=f"{ai}s", anchor="nw",
+                              fill=colors["text"], font=self.fonts["micro"])
+            elif ai % 5 == 0:
+                c.create_line(tx, RULER_H // 2, tx, RULER_H, fill=colors["text_muted"], width=1)
+                c.create_text(tx + 2, RULER_H // 2 + 1, text=f"{ai}s", anchor="nw",
+                              fill=colors["text_muted"], font=self.fonts["micro"])
+            else:
+                c.create_line(tx, RULER_H - 6, tx, RULER_H, fill=colors["border"], width=1)
+
+        # ── Audio bar ──
+        audio_path = self.timeline_selected_audio or self.current_generated_audio
+        audio_ok = bool(audio_path and os.path.exists(audio_path))
+        audio_bg  = colors["accent"] if audio_ok else colors["surface_soft"]
+        c.create_rectangle(PAD, RULER_H, total_w - PAD, RULER_H + AUDIO_H,
+                            fill=audio_bg, outline="")
+        audio_text = ("♪  " + os.path.basename(audio_path)) if audio_ok else "♪  No audio selected"
+        c.create_text(PAD + 6, RULER_H + 3, text=audio_text, anchor="nw",
+                      fill=colors["text"] if audio_ok else colors["text_muted"],
+                      font=self.fonts["small"])
+
+        # ── Scene cards ──
+        THUMB_W = min(sc_w - 8 for _, sc_x, sc_w in positions) if positions else 80
+        THUMB_W = min(THUMB_W, 120)
+        THUMB_H = int(THUMB_W * 9 / 16)
+        for display_num, (sc, sc_x, sc_w) in enumerate(positions, start=1):
+            scene_id    = sc["scene_id"]
+            tag         = f"clip_{scene_id}"
+            dur         = sc.get("duration") or 0.0
+            excerpt     = sc.get("prompt_excerpt", "")
+            thumb_path  = sc.get("thumb_path", "")
+
+            # Card shadow
+            c.create_rectangle(sc_x + 3, CARD_Y + 3, sc_x + sc_w + 3, CARD_Y + CARD_H + 3,
+                                fill="#000000", outline="", tags=(tag,))
+            # Card bg
+            c.create_rectangle(sc_x, CARD_Y, sc_x + sc_w, CARD_Y + CARD_H,
+                                fill=colors["card"], outline=colors["accent"], width=2,
+                                tags=(tag, "card"))
+
+            # Thumbnail — fill width of card
+            tw = sc_w - 6
+            th = max(30, int(tw * 9 / 16))
+            thumb_loaded = False
+            if thumb_path and os.path.exists(thumb_path):
+                try:
+                    img = Image.open(thumb_path)
+                    img = img.resize((tw, th), Image.LANCZOS)
+                    photo = ImageTk.PhotoImage(img)
+                    self._timeline_thumb_images.append(photo)
+                    c.create_image(sc_x + 3, CARD_Y + 3, anchor="nw", image=photo, tags=(tag,))
+                    thumb_loaded = True
+                except Exception:
+                    pass
+            if not thumb_loaded:
+                c.create_rectangle(sc_x + 3, CARD_Y + 3, sc_x + sc_w - 3, CARD_Y + 3 + th,
+                                   fill=colors["surface_soft"], outline=colors["border"], tags=(tag,))
+                c.create_text(sc_x + sc_w // 2, CARD_Y + 3 + th // 2,
+                              text="No preview", fill=colors["text_muted"],
+                              font=self.fonts["micro"], tags=(tag,))
+
+            # Overlay strip at bottom of thumbnail
+            strip_y = CARD_Y + 3 + th
+            c.create_rectangle(sc_x + 3, strip_y, sc_x + sc_w - 3, strip_y + 18,
+                                fill=colors["surface"], outline="", tags=(tag,))
+            c.create_text(sc_x + 6, strip_y + 2, text=f"Scene {display_num:02d}", anchor="nw",
+                          fill=colors["text"], font=self.fonts["body_strong"], tags=(tag,))
+            c.create_text(sc_x + sc_w - 5, strip_y + 2, text=f"{dur:.1f}s", anchor="ne",
+                          fill=colors["text_muted"], font=self.fonts["small"], tags=(tag,))
+
+            # Prompt excerpt
+            max_chars = max(8, (sc_w - 12) // 6)
+            short = excerpt[:max_chars] + ("…" if len(excerpt) > max_chars else "")
+            c.create_text(sc_x + 6, strip_y + 22,
+                          text=short, anchor="nw",
+                          fill=colors["text_muted"], font=self.fonts["small"], tags=(tag,))
+
+        c.configure(scrollregion=(0, 0, total_w, total_h))
+
+        # Redraw playhead on top
+        self._timeline_draw_playhead(self._timeline_playback_pos)
+
+        has_clips = any(sc.get("clip_path") and os.path.exists(sc.get("clip_path", "")) for sc in scenes)
+        self.timeline_export_btn.config(state=tk.NORMAL if has_clips else tk.DISABLED)
+        n = len(scenes)
+        total_str = f"{int(total_dur//60)}:{int(total_dur)%60:02d}"
+        self.timeline_status_label.config(
+            text=f"{n} scene{'s' if n!=1 else ''}  ·  {total_str} total  ·  Drag cards to reorder"
+        )
+        self._timeline_current_scenes = list(positions)
+
+    def _timeline_zoom(self, direction):
+        self.timeline_px_per_second = max(20, min(300, self.timeline_px_per_second + direction * 20))
+        scenes = [sc for sc, _, _ in getattr(self, "_timeline_current_scenes", [])]
+        self._draw_timeline_canvas(scenes)
+
+    # ── Drag & drop ───────────────────────────────────────────────────────
+
+    def _timeline_drag_start(self, event):
+        c = self.timeline_canvas
+        cx = c.canvasx(event.x)
+        cy = c.canvasy(event.y)
+
+        # ── Scrub mode: click in ruler/audio zone OR anywhere near playhead ──
+        SCRUB_ZONE = self._TL_RULER_H + self._TL_AUDIO_H
+        near_playhead = (
+            getattr(self, "_timeline_clip_list", None)
+            and abs(cx - self._timeline_pos_to_x(self._timeline_playback_pos)) <= 7
+        )
+        if cy <= SCRUB_ZONE or near_playhead:
+            was_playing = self._timeline_playback_active
+            if was_playing:
+                self._timeline_pause()
+            pos = max(0.0, min(self._timeline_x_to_pos(cx), self._timeline_total_duration))
+            self._timeline_playback_pos = pos
+            self._timeline_draw_playhead(pos)
+            self._timeline_update_time_label(pos)
+            self._timeline_drag_state = {"mode": "scrub", "was_playing": was_playing}
+            return
+
+        # ── Card drag mode: click on a scene clip ─────────────────────────
+        items = c.find_overlapping(cx - 2, cy - 2, cx + 2, cy + 2)
+        scene_id = None
+        for item in items:
+            for t in c.gettags(item):
+                if t.startswith("clip_"):
+                    scene_id = t[len("clip_"):]
+                    break
+            if scene_id:
+                break
+        if not scene_id:
+            self._timeline_drag_state = None
+            return
+        # Highlight selected card
+        c.itemconfig(f"clip_{scene_id}&&card", outline=self.colors.get("primary", "#ffffff"), width=3)
+        c.tag_raise(f"clip_{scene_id}")
+        self._timeline_drag_state = {
+            "scene_id": scene_id,
+            "start_x": cx,
+            "last_x": cx,
+            "dragging": False,
+            "was_playing": self._timeline_playback_active,
+            "saved_pos": self._timeline_playback_pos,
+        }
+        if self._timeline_playback_active:
+            self._timeline_pause()
+
+    def _timeline_drag_move(self, event):
+        if not self._timeline_drag_state:
+            return
+        c = self.timeline_canvas
+        cx = c.canvasx(event.x)
+
+        if self._timeline_drag_state.get("mode") == "scrub":
+            pos = max(0.0, min(self._timeline_x_to_pos(cx), self._timeline_total_duration))
+            self._timeline_playback_pos = pos
+            self._timeline_draw_playhead(pos)
+            self._timeline_update_time_label(pos)
+            # ── Edge-scroll when dragging near canvas edges ───────────────
+            EDGE_ZONE = 50
+            widget_w = c.winfo_width() or 600
+            try:
+                sr = c.cget("scrollregion").split()
+                total_w = float(sr[2]) if len(sr) >= 3 else 0
+            except Exception:
+                total_w = 0
+            if total_w > 0:
+                lo, _ = c.xview()
+                ex = event.x  # widget-relative (not canvas)
+                if ex < EDGE_ZONE:
+                    speed = (4 + (EDGE_ZONE - ex) * 0.3) / total_w
+                    c.xview_moveto(max(0.0, lo - speed))
+                elif ex > widget_w - EDGE_ZONE:
+                    speed = (4 + (ex - (widget_w - EDGE_ZONE)) * 0.3) / total_w
+                    c.xview_moveto(min(1.0, lo + speed))
+            return
+
+        # Card drag
+        dx = cx - self._timeline_drag_state["last_x"]
+        scene_id = self._timeline_drag_state["scene_id"]
+        c.move(f"clip_{scene_id}", dx, 0)
+        self._timeline_drag_state["last_x"] = cx
+        self._timeline_drag_state["dragging"] = True
+
+    def _timeline_drag_release(self, event):
+        if not self._timeline_drag_state:
+            return
+        state = self._timeline_drag_state
+        self._timeline_drag_state = None
+
+        # ── Scrub release ────────────────────────────────────────────────
+        if state.get("mode") == "scrub":
+            c = self.timeline_canvas
+            cx = c.canvasx(event.x)
+            pos = max(0.0, min(self._timeline_x_to_pos(cx), self._timeline_total_duration))
+            self._timeline_playback_pos = pos
+            self._timeline_draw_playhead(pos)
+            self._timeline_update_time_label(pos)
+            if state["was_playing"]:
+                self._timeline_play()
+            return
+
+        # ── Card drag release ─────────────────────────────────────────────
+        scene_id    = state["scene_id"]
+        was_playing = state["was_playing"]
+        saved_pos   = state["saved_pos"]
+        c = self.timeline_canvas
+
+        # Restore card border
+        c.itemconfig(f"clip_{scene_id}&&card", outline=self.colors["accent"], width=2)
+
+        # Click-to-play (no drag)
+        if not state["dragging"] or abs(c.canvasx(event.x) - state["start_x"]) < 6:
+            for sc, _, _ in getattr(self, "_timeline_current_scenes", []):
+                if sc["scene_id"] == scene_id:
+                    cp = sc.get("clip_path", "")
+                    if cp and os.path.exists(cp):
+                        self.play_video(cp)
+                    break
+            if was_playing:
+                self._timeline_playback_pos = saved_pos
+                self._timeline_play()
+            return
+
+        # Reorder by center-X
+        scenes_list = getattr(self, "_timeline_current_scenes", [])
+        if not scenes_list:
+            self.refresh_timeline_editor()
+            return
+        card_centers = []
+        for sc, orig_x, sc_w in scenes_list:
+            sid = sc["scene_id"]
+            items = c.find_withtag(f"clip_{sid}")
+            if items:
+                bbox = c.bbox(items[0])
+                cx_card = (bbox[0] + bbox[2]) / 2 if bbox else orig_x + sc_w / 2
+            else:
+                cx_card = orig_x + sc_w / 2
+            card_centers.append((cx_card, sc))
+        card_centers.sort(key=lambda t: t[0])
+        self.timeline_arrangement = [sc["scene_id"] for _, sc in card_centers]
+        self._save_timeline_arrangement()
+
+        def _after_redraw():
+            if was_playing:
+                self._timeline_playback_pos = saved_pos
+                self._timeline_play()
+
+        self.root.after(0, lambda: (self.refresh_timeline_editor(), self.root.after(200, _after_redraw)))
+
+    # ── Tab layout ────────────────────────────────────────────────────────
+
+    def setup_timeline_editor_tab(self):
+        """Build the full NLE-style Timeline Editor tab."""
+        self._timeline_proc_lock = threading.Lock()
+        bg = self.colors["bg"]
+        surf = self.colors["surface"]
+        surf_alt = self.colors["surface_alt"]
+
+        # ── Top toolbar ──────────────────────────────────────────────────
+        self.timeline_toolbar_frame = tk.Frame(self.timeline_tab, padx=14, pady=6)
+        self.timeline_toolbar_frame.pack(fill=tk.X)
+
+        self.timeline_title_label = tk.Label(
+            self.timeline_toolbar_frame, text="Timeline Editor", anchor=tk.W
+        )
+        self.timeline_title_label.pack(side=tk.LEFT, padx=(0, 16))
+        self._style_label(self.timeline_title_label, "title", bg)
+
+        self.timeline_refresh_btn = tk.Button(
+            self.timeline_toolbar_frame, text="\u21ba  Refresh",
+            command=self.refresh_timeline_editor
+        )
+        self.timeline_refresh_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self._style_button(self.timeline_refresh_btn, "ghost", compact=True)
+
+        self.timeline_zoom_in_btn = tk.Button(
+            self.timeline_toolbar_frame, text="+ Zoom",
+            command=lambda: self._timeline_zoom(1)
+        )
+        self.timeline_zoom_in_btn.pack(side=tk.LEFT, padx=(0, 2))
+        self._style_button(self.timeline_zoom_in_btn, "ghost", compact=True)
+
+        self.timeline_zoom_out_btn = tk.Button(
+            self.timeline_toolbar_frame, text="− Zoom",
+            command=lambda: self._timeline_zoom(-1)
+        )
+        self.timeline_zoom_out_btn.pack(side=tk.LEFT, padx=(0, 14))
+        self._style_button(self.timeline_zoom_out_btn, "ghost", compact=True)
+
+        self.timeline_follow_btn = tk.Button(
+            self.timeline_toolbar_frame, text="↦ Follow: ON",
+            command=self._timeline_toggle_follow
+        )
+        self.timeline_follow_btn.pack(side=tk.LEFT, padx=(0, 14))
+        self._style_button(self.timeline_follow_btn, "primary", compact=True)
+
+        # Song selector
+        song_lbl = tk.Label(self.timeline_toolbar_frame, text="\U0001f3b5  Song:", anchor=tk.W)
+        song_lbl.pack(side=tk.LEFT, padx=(0, 4))
+        self._style_label(song_lbl, "muted", bg)
+        self.timeline_toolbar_song_lbl = song_lbl
+
+        self.timeline_song_combo = ttk.Combobox(
+            self.timeline_toolbar_frame, width=32, state="readonly"
+        )
+        self.timeline_song_combo.pack(side=tk.LEFT, padx=(0, 8))
+        self.timeline_song_combo.bind("<<ComboboxSelected>>", self._timeline_on_audio_selected)
+
+        self.timeline_no_audio_label = tk.Label(
+            self.timeline_toolbar_frame,
+            text="Generate a song in Music Studio first.",
+            anchor=tk.W
+        )
+        self._style_label(self.timeline_no_audio_label, "muted", bg)
+
+        self.timeline_export_btn = tk.Button(
+            self.timeline_toolbar_frame, text="\u25b6  Export Video",
+            command=self._export_timeline_video, state=tk.DISABLED
+        )
+        self.timeline_export_btn.pack(side=tk.RIGHT, padx=(8, 0))
+        self._style_button(self.timeline_export_btn, "primary", compact=True)
+
+        self.timeline_header_frame = self.timeline_toolbar_frame  # alias for theme compat
+
+        # ── Body: full-width preview strip + full-width timeline rail ────
+        self.timeline_body_frame = tk.Frame(self.timeline_tab)
+        self.timeline_body_frame.pack(fill=tk.BOTH, expand=True, padx=14, pady=(0, 6))
+
+        # ── Preview area (fixed-height row: canvas left, info right) ────
+        self.timeline_preview_frame = tk.Frame(self.timeline_body_frame, height=290)
+        self.timeline_preview_frame.pack(fill=tk.X, pady=(0, 6))
+        self.timeline_preview_frame.pack_propagate(False)
+
+        # Preview canvas (left side of preview row)
+        self.timeline_preview_canvas = tk.Canvas(
+            self.timeline_preview_frame,
+            width=self._TL_PREVIEW_W, height=self._TL_PREVIEW_H,
+            bd=0, highlightthickness=1,
+            bg="#0a0a0a"
+        )
+        self.timeline_preview_canvas.pack(side=tk.LEFT, pady=8)
+        # Idle placeholder
+        self.timeline_preview_canvas.create_text(
+            self._TL_PREVIEW_W // 2, self._TL_PREVIEW_H // 2,
+            text="\u25b6", fill="#444444", font=("Helvetica", 48)
+        )
+
+        # Info panel (right side of preview row): scene, time, transport, audio
+        self.timeline_info_panel = tk.Frame(self.timeline_preview_frame)
+        self.timeline_info_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=20, pady=8)
+
+        # Scene info label
+        self.timeline_preview_scene_label = tk.Label(
+            self.timeline_info_panel, text="", anchor=tk.W, wraplength=500
+        )
+        self.timeline_preview_scene_label.pack(fill=tk.X)
+        self._style_label(self.timeline_preview_scene_label, "body_strong", bg)
+
+        # Time label
+        self.timeline_preview_time_label = tk.Label(
+            self.timeline_info_panel, text="0:00 / 0:00", anchor=tk.W
+        )
+        self.timeline_preview_time_label.pack(fill=tk.X, pady=(4, 14))
+        self._style_label(self.timeline_preview_time_label, "muted", bg)
+
+        # Transport controls
+        transport_row = tk.Frame(self.timeline_info_panel)
+        transport_row.pack(anchor=tk.W, pady=(0, 10))
+
+        self.timeline_play_btn = tk.Button(
+            transport_row, text="\u25b6  Play", width=10,
+            command=self._timeline_toggle_play
+        )
+        self.timeline_play_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self._style_button(self.timeline_play_btn, "primary", compact=True)
+
+        self.timeline_stop_btn = tk.Button(
+            transport_row, text="\u25a0  Stop", width=8,
+            command=self._timeline_stop
+        )
+        self.timeline_stop_btn.pack(side=tk.LEFT)
+        self._style_button(self.timeline_stop_btn, "ghost", compact=True)
+
+        # Audio note
+        self.timeline_audio_row = tk.Frame(self.timeline_info_panel)
+        self.timeline_audio_row.pack(fill=tk.X)
+
+        self.timeline_audio_info_label = tk.Label(
+            self.timeline_audio_row, text="", anchor=tk.W, wraplength=500
+        )
+        self.timeline_audio_info_label.pack(fill=tk.X)
+        self._style_label(self.timeline_audio_info_label, "muted", bg)
+
+        # ── Timeline rail: full-width canvas below the preview ───────────
+        self.timeline_rail_frame = tk.Frame(self.timeline_body_frame)
+        self.timeline_rail_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.timeline_vscrollbar = tk.Scrollbar(self.timeline_rail_frame, orient="vertical")
+        self.timeline_vscrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.timeline_hscrollbar = tk.Scrollbar(self.timeline_rail_frame, orient="horizontal")
+        self.timeline_hscrollbar.pack(side=tk.BOTTOM, fill=tk.X)
+
+        self.timeline_canvas = tk.Canvas(
+            self.timeline_rail_frame, bd=0, highlightthickness=0,
+            xscrollcommand=self.timeline_hscrollbar.set,
+            yscrollcommand=self.timeline_vscrollbar.set,
+            bg=surf,
+        )
+        self.timeline_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.timeline_hscrollbar.config(command=self.timeline_canvas.xview)
+        self.timeline_vscrollbar.config(command=self.timeline_canvas.yview)
+
+        self.timeline_canvas.bind("<Button-1>", self._timeline_drag_start)
+        self.timeline_canvas.bind("<B1-Motion>", self._timeline_drag_move)
+        self.timeline_canvas.bind("<ButtonRelease-1>", self._timeline_drag_release)
+        self.timeline_canvas.bind("<Motion>", self._timeline_canvas_motion)
+
+        # Status bar
+        self.timeline_status_row = tk.Frame(self.timeline_tab, padx=14, pady=3)
+        self.timeline_status_row.pack(fill=tk.X)
+
+        self.timeline_status_label = tk.Label(
+            self.timeline_status_row, text="Click Refresh to load scenes.", anchor=tk.W
+        )
+        self.timeline_status_label.pack(side=tk.LEFT)
+        self._style_label(self.timeline_status_label, "muted", bg)
+
+        # Backward-compat aliases for theming
+        self.timeline_left_panel = self.timeline_preview_frame
+        self.timeline_right_panel = self.timeline_rail_frame
+        self.timeline_canvas_shell = self.timeline_rail_frame
+        self.timeline_subtitle_label = self.timeline_status_label
+        self.timeline_audio_static_label = self.timeline_audio_info_label
+
+        self._timeline_current_scenes = []
+        self._timeline_audio_paths = []
+        self._timeline_follow_playhead = True
+
+    # ── Export ────────────────────────────────────────────────────────────
+
+    def _export_timeline_video(self):
+        scenes = self._get_timeline_ordered_scenes()
+        filepaths = [
+            sc["clip_path"] for sc in scenes
+            if sc.get("clip_path") and os.path.exists(sc.get("clip_path", ""))
+        ]
+        if not filepaths:
+            messagebox.showwarning("No Clips", "No video clips found in the timeline.")
+            return
+
+        audio = self.timeline_selected_audio or self.current_generated_audio
+        merge_audio = False
+        if audio and os.path.exists(audio):
+            merge_audio = messagebox.askyesno(
+                "Merge Audio?",
+                f"Merge selected audio into the exported video?\n\n{os.path.basename(audio)}"
+            )
+
+        self.timeline_export_btn.config(state=tk.DISABLED)
+        self.timeline_status_label.config(text="Exporting timeline video…")
+
+        def _do_export():
+            stitch_out = None
+            try:
+                timestamp = int(time.time())
+                list_file = f"timeline_concat_{timestamp}.txt"
+                try:
+                    with open(list_file, "w", encoding="utf-8") as f:
+                        for p in filepaths:
+                            f.write(f"file '{p.replace(chr(92), '/')}'\n")
+                    stitch_out = os.path.join(self.stitched_dir, f"timeline_export_{timestamp}.mp4")
+                    cmd = [
+                        FFMPEG_PATH, "-y", "-f", "concat", "-safe", "0",
+                        "-i", list_file, "-c:v", "copy", "-an", stitch_out
+                    ]
+                    subprocess.run(cmd, creationflags=subprocess.CREATE_NO_WINDOW,
+                                   capture_output=True, text=True, check=True)
+                finally:
+                    if os.path.exists(list_file):
+                        try:
+                            os.remove(list_file)
+                        except Exception:
+                            pass
+
+                final_out = stitch_out
+                if merge_audio and stitch_out and os.path.exists(stitch_out):
+                    merged_out = os.path.join(
+                        self.final_mv_dir, f"Timeline_Music_Video_{timestamp}.mp4"
+                    )
+                    merge_cmd = [
+                        FFMPEG_PATH, "-y",
+                        "-i", stitch_out, "-i", audio,
+                        "-map", "0:v:0", "-map", "1:a:0",
+                        "-c:v", "copy", "-c:a", "aac", "-shortest", merged_out,
+                    ]
+                    subprocess.run(merge_cmd, creationflags=subprocess.CREATE_NO_WINDOW,
+                                   capture_output=True, text=True, check=True)
+                    final_out = merged_out
+
+                def _done(out=final_out):
+                    self.timeline_export_btn.config(state=tk.NORMAL)
+                    self.timeline_status_label.config(
+                        text=f"Export complete: {os.path.basename(out)}")
+                    self.update_status(f"Timeline export: {os.path.basename(out)}", "green")
+                    self.refresh_gallery()
+                    if messagebox.askyesno("Open File?",
+                                           f"Open the exported video?\n\n{os.path.basename(out)}"):
+                        self.play_video(out)
+
+                self.root.after(0, _done)
+
+            except subprocess.CalledProcessError as e:
+                def _err():
+                    self.timeline_export_btn.config(state=tk.NORMAL)
+                    self.timeline_status_label.config(text="Export failed.")
+                    messagebox.showerror("Export Error", f"FFmpeg error:\n{e.stderr}")
+                self.root.after(0, _err)
+            except Exception as ex:
+                def _err2(exc=ex):
+                    self.timeline_export_btn.config(state=tk.NORMAL)
+                    self.timeline_status_label.config(text=f"Export error: {exc}")
+                    messagebox.showerror("Export Error", str(exc))
+                self.root.after(0, _err2)
+
+        threading.Thread(target=_do_export, daemon=True).start()
 
     def setup_music_tab(self):
         # Left side: Controls
@@ -9534,7 +12027,63 @@ class LTXQueueManager:
         
         self.music_status_label = tk.Label(self.music_actions_card, text="Status: Idle", fg="blue")
         self.music_status_label.pack(anchor="w", pady=(14, 0))
-        
+
+        # --- Songs Library ---
+        self.music_songs_library_section = self._create_collapsible_section(
+            self.music_main_frame,
+            "music_songs_library",
+            "Songs Library",
+            meta_text="No songs yet",
+            is_open=True,
+            body_expand=True
+        )
+        self.music_songs_library_section["container"].pack(fill=tk.X, pady=(0, 12))
+
+        music_songs_card = tk.Frame(self.music_songs_library_section["body"], padx=16, pady=12)
+        music_songs_card.pack(fill=tk.BOTH, expand=True)
+        self.music_songs_library_card = music_songs_card
+
+        # Listbox + scrollbar
+        songs_list_shell = tk.Frame(music_songs_card)
+        songs_list_shell.pack(fill=tk.X)
+        songs_scrollbar = tk.Scrollbar(songs_list_shell, orient="vertical")
+        songs_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.music_songs_listbox = tk.Listbox(
+            songs_list_shell,
+            height=6,
+            activestyle="dotbox",
+            selectmode=tk.SINGLE,
+            yscrollcommand=songs_scrollbar.set,
+            exportselection=False,
+        )
+        self.music_songs_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        songs_scrollbar.config(command=self.music_songs_listbox.yview)
+        self.music_songs_listbox.bind("<<ListboxSelect>>", lambda _e: self._music_songs_update_buttons())
+
+        # Button row
+        songs_btn_row = tk.Frame(music_songs_card)
+        songs_btn_row.pack(fill=tk.X, pady=(8, 0))
+        self.music_songs_preview_btn = tk.Button(
+            songs_btn_row, text="Preview", command=self._music_songs_preview, state=tk.DISABLED
+        )
+        self.music_songs_preview_btn.pack(side=tk.LEFT)
+        self.music_songs_rename_btn = tk.Button(
+            songs_btn_row, text="Rename", command=self._music_songs_rename, state=tk.DISABLED
+        )
+        self.music_songs_rename_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.music_songs_set_active_btn = tk.Button(
+            songs_btn_row, text="Set as Active", command=self._music_songs_set_active, state=tk.DISABLED
+        )
+        self.music_songs_set_active_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.music_songs_delete_btn = tk.Button(
+            songs_btn_row, text="Delete", command=self._music_songs_delete, state=tk.DISABLED
+        )
+        self.music_songs_delete_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self._style_button(self.music_songs_delete_btn, "danger", compact=True)
+
+        self.music_songs_count_label = tk.Label(music_songs_card, text="No songs yet", anchor="w")
+        self.music_songs_count_label.pack(anchor="w", pady=(6, 0))
+
         # --- Selected Video Info ---
         self.music_media_state_section = self._create_collapsible_section(
             self.music_right_frame,
@@ -9973,6 +12522,28 @@ class LTXQueueManager:
         quality_hint.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self._style_label(quality_hint, "muted", auto_body.cget("bg"))
 
+        # ── Video Model Preset selector ──
+        auto_model_row = tk.Frame(auto_body)
+        auto_model_row.pack(fill=tk.X, pady=(0, 8))
+        self._style_panel(auto_model_row, auto_body.cget("bg"))
+
+        model_label = tk.Label(auto_model_row, text="Video Model:")
+        model_label.pack(side=tk.LEFT, padx=(0, 6))
+        self._style_label(model_label, "body_strong", auto_body.cget("bg"))
+
+        self.autonomous_model_preset_combo = ttk.Combobox(
+            auto_model_row, textvariable=self.video_model_preset_var,
+            values=list(self.video_preset_key_to_label.values()),
+            state="readonly", width=22,
+        )
+        self.autonomous_model_preset_combo.pack(side=tk.LEFT, padx=(0, 12))
+        self.autonomous_model_preset_combo.bind("<<ComboboxSelected>>", self.on_video_model_preset_changed)
+
+        self.autonomous_preset_vram_hint = tk.Label(auto_model_row, text="", anchor="w")
+        self.autonomous_preset_vram_hint.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._style_label(self.autonomous_preset_vram_hint, "muted", auto_body.cget("bg"))
+        self._update_preset_vram_label()
+
         auto_btn_row = tk.Frame(auto_body)
         auto_btn_row.pack(fill=tk.X, pady=(0, 8))
         self._style_panel(auto_btn_row, auto_body.cget("bg"))
@@ -10112,7 +12683,7 @@ class LTXQueueManager:
             return default
         return self._get_workflow_role_value_from_roles(self.image_workflow, IMAGE_WORKFLOW_PROFILE["roles"], role_name, default=default)
 
-    def _build_image_filename_prefix(self, mode, index=None):
+    def _build_image_filename_prefix(self, mode, index=None, suffix=None):
         parts = ["z-image"]
         if self.current_project_dir:
             parts.append(self._sanitize_output_token(os.path.basename(self.current_project_dir), fallback="project"))
@@ -10123,6 +12694,9 @@ class LTXQueueManager:
             parts.append(f"{index:02d}")
         else:
             parts.append(str(int(time.time())))
+
+        if suffix:
+            parts.append(self._sanitize_output_token(suffix, fallback="v01"))
 
         return f"images/{'_'.join(parts)}"
 
@@ -11080,7 +13654,12 @@ class LTXQueueManager:
             "upscaler_name"
         ]
 
+        profile = self._get_video_profile(profile_key)
+        profile_roles = profile.get("roles", {})
+
         for role_name in required_roles:
+            if role_name not in profile_roles or profile_roles[role_name] == []:
+                continue
             role_refs = self._get_profile_role_refs(role_name, profile_key)
             if not role_refs:
                 return False, f"Workflow profile is missing the '{role_name}' mapping."
@@ -11130,6 +13709,9 @@ class LTXQueueManager:
 
         for field_name in ["checkpoint_name", "text_encoder_name", "lora_name", "upscaler_name"]:
             if not parsed_settings[field_name]:
+                # Skip validation for fields whose workflow role is [] (unused in this profile)
+                if not self._get_profile_role_refs(field_name):
+                    continue
                 return None, f"{field_name.replace('_', ' ').title()} is required."
 
         if not parsed_settings["output_subfolder"]:
@@ -11139,7 +13721,7 @@ class LTXQueueManager:
 
         return parsed_settings, None
 
-    def _build_video_filename_prefix(self, video_settings, mode, index=None):
+    def _build_video_filename_prefix(self, video_settings, mode, index=None, suffix=None):
         subfolder = self._sanitize_output_token(video_settings.get("output_subfolder", "video"), fallback="video")
         base_name = self._sanitize_output_token(video_settings.get("output_base_name", "LTX2_3_Scene"), fallback="LTX2_3_Scene")
         parts = []
@@ -11156,6 +13738,9 @@ class LTXQueueManager:
             parts.append(f"{index:02d}")
         else:
             parts.append(str(int(time.time())))
+
+        if suffix:
+            parts.append(self._sanitize_output_token(suffix, fallback="v01"))
 
         return f"{subfolder}/{'_'.join(parts)}"
 
@@ -11178,13 +13763,14 @@ class LTXQueueManager:
         if not subdirectory:
             return []
 
+        valid_extensions = ('.safetensors', '.gguf')
         discovered_names = set()
         for root in self._get_available_model_search_roots():
             candidate_dir = os.path.join(root, subdirectory)
             if not os.path.exists(candidate_dir):
                 continue
             for entry in os.scandir(candidate_dir):
-                if entry.is_file() and entry.name.lower().endswith('.safetensors'):
+                if entry.is_file() and entry.name.lower().endswith(valid_extensions):
                     discovered_names.add(entry.name)
 
         return sorted(discovered_names, key=str.lower)
@@ -11354,6 +13940,22 @@ class LTXQueueManager:
         self._set_workflow_role_value(workflow_to_submit, "lora_name", video_settings["lora_name"])
         self._set_workflow_role_value(workflow_to_submit, "upscaler_name", video_settings["upscaler_name"])
 
+        # GGUF-specific roles: unet_name, vae_name, connectors, and audio VAE
+        if self.active_workflow_type in ("gguf", "gguf_distilled"):
+            preset = VIDEO_MODEL_PRESETS.get(self.active_video_model_preset, {})
+            unet_name = preset.get("unet_name", "")
+            if unet_name:
+                self._set_workflow_role_value(workflow_to_submit, "unet_name", unet_name)
+            vae_name = preset.get("vae_name", "")
+            if vae_name:
+                self._set_workflow_role_value(workflow_to_submit, "vae_name", vae_name)
+            connectors_name = preset.get("connectors_name", "")
+            if connectors_name:
+                self._set_workflow_role_value(workflow_to_submit, "connectors_name", connectors_name)
+            audio_vae_name = preset.get("audio_vae_name", "")
+            if audio_vae_name:
+                self._set_workflow_role_value(workflow_to_submit, "audio_vae_name", audio_vae_name)
+
         for role_ref in self._get_profile_role_refs("noise_seed"):
             node_id = str(role_ref["node_id"])
             workflow_to_submit[node_id]["inputs"][role_ref["input"]] = random.randint(1, 999999999999999)
@@ -11369,7 +13971,8 @@ class LTXQueueManager:
             checkpoint=video_settings["checkpoint_name"],
             text_encoder=video_settings["text_encoder_name"],
             lora=video_settings["lora_name"],
-            upscaler=video_settings["upscaler_name"]
+            upscaler=video_settings["upscaler_name"],
+            workflow_type=self.active_workflow_type
         )
         return workflow_to_submit
 
@@ -11436,6 +14039,82 @@ class LTXQueueManager:
         self.api_json_path = self._resolve_video_workflow_path(None, selected_profile)
         self._load_video_workflow_template(force_video_settings=True)
         self._mark_video_preflight_stale("Workflow profile changed. Re-run validation for current settings.")
+        self.save_global_settings()
+
+    def _update_preset_vram_label(self):
+        preset_key = self._get_selected_video_model_preset_key()
+        preset = VIDEO_MODEL_PRESETS.get(preset_key, {})
+        vram_tier = preset.get("vram_tier", "")
+        vram_text = f"VRAM: {vram_tier}" if vram_tier else ""
+        if hasattr(self, "video_preset_vram_label"):
+            self.video_preset_vram_label.config(text=vram_text)
+        if hasattr(self, "autonomous_preset_vram_hint"):
+            self.autonomous_preset_vram_hint.config(text=vram_text)
+
+    def _get_selected_video_model_preset_key(self):
+        selected_label = self.video_model_preset_var.get()
+        return self.video_preset_label_to_key.get(selected_label, "custom")
+
+    def _set_selected_video_model_preset_key(self, preset_key):
+        preset_label = self.video_preset_key_to_label.get(preset_key, self.video_preset_key_to_label.get("custom", "Custom"))
+        self.video_model_preset_var.set(preset_label)
+        self.active_video_model_preset = preset_key
+
+    def _get_active_i2v_profile(self):
+        """Return the I2V workflow profile matching the active workflow type."""
+        wt = self.active_workflow_type
+        if wt == "gguf_distilled":
+            return I2V_WORKFLOW_PROFILES.get("gguf_distilled", I2V_WORKFLOW_PROFILES["gguf"])
+        return I2V_WORKFLOW_PROFILES.get(wt, I2V_WORKFLOW_PROFILES["safetensors"])
+
+    def on_video_model_preset_changed(self, event=None):
+        preset_key = self._get_selected_video_model_preset_key()
+        preset = VIDEO_MODEL_PRESETS.get(preset_key)
+        if not preset:
+            return
+
+        self.active_video_model_preset = preset_key
+        self._update_preset_vram_label()
+
+        if preset_key == "custom":
+            self._mark_video_preflight_stale("Custom preset selected. Configure models manually.")
+            self.save_global_settings()
+            return
+
+        # Determine workflow type and switch profile
+        workflow_type = preset.get("workflow_type", "safetensors")
+        self.active_workflow_type = workflow_type
+
+        if workflow_type == "gguf":
+            target_profile_key = "ltx_2_3_t2v_gguf"
+        elif workflow_type == "gguf_distilled":
+            target_profile_key = "ltx_2_3_t2v_gguf_distilled"
+        else:
+            target_profile_key = "ltx_2_3_t2v"
+
+        # Switch to the correct workflow profile
+        current_profile = self._get_selected_video_profile_key()
+        if current_profile != target_profile_key:
+            self._set_selected_video_profile_key(target_profile_key)
+            self.api_json_path = self._resolve_video_workflow_path(None, target_profile_key)
+            self._load_video_workflow_template(force_video_settings=True)
+
+        # Load the matching I2V workflow
+        i2v_profile = self._get_active_i2v_profile()
+        self.i2v_json_path = i2v_profile["workflow_path"]
+        self._load_i2v_workflow_template()
+
+        # Auto-fill model selections from preset
+        if "checkpoint_name" in preset:
+            self.video_checkpoint_var.set(preset["checkpoint_name"])
+        if "text_encoder_name" in preset:
+            self.video_text_encoder_var.set(preset["text_encoder_name"])
+        if "lora_name" in preset:
+            self.video_lora_var.set(preset["lora_name"])
+        if "upscaler_name" in preset:
+            self.video_upscaler_var.set(preset["upscaler_name"])
+
+        self._mark_video_preflight_stale(f"Preset changed to '{preset['label']}'. Re-run validation.")
         self.save_global_settings()
 
     def reset_video_profile_defaults(self):
@@ -11544,6 +14223,34 @@ class LTXQueueManager:
     def _get_scene_mode_value(self, mode_label):
         return SCENE_MODE_I2V if str(mode_label or "").strip() == "Image to Video" else SCENE_MODE_T2V
 
+    def _normalize_scene_render_status(self, render_status):
+        normalized_status = str(render_status or "pending").strip().lower() or "pending"
+        if normalized_status == "complete":
+            return "ready"
+        return normalized_status
+
+    def _format_scene_render_status(self, render_status):
+        status_value = self._normalize_scene_render_status(render_status)
+        if status_value == "stale":
+            return "Needs Re-render"
+        return status_value.title()
+
+    def _mark_scene_frame_stale(self, frame):
+        if not frame:
+            return
+        current_status = self._normalize_scene_render_status(getattr(frame, "render_status", "pending"))
+        if current_status == "rendering":
+            return
+        self._set_scene_entry_render_state(frame.scene_id, "stale", getattr(frame, "output_path", None))
+        self._schedule_project_state_save()
+
+    def _handle_scene_prompt_edit(self, frame):
+        self._mark_scene_frame_stale(frame)
+
+    def _handle_scene_mode_changed(self, frame):
+        self._refresh_scene_entry_rows()
+        self._mark_scene_frame_stale(frame)
+
     def _get_scene_asset_options(self):
         options = [("Unassigned", "")]
         for asset in self._normalize_image_assets(self.image_assets):
@@ -11587,7 +14294,7 @@ class LTXQueueManager:
 
     def _refresh_scene_entry_rows(self):
         for index, frame in enumerate(self._collect_scene_entry_frames(), start=1):
-            frame.order_label.config(text=f"Scene {index:02d}")
+            frame.order_var.set(str(index))
             self._apply_scene_mode_state(frame)
         self._refresh_scene_asset_choices()
         self.update_scene_scroll_region()
@@ -11616,22 +14323,45 @@ class LTXQueueManager:
         self._style_panel(frame, self.colors["card"], border=True)
         frame.scene_id = scene_data.get("scene_id") or self._generate_entity_id("scene")
         frame.output_path = self._normalize_path(scene_data.get("output_path"))
-        frame.render_status = str(scene_data.get("render_status", "pending")).strip().lower() or "pending"
+        frame.render_status = self._normalize_scene_render_status(scene_data.get("render_status", "pending"))
+        frame.output_versions = copy.deepcopy(scene_data.get("output_versions") or [])
+        frame.active_output_version_id = str(scene_data.get("active_output_version_id") or "").strip() or None
+        frame.version_count_sync_in_progress = False
 
         header_row = tk.Frame(frame, padx=10, pady=8)
         header_row.pack(fill=tk.X)
         self._style_panel(header_row, self.colors["card"])
 
-        frame.order_label = tk.Label(header_row, text="Scene")
-        frame.order_label.pack(side=tk.LEFT)
-        self._style_label(frame.order_label, "section", self.colors["card"])
+        order_prefix_label = tk.Label(header_row, text="Scene")
+        order_prefix_label.pack(side=tk.LEFT)
+        self._style_label(order_prefix_label, "section", self.colors["card"])
+
+        frame.order_var = tk.StringVar(value="")
+        frame.order_label = tk.Entry(
+            header_row,
+            textvariable=frame.order_var,
+            width=3,
+            justify="center",
+            relief=tk.FLAT,
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=self.colors["input_border"],
+            highlightcolor=self.colors["accent"],
+            bg=self.colors["input_bg"],
+            fg=self.colors["text"],
+            insertbackground=self.colors["text"],
+            font=self.fonts["section"],
+        )
+        frame.order_label.pack(side=tk.LEFT, padx=(4, 0))
+        frame.order_label.bind("<Return>", lambda _e, f=frame: self._on_scene_order_entry_confirm(f))
+        frame.order_label.bind("<FocusOut>", lambda _e, f=frame: self._on_scene_order_entry_blur(f))
 
         frame.mode_var = tk.StringVar(value=self._get_scene_mode_label(scene_data.get("mode", SCENE_MODE_T2V)))
         mode_combo = ttk.Combobox(header_row, textvariable=frame.mode_var, state="readonly", values=["Text to Video", "Image to Video"], width=18)
         mode_combo.pack(side=tk.LEFT, padx=(12, 0))
         frame.mode_combo = mode_combo
 
-        frame.status_label = tk.Label(header_row, text=f"Status: {frame.render_status.title()}")
+        frame.status_label = tk.Label(header_row, text=f"Status: {self._format_scene_render_status(frame.render_status)}")
         frame.status_label.pack(side=tk.LEFT, padx=(12, 0))
         self._style_label(frame.status_label, "muted", self.colors["card"])
 
@@ -11650,6 +14380,14 @@ class LTXQueueManager:
         remove_btn = tk.Button(btn_frame, text="Remove", command=lambda f=frame: self.remove_scene_timeline_entry(f))
         remove_btn.pack(side=tk.LEFT, padx=(6, 0))
         self._style_button(remove_btn, "ghost", compact=True)
+
+        frame.render_btn = tk.Button(
+            btn_frame,
+            text="Re-render Scene" if frame.render_status in {"ready", "stale", "failed"} else "Render Scene",
+            command=lambda sid=frame.scene_id: self.start_single_scene_render(sid)
+        )
+        frame.render_btn.pack(side=tk.LEFT, padx=(6, 0))
+        self._style_button(frame.render_btn, "accent", compact=True)
 
         body_row = tk.Frame(frame, padx=10, pady=10)
         body_row.pack(fill=tk.X)
@@ -11680,24 +14418,357 @@ class LTXQueueManager:
         frame.asset_summary_label.grid(row=2, column=1, sticky="ew", pady=(0, 6))
         self._style_label(frame.asset_summary_label, "muted", self.colors["card"])
 
+        versions_label = tk.Label(body_row, text="Versions")
+        versions_label.grid(row=3, column=0, sticky="w", pady=(0, 6))
+        self._style_label(versions_label, "muted", self.colors["card"])
+
+        versions_row = tk.Frame(body_row)
+        versions_row.grid(row=3, column=1, sticky="ew", pady=(0, 6))
+        self._style_panel(versions_row, self.colors["card"])
+
+        count_label = tk.Label(versions_row, text="Generate")
+        count_label.pack(side=tk.LEFT)
+        self._style_label(count_label, "muted", self.colors["card"])
+
+        frame.version_count_var = tk.StringVar(value=str(scene_data.get("version_count", 1)))
+        frame.version_count_spinbox = tk.Spinbox(versions_row, from_=1, to=99, width=4, textvariable=frame.version_count_var)
+        frame.version_count_spinbox.pack(side=tk.LEFT, padx=(6, 6))
+
+        count_suffix_label = tk.Label(versions_row, text="render(s)")
+        count_suffix_label.pack(side=tk.LEFT)
+        self._style_label(count_suffix_label, "muted", self.colors["card"])
+
+        saved_versions_label = tk.Label(versions_row, text="Saved")
+        saved_versions_label.pack(side=tk.LEFT, padx=(14, 6))
+        self._style_label(saved_versions_label, "muted", self.colors["card"])
+
+        frame.version_var = tk.StringVar(value="")
+        frame.version_combo = ttk.Combobox(versions_row, textvariable=frame.version_var, state="readonly", width=42)
+        frame.version_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        versions_actions_row = tk.Frame(body_row)
+        versions_actions_row.grid(row=4, column=1, sticky="ew", pady=(0, 6))
+        self._style_panel(versions_actions_row, self.colors["card"])
+        versions_actions_row.grid_columnconfigure((0, 1), weight=1)
+
+        frame.delete_version_btn = tk.Button(versions_actions_row, text="Delete Selected", command=lambda f=frame: self.delete_selected_scene_version(f))
+        frame.delete_version_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self._style_button(frame.delete_version_btn, "danger", compact=True)
+
+        frame.prune_versions_btn = tk.Button(versions_actions_row, text="Prune Others", command=lambda f=frame: self.prune_scene_versions(f))
+        frame.prune_versions_btn.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        self._style_button(frame.prune_versions_btn, "secondary", compact=True)
+
+        frame.version_summary_label = tk.Label(body_row, text="No saved versions yet.", anchor="w", justify=tk.LEFT, wraplength=680)
+        frame.version_summary_label.grid(row=5, column=1, sticky="ew", pady=(0, 6))
+        self._style_label(frame.version_summary_label, "muted", self.colors["card"])
+
         output_text = os.path.basename(frame.output_path) if frame.output_path and os.path.exists(frame.output_path) else "No render yet"
         frame.output_label = tk.Label(frame, text=output_text, anchor="w")
         frame.output_label.pack(fill=tk.X, padx=10, pady=(0, 10))
         self._style_label(frame.output_label, "muted", self.colors["card"])
 
-        mode_combo.bind("<<ComboboxSelected>>", lambda _event, f=frame: self._refresh_scene_entry_rows())
+        mode_combo.bind("<<ComboboxSelected>>", lambda _event, f=frame: self._handle_scene_mode_changed(f))
+        frame.prompt_text.bind("<KeyRelease>", lambda _event, f=frame: self._handle_scene_prompt_edit(f))
+        frame.version_count_var.trace_add("write", lambda *_args, f=frame: self._handle_scene_version_count_changed(f))
+        frame.version_combo.bind("<<ComboboxSelected>>", lambda _event, f=frame: self._handle_scene_version_selected(f))
         frame.image_asset_combo.bind(
             "<<ComboboxSelected>>",
             lambda _event, f=frame: self._handle_scene_asset_selection(f)
         )
+        # Prevent mousewheel from changing widget values while scrolling the scene list
+        for _w in (mode_combo, frame.image_asset_combo, frame.version_combo, frame.version_count_spinbox):
+            _w.bind("<MouseWheel>", self._redirect_scroll_to_scene_canvas)
+            _w.bind("<Button-4>", self._redirect_scroll_to_scene_canvas)
+            _w.bind("<Button-5>", self._redirect_scroll_to_scene_canvas)
 
         self.scene_entry_frames.append(frame)
+        self._refresh_scene_version_controls(frame)
         self._refresh_scene_entry_rows()
+
+    def _refresh_scene_version_controls(self, frame):
+        prompt_text = frame.prompt_text.get("1.0", tk.END).strip() if hasattr(frame, "prompt_text") else ""
+        scene_entry = self._create_scene_entry(
+            1,
+            mode=self._get_scene_mode_value(frame.mode_var.get()) if hasattr(frame, "mode_var") else SCENE_MODE_T2V,
+            prompt=prompt_text,
+            image_asset_id=getattr(frame, "selected_asset_id", None),
+            scene_id=getattr(frame, "scene_id", None),
+            output_path=getattr(frame, "output_path", None),
+            render_status=getattr(frame, "render_status", "pending"),
+            version_count=frame.version_count_var.get() if hasattr(frame, "version_count_var") else 1,
+            output_versions=getattr(frame, "output_versions", []),
+            active_output_version_id=getattr(frame, "active_output_version_id", None)
+        )
+        frame.output_versions = copy.deepcopy(scene_entry.get("output_versions") or [])
+        frame.active_output_version_id = scene_entry.get("active_output_version_id")
+        frame.output_path = scene_entry.get("output_path")
+        if hasattr(frame, "version_count_var"):
+            normalized_count = str(scene_entry.get("version_count", 1))
+            if frame.version_count_var.get() != normalized_count:
+                frame.version_count_sync_in_progress = True
+                frame.version_count_var.set(normalized_count)
+                frame.version_count_sync_in_progress = False
+
+        option_map = {}
+        option_values = []
+        for version_entry in frame.output_versions:
+            is_active = str(version_entry.get("version_id") or "").strip() == str(frame.active_output_version_id or "").strip()
+            option_label = self._build_scene_output_version_label(version_entry, is_active=is_active)
+            option_map[option_label] = str(version_entry.get("version_id") or "").strip()
+            option_values.append(option_label)
+
+        frame.version_option_map = option_map
+        frame.version_combo["values"] = option_values
+        if option_values:
+            active_label = next((label for label, version_id in option_map.items() if version_id == frame.active_output_version_id), option_values[0])
+            frame.version_var.set(active_label)
+            frame.version_combo.configure(state="readonly")
+            active_version = self._get_scene_output_version_by_id(scene_entry, frame.active_output_version_id)
+            favorite_label = self._build_scene_output_version_label(active_version, is_active=True) if active_version else active_label
+            frame.version_summary_label.config(text=f"{len(option_values)} saved version(s). Favorite: {favorite_label}")
+        else:
+            frame.version_var.set("")
+            frame.version_combo.configure(state=tk.DISABLED)
+            frame.version_summary_label.config(text="No saved versions yet.")
+
+        has_versions = bool(option_values)
+        frame.delete_version_btn.config(state=tk.NORMAL if has_versions else tk.DISABLED)
+        frame.prune_versions_btn.config(state=tk.NORMAL if len(option_values) > 1 else tk.DISABLED)
+
+    def _apply_scene_entry_to_frame(self, scene_entry):
+        for frame in self._collect_scene_entry_frames():
+            if frame.scene_id != scene_entry.get("scene_id"):
+                continue
+            frame.render_status = self._normalize_scene_render_status(scene_entry.get("render_status", "pending"))
+            frame.output_path = self._normalize_path(scene_entry.get("output_path"))
+            frame.output_versions = copy.deepcopy(scene_entry.get("output_versions") or [])
+            frame.active_output_version_id = scene_entry.get("active_output_version_id")
+            if hasattr(frame, "version_count_var"):
+                normalized_count = str(scene_entry.get("version_count", 1))
+                if frame.version_count_var.get() != normalized_count:
+                    frame.version_count_var.set(normalized_count)
+            self._refresh_scene_version_controls(frame)
+            self._set_scene_entry_render_state(frame.scene_id, frame.render_status, frame.output_path)
+            break
+
+    def _handle_scene_version_count_changed(self, frame):
+        if not frame or not hasattr(frame, "version_count_var"):
+            return
+        if getattr(frame, "version_count_sync_in_progress", False):
+            return
+        normalized_count = self._coerce_scene_version_count(frame.version_count_var.get())
+        if frame.version_count_var.get() != str(normalized_count):
+            frame.version_count_var.set(str(normalized_count))
+            return
+        self._mark_scene_frame_stale(frame)
+
+    def _handle_scene_version_selected(self, frame):
+        selected_version_id = frame.version_option_map.get(frame.version_var.get(), "") if hasattr(frame, "version_option_map") else ""
+        if not selected_version_id:
+            return
+        self.select_scene_output_version(frame.scene_id, selected_version_id)
+
+    def delete_selected_scene_version(self, frame):
+        if not frame or not hasattr(frame, "version_option_map"):
+            return
+        selected_version_id = frame.version_option_map.get(frame.version_var.get(), "")
+        if not selected_version_id:
+            return
+        self.delete_scene_output_version(frame.scene_id, selected_version_id)
+
+    def prune_scene_versions(self, frame):
+        if not frame or not hasattr(frame, "version_option_map"):
+            return
+        selected_version_id = frame.version_option_map.get(frame.version_var.get(), "")
+        if not selected_version_id:
+            return
+        self.prune_scene_output_versions(frame.scene_id, selected_version_id)
+
+    def _get_scene_output_version_lookup(self, scene_timeline=None):
+        normalized_timeline = self._normalize_scene_timeline(scene_timeline if scene_timeline is not None else (self._collect_scene_timeline_from_widgets() if hasattr(self, "scene_scrollable_frame") and self._collect_scene_entry_frames() else self.scene_timeline))
+        arrangement_pos = {sid: (i + 1) for i, sid in enumerate(self.timeline_arrangement or [])}
+        lookup = {}
+        for scene_entry in normalized_timeline:
+            scene_id = str(scene_entry.get("scene_id") or "").strip()
+            scene_number = arrangement_pos.get(scene_id) or int(scene_entry.get("order_index") or 0)
+            active_version_id = str(scene_entry.get("active_output_version_id") or "").strip()
+            for version_entry in scene_entry.get("output_versions") or []:
+                version_path = self._normalize_path(version_entry.get("path"))
+                if not version_path:
+                    continue
+                lookup[os.path.normcase(version_path)] = {
+                    "scene_id": scene_entry.get("scene_id"),
+                    "scene_order": scene_number,
+                    "scene_prompt": self._get_scene_prompt_text(scene_entry),
+                    "version_id": str(version_entry.get("version_id") or "").strip(),
+                    "version_number": int(version_entry.get("version_number") or 0),
+                    "is_active": str(version_entry.get("version_id") or "").strip() == active_version_id,
+                    "path": version_path,
+                }
+        return lookup
+
+    def _delete_scene_version_file(self, video_path):
+        normalized_video_path = self._normalize_path(video_path)
+        if normalized_video_path and os.path.exists(normalized_video_path):
+            os.remove(normalized_video_path)
+        if normalized_video_path:
+            thumb_path = os.path.join(self.thumbs_dir, f"{os.path.basename(normalized_video_path)}.jpg")
+            if os.path.exists(thumb_path):
+                os.remove(thumb_path)
+
+    def _sync_scene_version_selection_side_effects(self, previous_output_path, updated_scene_entry):
+        new_output_path = self._normalize_path(updated_scene_entry.get("output_path"))
+        normalized_previous_output = self._normalize_path(previous_output_path)
+        if normalized_previous_output and normalized_previous_output in self.selected_videos and normalized_previous_output != new_output_path:
+            self.selected_videos.discard(normalized_previous_output)
+            if new_output_path:
+                self.selected_videos.add(new_output_path)
+        if normalized_previous_output and self.selected_video_for_music == normalized_previous_output:
+            if new_output_path:
+                self.selected_video_for_music = new_output_path
+                thumb_path = os.path.join(self.thumbs_dir, f"{os.path.basename(new_output_path)}.jpg")
+                self._set_selected_video_preview(new_output_path, thumb_path)
+            else:
+                self.selected_video_for_music = None
+                self._reset_selected_video_preview()
+                self.merge_music_btn.config(state=tk.DISABLED)
+
+    def select_scene_output_version(self, scene_id, version_id):
+        scene_timeline = self._collect_scene_timeline_from_widgets() if hasattr(self, "scene_scrollable_frame") else self.scene_timeline
+        scene_entry = self._get_scene_entry_by_id(scene_timeline, scene_id)
+        if not scene_entry:
+            return
+        previous_output_path = scene_entry.get("output_path")
+        updated_scene_entry = self._set_scene_active_output_version(scene_entry, version_id)
+        self.scene_timeline = self._replace_scene_entry_by_id(scene_timeline, updated_scene_entry)
+        self._sync_scene_version_selection_side_effects(previous_output_path, updated_scene_entry)
+        self._apply_scene_entry_to_frame(updated_scene_entry)
+        self.save_project_state()
+        self.refresh_gallery()
+
+    def _gallery_favorite_scene_version(self, scene_id, version_id):
+        """Mark version active, then offer to prune all other versions for that scene."""
+        # Use widget frames only if they actually exist; otherwise fall back to self.scene_timeline
+        use_widgets = hasattr(self, "scene_scrollable_frame") and bool(self._collect_scene_entry_frames())
+        scene_timeline = self._collect_scene_timeline_from_widgets() if use_widgets else self.scene_timeline
+        scene_entry = self._get_scene_entry_by_id(scene_timeline, scene_id)
+        if not scene_entry and use_widgets:
+            # Frames exist but scene not found there — try self.scene_timeline as fallback
+            scene_entry = self._get_scene_entry_by_id(self.scene_timeline, scene_id)
+            scene_timeline = self.scene_timeline
+        if not scene_entry:
+            return
+
+        # Capture other versions now, before activation changes anything
+        norm_vid = str(version_id or "").strip()
+        other_versions = [
+            v for v in (scene_entry.get("output_versions") or [])
+            if str(v.get("version_id") or "").strip() != norm_vid
+        ]
+
+        # Activate the chosen version
+        previous_output_path = scene_entry.get("output_path")
+        updated_scene_entry = self._set_scene_active_output_version(scene_entry, version_id)
+        self.scene_timeline = self._replace_scene_entry_by_id(scene_timeline, updated_scene_entry)
+        self._sync_scene_version_selection_side_effects(previous_output_path, updated_scene_entry)
+        self._apply_scene_entry_to_frame(updated_scene_entry)
+        self.save_project_state()
+
+        if other_versions:
+            scene_order = int(scene_entry.get("order_index") or 0)
+            n = len(other_versions)
+            if messagebox.askyesno(
+                "Remove Other Versions?",
+                f"Delete {n} other version{'s' if n != 1 else ''} for Scene {scene_order:02d}?\n\nThis cannot be undone."
+            ):
+                # Inline deletion using the already-computed list — avoids re-reading widgets
+                try:
+                    for ver in other_versions:
+                        ver_path = self._normalize_path(ver.get("path"))
+                        self._delete_scene_version_file(ver_path)
+                        self.selected_videos.discard(ver_path)
+                except Exception as e:
+                    messagebox.showerror("Error", f"Could not remove scene versions:\n{e}")
+                # Strip deleted versions from the scene entry and persist
+                kept = [v for v in (updated_scene_entry.get("output_versions") or []) if str(v.get("version_id") or "").strip() == norm_vid]
+                updated_scene_entry["output_versions"] = kept or updated_scene_entry.get("output_versions") or []
+                self.scene_timeline = self._replace_scene_entry_by_id(self.scene_timeline, updated_scene_entry)
+                self._apply_scene_entry_to_frame(updated_scene_entry)
+                self.save_project_state()
+                self.refresh_gallery()
+                return
+
+        self.refresh_gallery()
+
+    def delete_scene_output_version(self, scene_id, version_id, confirm=True):
+        scene_timeline = self._collect_scene_timeline_from_widgets() if hasattr(self, "scene_scrollable_frame") else self.scene_timeline
+        scene_entry = self._get_scene_entry_by_id(scene_timeline, scene_id)
+        if not scene_entry:
+            return
+        version_entry = self._get_scene_output_version_by_id(scene_entry, version_id)
+        if not version_entry:
+            return
+        version_path = self._normalize_path(version_entry.get("path"))
+        if confirm and not messagebox.askyesno("Delete Scene Version", f"Delete {os.path.basename(version_path or 'selected version')}?"):
+            return
+
+        previous_output_path = scene_entry.get("output_path")
+        try:
+            self._delete_scene_version_file(version_path)
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not delete scene version:\n{e}")
+            return
+
+        self.selected_videos.discard(version_path)
+        updated_scene_entry = self._remove_scene_output_version(scene_entry, version_id)
+        self.scene_timeline = self._replace_scene_entry_by_id(scene_timeline, updated_scene_entry)
+        self._sync_scene_version_selection_side_effects(previous_output_path, updated_scene_entry)
+        self._apply_scene_entry_to_frame(updated_scene_entry)
+        self.save_project_state()
+        self.refresh_gallery()
+
+    def prune_scene_output_versions(self, scene_id, keep_version_id, confirm=True):
+        scene_timeline = self._collect_scene_timeline_from_widgets() if hasattr(self, "scene_scrollable_frame") else self.scene_timeline
+        scene_entry = self._get_scene_entry_by_id(scene_timeline, scene_id)
+        if not scene_entry:
+            return
+        keep_version = self._get_scene_output_version_by_id(scene_entry, keep_version_id)
+        if not keep_version:
+            return
+        removable_versions = [
+            version for version in scene_entry.get("output_versions") or []
+            if str(version.get("version_id") or "").strip() != str(keep_version_id or "").strip()
+        ]
+        if not removable_versions:
+            return
+        if confirm and not messagebox.askyesno("Prune Scene Versions", f"Delete {len(removable_versions)} non-selected version(s) for Scene {int(scene_entry.get('order_index') or 0):02d}?"):
+            return
+
+        previous_output_path = scene_entry.get("output_path")
+        try:
+            for version_entry in removable_versions:
+                version_path = self._normalize_path(version_entry.get("path"))
+                self._delete_scene_version_file(version_path)
+                self.selected_videos.discard(version_path)
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not prune scene versions:\n{e}")
+            return
+
+        updated_scene_entry = dict(scene_entry)
+        updated_scene_entry["output_versions"] = [copy.deepcopy(keep_version)]
+        updated_scene_entry = self._set_scene_active_output_version(updated_scene_entry, keep_version_id)
+        self.scene_timeline = self._replace_scene_entry_by_id(scene_timeline, updated_scene_entry)
+        self._sync_scene_version_selection_side_effects(previous_output_path, updated_scene_entry)
+        self._apply_scene_entry_to_frame(updated_scene_entry)
+        self.save_project_state()
+        self.refresh_gallery()
 
     def _handle_scene_asset_selection(self, frame):
         frame.selected_asset_id = frame.asset_option_map.get(frame.image_asset_var.get(), "")
         self._refresh_scene_asset_summaries()
         self._update_prompt_collection_summary()
+        self._mark_scene_frame_stale(frame)
 
     def remove_scene_timeline_entry(self, frame):
         frame.destroy()
@@ -11715,8 +14786,109 @@ class LTXQueueManager:
             return
 
         scene_state = self._collect_scene_timeline_from_widgets()
-        scene_state[current_index], scene_state[target_index] = scene_state[target_index], scene_state[current_index]
+        item = scene_state.pop(current_index)
+        scene_state.insert(target_index, item)
         self._rebuild_scene_timeline_from_state(scene_state)
+
+    def _on_scene_order_entry_confirm(self, frame):
+        frames = self._collect_scene_entry_frames()
+        if frame not in frames:
+            return
+        raw = frame.order_var.get().strip()
+        try:
+            target_1based = int(raw)
+        except (ValueError, TypeError):
+            self._on_scene_order_entry_blur(frame)
+            return
+        total = len(frames)
+        target_1based = max(1, min(target_1based, total))
+        current_index = frames.index(frame)  # 0-based
+        target_index = target_1based - 1       # 0-based
+        if target_index == current_index:
+            frame.order_var.set(str(current_index + 1))
+            return
+        scene_state = self._collect_scene_timeline_from_widgets()
+        item = scene_state.pop(current_index)
+        scene_state.insert(target_index, item)
+        self._rebuild_scene_timeline_from_state(scene_state)
+
+    def _on_scene_order_entry_blur(self, frame):
+        try:
+            if not frame.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        frames = self._collect_scene_entry_frames()
+        if frame not in frames:
+            return
+        current_index = frames.index(frame)
+        frame.order_var.set(str(current_index + 1))
+
+    def _on_gallery_scene_order_confirm(self, scene_id, entry_var, fallback_order):
+        raw = entry_var.get().strip()
+        try:
+            target_1based = int(raw)
+        except (ValueError, TypeError):
+            entry_var.set(str(fallback_order))
+            return
+        scene_state = self._collect_scene_timeline_from_widgets() if hasattr(self, "scene_scrollable_frame") and self._collect_scene_entry_frames() else list(self.scene_timeline)
+        total = len(scene_state)
+        if total == 0:
+            entry_var.set(str(fallback_order))
+            return
+        target_1based = max(1, min(target_1based, total))
+        current_index = next(
+            (i for i, e in enumerate(scene_state) if str(e.get("scene_id") or "").strip() == scene_id),
+            None
+        )
+        if current_index is None:
+            entry_var.set(str(fallback_order))
+            return
+        target_index = target_1based - 1
+        if target_index == current_index:
+            entry_var.set(str(current_index + 1))
+            return
+        item = scene_state.pop(current_index)
+        scene_state.insert(target_index, item)
+        self._rebuild_scene_timeline_from_state(scene_state)
+        self.save_project_state()
+        self.refresh_gallery()
+
+    def _on_gallery_scene_order_blur(self, entry_var, fallback_order):
+        entry_var.set(str(fallback_order))
+
+    def _on_gallery_image_order_confirm(self, asset_id, entry_var, fallback_order):
+        raw = entry_var.get().strip()
+        try:
+            target_1based = int(raw)
+        except (ValueError, TypeError):
+            entry_var.set(str(fallback_order))
+            return
+        assets = list(self._normalize_image_assets(self.image_assets))
+        total = len(assets)
+        if total == 0:
+            entry_var.set(str(fallback_order))
+            return
+        target_1based = max(1, min(target_1based, total))
+        current_index = next(
+            (i for i, a in enumerate(assets) if str(a.get("asset_id") or "").strip() == asset_id),
+            None
+        )
+        if current_index is None:
+            entry_var.set(str(fallback_order))
+            return
+        target_index = target_1based - 1
+        if target_index == current_index:
+            entry_var.set(str(current_index + 1))
+            return
+        item = assets.pop(current_index)
+        assets.insert(target_index, item)
+        self.image_assets = self._reindex_ordered_entries(assets)
+        self.save_project_state()
+        self.refresh_gallery()
+
+    def _on_gallery_image_order_blur(self, entry_var, fallback_order):
+        entry_var.set(str(fallback_order))
 
     def _collect_scene_timeline_from_widgets(self):
         scene_entries = []
@@ -11731,7 +14903,10 @@ class LTXQueueManager:
                     image_asset_id=selected_asset_id,
                     scene_id=frame.scene_id,
                     output_path=getattr(frame, "output_path", None),
-                    render_status=getattr(frame, "render_status", "pending")
+                    render_status=getattr(frame, "render_status", "pending"),
+                    version_count=frame.version_count_var.get() if hasattr(frame, "version_count_var") else 1,
+                    output_versions=copy.deepcopy(getattr(frame, "output_versions", [])),
+                    active_output_version_id=getattr(frame, "active_output_version_id", None)
                 )
             )
         return self._reindex_ordered_entries(scene_entries)
@@ -11743,13 +14918,85 @@ class LTXQueueManager:
         self._refresh_scene_entry_rows()
 
     def _rebuild_image_prompt_queue_from_texts(self, prompts_text=None):
-        normalized_prompts = self._normalize_string_list(prompts_text or [])
+        normalized_entries = self._normalize_image_prompt_queue_entries(prompts_text or [])
         self._clear_all_image_prompt_entries()
-        self.image_prompt_queue = list(normalized_prompts)
-        for prompt_text in normalized_prompts:
-            self.add_image_prompt_entry()
-            self.image_prompts[-1].insert(tk.END, prompt_text)
+        self.image_prompt_queue = list(normalized_entries)
+        for prompt_entry in normalized_entries:
+            self.add_image_prompt_entry(prompt_entry)
         self._update_prompt_collection_summary()
+
+    def _get_image_prompt_frame_by_id(self, prompt_id):
+        normalized_prompt_id = str(prompt_id or "").strip()
+        if not normalized_prompt_id or not hasattr(self, "image_scrollable_frame"):
+            return None
+        for frame in self.image_scrollable_frame.winfo_children():
+            if str(getattr(frame, "prompt_entry_id", "") or "").strip() == normalized_prompt_id:
+                return frame
+        return None
+
+    def _build_image_render_tasks(self, prompt_entries=None):
+        render_tasks = []
+        normalized_entries = self._normalize_image_prompt_queue_entries(prompt_entries if prompt_entries is not None else self.image_prompt_queue)
+        for row_index, prompt_entry in enumerate(normalized_entries, start=1):
+            prompt_text = str(prompt_entry.get("prompt_text") or "").strip()
+            if not prompt_text:
+                continue
+            asset = self._get_image_asset_by_id(prompt_entry.get("asset_id"))
+            next_version_number = self._get_next_image_output_version_number(asset) if asset else 1
+            desired_version_count = self._coerce_image_version_count(prompt_entry.get("version_count", 1))
+            for offset in range(desired_version_count):
+                render_tasks.append({
+                    "prompt_id": prompt_entry.get("prompt_id"),
+                    "row_index": row_index,
+                    "prompt_text": prompt_text,
+                    "version_number": next_version_number + offset,
+                })
+        return render_tasks
+
+    def _register_generated_image_for_prompt_entry(self, prompt_entry, output_path, prompt_text=None):
+        normalized_output_path = self._normalize_path(output_path)
+        if not normalized_output_path:
+            return None, None
+
+        normalized_entry = self._create_image_prompt_queue_entry(
+            prompt_text=prompt_text if prompt_text is not None else (prompt_entry or {}).get("prompt_text", ""),
+            prompt_id=(prompt_entry or {}).get("prompt_id"),
+            version_count=(prompt_entry or {}).get("version_count", 1),
+            asset_id=(prompt_entry or {}).get("asset_id"),
+            created_at=(prompt_entry or {}).get("created_at"),
+            updated_at=datetime.now().isoformat(timespec="seconds"),
+        )
+
+        asset = self._get_image_asset_by_id(normalized_entry.get("asset_id"))
+        if asset:
+            updated_asset = dict(asset)
+            updated_asset["prompt_text"] = normalized_entry.get("prompt_text", "")
+            updated_asset["status"] = "ready"
+            updated_asset["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            updated_asset["version_count"] = self._coerce_image_version_count(normalized_entry.get("version_count", 1))
+            updated_asset, new_version = self._append_image_output_version(updated_asset, normalized_output_path)
+            self._replace_image_asset_by_id(updated_asset)
+        else:
+            updated_asset = self._create_image_asset_record(
+                normalized_output_path,
+                source="generated",
+                prompt_text=normalized_entry.get("prompt_text", ""),
+                status="ready",
+            )
+            updated_asset["version_count"] = self._coerce_image_version_count(normalized_entry.get("version_count", 1))
+            updated_asset = self._sync_image_asset_output_fields(updated_asset)
+            self.image_assets = self._reindex_ordered_entries(self.image_assets + [updated_asset])
+            new_version = self._get_image_output_version_by_id(updated_asset, updated_asset.get("active_output_version_id"))
+
+        normalized_entry["asset_id"] = updated_asset.get("asset_id")
+        self._replace_image_prompt_entry_by_id(normalized_entry)
+
+        frame = self._get_image_prompt_frame_by_id(normalized_entry.get("prompt_id"))
+        if frame:
+            self.root.after(0, lambda target_frame=frame, entry=copy.deepcopy(normalized_entry): self._apply_image_prompt_entry_to_frame(target_frame, entry))
+        self.root.after(0, self.refresh_gallery)
+        self.root.after(0, self.save_project_state)
+        return normalized_entry, updated_asset
 
     def sync_scene_timeline_from_prompt_queue(self):
         prompts_text = self._collect_prompt_texts()
@@ -11795,43 +15042,171 @@ class LTXQueueManager:
         self.update_status(f"Scene Timeline synced from Image Phase: {', '.join(status_parts)}.", "blue")
 
     def _set_scene_entry_render_state(self, scene_id, render_status, output_path=None):
-        normalized_status = str(render_status or "pending").strip().lower() or "pending"
+        normalized_status = self._normalize_scene_render_status(render_status)
         normalized_output_path = self._normalize_path(output_path)
         for frame in self._collect_scene_entry_frames():
             if frame.scene_id != scene_id:
                 continue
             frame.render_status = normalized_status
             frame.output_path = normalized_output_path
-            frame.status_label.config(text=f"Status: {normalized_status.title()}")
+            frame.status_label.config(text=f"Status: {self._format_scene_render_status(normalized_status)}")
+            if hasattr(frame, "render_btn"):
+                frame.render_btn.config(text="Re-render Scene" if normalized_status in {"ready", "stale", "failed"} else "Render Scene")
             display_text = os.path.basename(normalized_output_path) if normalized_output_path and os.path.exists(normalized_output_path) else "No render yet"
             frame.output_label.config(text=display_text)
+            if hasattr(frame, "version_combo"):
+                self._refresh_scene_version_controls(frame)
             break
         self._update_prompt_collection_summary()
 
     def _build_i2v_workflow_for_scene(self, prompt_text, image_path, filename_prefix, video_settings):
+        i2v_profile = self._get_active_i2v_profile()
+        roles = i2v_profile["roles"]
         workflow_to_submit = copy.deepcopy(self.i2v_workflow)
 
-        self._set_workflow_role_value_from_roles(workflow_to_submit, I2V_WORKFLOW_PROFILE["roles"], "prompt", prompt_text)
-        self._set_workflow_role_value_from_roles(workflow_to_submit, I2V_WORKFLOW_PROFILE["roles"], "negative_prompt", video_settings["negative_prompt"])
-        self._set_workflow_role_value_from_roles(workflow_to_submit, I2V_WORKFLOW_PROFILE["roles"], "width", video_settings["width"])
-        self._set_workflow_role_value_from_roles(workflow_to_submit, I2V_WORKFLOW_PROFILE["roles"], "height", video_settings["height"])
-        self._set_workflow_role_value_from_roles(workflow_to_submit, I2V_WORKFLOW_PROFILE["roles"], "fps", video_settings["fps"])
-        self._set_workflow_role_value_from_roles(workflow_to_submit, I2V_WORKFLOW_PROFILE["roles"], "length", video_settings["length"])
-        self._set_workflow_role_value_from_roles(workflow_to_submit, I2V_WORKFLOW_PROFILE["roles"], "t2v_enabled", False)
-        self._set_workflow_role_value_from_roles(workflow_to_submit, I2V_WORKFLOW_PROFILE["roles"], "filename_prefix", filename_prefix)
-        self._set_workflow_role_value_from_roles(workflow_to_submit, I2V_WORKFLOW_PROFILE["roles"], "checkpoint_name", video_settings["checkpoint_name"])
-        self._set_workflow_role_value_from_roles(workflow_to_submit, I2V_WORKFLOW_PROFILE["roles"], "text_encoder_name", video_settings["text_encoder_name"])
-        self._set_workflow_role_value_from_roles(workflow_to_submit, I2V_WORKFLOW_PROFILE["roles"], "lora_name", video_settings["lora_name"])
-        self._set_workflow_role_value_from_roles(workflow_to_submit, I2V_WORKFLOW_PROFILE["roles"], "upscaler_name", video_settings["upscaler_name"])
-        self._set_workflow_role_value_from_roles(workflow_to_submit, I2V_WORKFLOW_PROFILE["roles"], "image_path", image_path)
+        self._set_workflow_role_value_from_roles(workflow_to_submit, roles, "prompt", prompt_text)
+        self._set_workflow_role_value_from_roles(workflow_to_submit, roles, "negative_prompt", video_settings["negative_prompt"])
+        self._set_workflow_role_value_from_roles(workflow_to_submit, roles, "width", video_settings["width"])
+        self._set_workflow_role_value_from_roles(workflow_to_submit, roles, "height", video_settings["height"])
+        self._set_workflow_role_value_from_roles(workflow_to_submit, roles, "fps", video_settings["fps"])
+        self._set_workflow_role_value_from_roles(workflow_to_submit, roles, "length", video_settings["length"])
+        self._set_workflow_role_value_from_roles(workflow_to_submit, roles, "t2v_enabled", False)
+        self._set_workflow_role_value_from_roles(workflow_to_submit, roles, "filename_prefix", filename_prefix)
+        self._set_workflow_role_value_from_roles(workflow_to_submit, roles, "checkpoint_name", video_settings["checkpoint_name"])
+        self._set_workflow_role_value_from_roles(workflow_to_submit, roles, "text_encoder_name", video_settings["text_encoder_name"])
+        self._set_workflow_role_value_from_roles(workflow_to_submit, roles, "lora_name", video_settings["lora_name"])
+        self._set_workflow_role_value_from_roles(workflow_to_submit, roles, "upscaler_name", video_settings["upscaler_name"])
+        self._set_workflow_role_value_from_roles(workflow_to_submit, roles, "image_path", image_path)
 
-        for role_ref in self._get_role_refs_from_roles(I2V_WORKFLOW_PROFILE["roles"], "noise_seed"):
+        # GGUF-specific roles: unet_name, vae_name, connectors, and audio VAE
+        if self.active_workflow_type in ("gguf", "gguf_distilled"):
+            preset = VIDEO_MODEL_PRESETS.get(self.active_video_model_preset, {})
+            unet_name = preset.get("unet_name", "")
+            if unet_name:
+                self._set_workflow_role_value_from_roles(workflow_to_submit, roles, "unet_name", unet_name)
+            vae_name = preset.get("vae_name", "")
+            if vae_name:
+                self._set_workflow_role_value_from_roles(workflow_to_submit, roles, "vae_name", vae_name)
+            connectors_name = preset.get("connectors_name", "")
+            if connectors_name:
+                self._set_workflow_role_value_from_roles(workflow_to_submit, roles, "connectors_name", connectors_name)
+            audio_vae_name = preset.get("audio_vae_name", "")
+            if audio_vae_name:
+                self._set_workflow_role_value_from_roles(workflow_to_submit, roles, "audio_vae_name", audio_vae_name)
+
+        for role_ref in self._get_role_refs_from_roles(roles, "noise_seed"):
             node_id = str(role_ref["node_id"])
             workflow_to_submit[node_id]["inputs"][role_ref["input"]] = random.randint(1, 999999999999999)
 
         return workflow_to_submit
 
+    def _get_scene_entry_by_id(self, scene_timeline, scene_id):
+        normalized_scene_id = str(scene_id or "").strip()
+        for entry in self._normalize_scene_timeline(scene_timeline or []):
+            if str(entry.get("scene_id") or "").strip() == normalized_scene_id:
+                return entry
+        return None
+
+    def _set_scene_render_controls_enabled(self, enabled):
+        state = tk.NORMAL if enabled else tk.DISABLED
+        self.scene_render_in_progress = not enabled
+        if hasattr(self, "render_scene_timeline_btn"):
+            self.render_scene_timeline_btn.config(state=state)
+        if hasattr(self, "add_scene_btn"):
+            self.add_scene_btn.config(state=state)
+        if hasattr(self, "sync_t2v_to_image_queue_btn"):
+            self.sync_t2v_to_image_queue_btn.config(state=state)
+        if hasattr(self, "sync_image_to_scene_btn"):
+            self.sync_image_to_scene_btn.config(state=state)
+        if hasattr(self, "auto_assign_scene_images_btn"):
+            self.auto_assign_scene_images_btn.config(state=state)
+        for frame in self._collect_scene_entry_frames():
+            if hasattr(frame, "render_btn"):
+                frame.render_btn.config(state=state)
+
+    def _validate_scene_entries_for_render(self, scene_timeline):
+        has_i2v_scene = any(entry.get("mode") == SCENE_MODE_I2V for entry in scene_timeline)
+        if has_i2v_scene and not self.i2v_workflow:
+            messagebox.showerror("Workflow Missing", "The image-to-video workflow JSON could not be loaded.")
+            return False
+
+        for entry in scene_timeline:
+            scene_prompt = self._get_scene_prompt_text(entry)
+            if not scene_prompt:
+                messagebox.showwarning("Scene Timeline", f"Scene {entry['order_index']} needs a scene prompt.")
+                return False
+            if entry.get("mode") == SCENE_MODE_I2V:
+                asset = self._get_image_asset_by_id(entry.get("image_asset_id"))
+                if not asset or not os.path.exists(asset.get("project_path", "")):
+                    messagebox.showwarning("Scene Timeline", f"Scene {entry['order_index']} needs a valid source image.")
+                    return False
+        return True
+
+    def _build_scene_render_tasks(self, scene_timeline, target_scene_ids=None):
+        normalized_target_ids = {str(scene_id).strip() for scene_id in (target_scene_ids or set()) if str(scene_id).strip()}
+        render_tasks = []
+        for scene_entry in self._normalize_scene_timeline(scene_timeline or []):
+            scene_id = str(scene_entry.get("scene_id") or "").strip()
+            if normalized_target_ids and scene_id not in normalized_target_ids:
+                continue
+            next_version_number = self._get_next_scene_output_version_number(scene_entry)
+            desired_version_count = self._coerce_scene_version_count(scene_entry.get("version_count", 1))
+            for offset in range(desired_version_count):
+                render_tasks.append((scene_id, next_version_number + offset))
+        return render_tasks
+
+    def _build_scene_render_workflow(self, scene_entry, video_settings, version_number=None):
+        prompt_text = self._get_scene_prompt_text(scene_entry)
+        scene_order = int(scene_entry.get("order_index") or 0)
+        filename_suffix = f"v{int(version_number or 1):02d}" if version_number is not None else None
+        filename_prefix = self._build_video_filename_prefix(video_settings, "timeline", scene_order if scene_order > 0 else None, suffix=filename_suffix)
+        if scene_entry.get("mode", SCENE_MODE_T2V) == SCENE_MODE_I2V:
+            asset = self._get_image_asset_by_id(scene_entry.get("image_asset_id"))
+            return self._build_i2v_workflow_for_scene(
+                prompt_text,
+                asset.get("project_path"),
+                filename_prefix,
+                video_settings
+            )
+        return self._build_video_workflow_for_prompt(
+            prompt_text,
+            filename_prefix,
+            video_settings
+        )
+
+    def start_single_scene_render(self, scene_id):
+        if self.scene_render_in_progress:
+            return
+
+        self.save_project_state()
+        scene_timeline = self._collect_scene_timeline_from_widgets()
+        scene_entry = self._get_scene_entry_by_id(scene_timeline, scene_id)
+        if not scene_entry:
+            messagebox.showwarning("Scene Timeline", "The selected scene could not be found.")
+            return
+
+        video_settings, validation_error = self._collect_validated_video_settings()
+        if validation_error:
+            messagebox.showerror("Workflow Settings Error", validation_error)
+            self.update_status(validation_error, "red")
+            return
+
+        if not self._validate_scene_entries_for_render([scene_entry]):
+            return
+
+        self.scene_timeline = self._normalize_scene_timeline(scene_timeline)
+        self._set_scene_render_controls_enabled(False)
+
+        thread = threading.Thread(
+            target=self._run_scene_timeline_thread,
+            args=(self.scene_timeline, video_settings, {str(scene_id).strip()})
+        )
+        thread.daemon = True
+        thread.start()
+
     def start_scene_timeline_render(self):
+        if self.scene_render_in_progress:
+            return
         self.save_project_state()
         scene_timeline = self._collect_scene_timeline_from_widgets()
         if not scene_timeline:
@@ -11844,129 +15219,102 @@ class LTXQueueManager:
             self.update_status(validation_error, "red")
             return
 
-        has_i2v_scene = any(entry.get("mode") == SCENE_MODE_I2V for entry in scene_timeline)
-        if has_i2v_scene and not self.i2v_workflow:
-            messagebox.showerror("Workflow Missing", "The image-to-video workflow JSON could not be loaded.")
+        if not self._validate_scene_entries_for_render(scene_timeline):
             return
 
-        for entry in scene_timeline:
-            scene_prompt = self._get_scene_prompt_text(entry)
-            if not scene_prompt:
-                messagebox.showwarning("Scene Timeline", f"Scene {entry['order_index']} needs a scene prompt.")
-                return
-            if entry.get("mode") == SCENE_MODE_I2V:
-                asset = self._get_image_asset_by_id(entry.get("image_asset_id"))
-                if not asset or not os.path.exists(asset.get("project_path", "")):
-                    messagebox.showwarning("Scene Timeline", f"Scene {entry['order_index']} needs a valid source image.")
-                    return
-
         self.scene_timeline = scene_timeline
-        self.render_scene_timeline_btn.config(state=tk.DISABLED)
-        self.add_scene_btn.config(state=tk.DISABLED)
-        if hasattr(self, "sync_t2v_to_image_queue_btn"):
-            self.sync_t2v_to_image_queue_btn.config(state=tk.DISABLED)
-        if hasattr(self, "sync_image_to_scene_btn"):
-            self.sync_image_to_scene_btn.config(state=tk.DISABLED)
-        if hasattr(self, "auto_assign_scene_images_btn"):
-            self.auto_assign_scene_images_btn.config(state=tk.DISABLED)
+        self._set_scene_render_controls_enabled(False)
 
         thread = threading.Thread(target=self._run_scene_timeline_thread, args=(scene_timeline, video_settings))
         thread.daemon = True
         thread.start()
 
-    def _run_scene_timeline_thread(self, scene_timeline, video_settings):
-        total = len(scene_timeline)
+    def _run_scene_timeline_thread(self, scene_timeline, video_settings, target_scene_ids=None):
+        render_tasks = self._build_scene_render_tasks(scene_timeline, target_scene_ids=target_scene_ids)
+        total = len(render_tasks)
+        if not total:
+            self.root.after(0, lambda: self._set_scene_render_controls_enabled(True))
+            return
+
+        is_single_scene_render = len({scene_id for scene_id, _version_number in render_tasks}) == 1
         self._set_tutorial_runtime_progress(
             "video_render",
             reset=True,
-            status="Preparing scene timeline render...",
+            status="Preparing scene render..." if is_single_scene_render else "Preparing scene timeline render...",
             current=0,
             total=total,
-            item_label="Scene timeline",
+            item_label="Scene" if is_single_scene_render else "Scene timeline",
             stage="preparing",
         )
-        for index, scene_entry in enumerate(scene_timeline, start=1):
-            scene_id = scene_entry.get("scene_id")
-            scene_mode = scene_entry.get("mode", SCENE_MODE_T2V)
+        for index, (scene_id, version_number) in enumerate(render_tasks, start=1):
+            scene_entry = self._get_scene_entry_by_id(scene_timeline, scene_id)
+            if not scene_entry:
+                continue
             prompt_text = self._get_scene_prompt_text(scene_entry)
+            scene_number = int(scene_entry.get("order_index") or index)
             self.root.after(0, lambda sid=scene_id: self._set_scene_entry_render_state(sid, "rendering"))
-            self.update_status(f"Rendering scene {index} of {total}...", "blue")
+            if is_single_scene_render:
+                self.update_status(f"Rendering scene {scene_number}, version {version_number}...", "blue")
+            else:
+                self.update_status(f"Rendering scene {scene_number}, version {version_number} ({index} of {total})...", "blue")
             self.update_debug_prompt_status(prompt_text, current=index, total=total)
             self._set_tutorial_runtime_progress(
                 "video_render",
-                status=f"Submitting scene {index} of {total}...",
+                status=f"Submitting scene {scene_number}, version {version_number}..." if is_single_scene_render else f"Submitting scene {scene_number}, version {version_number} ({index} of {total})...",
                 current=index,
                 total=total,
-                item_label=f"Scene {index}",
+                item_label=f"Scene {scene_number} v{version_number:02d}",
                 stage="submitting",
             )
 
             before_files = self._snapshot_media_files(self.scenes_dir, SUPPORTED_VIDEO_EXTENSIONS)
-            filename_prefix = self._build_video_filename_prefix(video_settings, "timeline", index)
-
-            if scene_mode == SCENE_MODE_I2V:
-                asset = self._get_image_asset_by_id(scene_entry.get("image_asset_id"))
-                workflow_to_submit = self._build_i2v_workflow_for_scene(
-                    prompt_text,
-                    asset.get("project_path"),
-                    filename_prefix,
-                    video_settings
-                )
-            else:
-                workflow_to_submit = self._build_video_workflow_for_prompt(
-                    prompt_text,
-                    filename_prefix,
-                    video_settings
-                )
+            workflow_to_submit = self._build_scene_render_workflow(scene_entry, video_settings, version_number=version_number)
 
             prompt_id = self.queue_prompt(workflow_to_submit)
             if not prompt_id:
                 self.root.after(0, lambda sid=scene_id: self._set_scene_entry_render_state(sid, "failed"))
-                self._set_tutorial_runtime_progress("video_render", status=f"Scene {index} failed to submit.", current=index, total=total, item_label=f"Scene {index}", stage="failed")
+                self._set_tutorial_runtime_progress("video_render", status=f"Scene {scene_number}, version {version_number} failed to submit.", current=index, total=total, item_label=f"Scene {scene_number} v{version_number:02d}", stage="failed")
                 break
 
             item_start = time.time()
             self.eta_item_start_time = item_start
-            success = self.wait_for_completion(
+            success, rendered_output = self.wait_for_completion(
                 prompt_id,
                 tutorial_progress_phase="video_render",
                 tutorial_progress_current=index,
                 tutorial_progress_total=total,
-                tutorial_progress_label=f"Scene {index}",
+                tutorial_progress_label=f"Scene {scene_number} v{version_number:02d}",
+                return_output_path=True,
             )
             if not success:
                 self.root.after(0, lambda sid=scene_id: self._set_scene_entry_render_state(sid, "failed"))
                 break
 
             self.record_tutorial_phase_timing("video_render", time.time() - item_start)
-            rendered_output = self._get_newest_rendered_media(before_files, self.scenes_dir, SUPPORTED_VIDEO_EXTENSIONS)
-            scene_entry["output_path"] = rendered_output
+            if not rendered_output:
+                rendered_output = self._get_newest_rendered_media(before_files, self.scenes_dir, SUPPORTED_VIDEO_EXTENSIONS) or scene_entry.get("output_path")
+            scene_entry, _new_version = self._append_scene_output_version(scene_entry, rendered_output)
             scene_entry["render_status"] = "ready"
-            self.root.after(0, lambda sid=scene_id, output_path=rendered_output: self._set_scene_entry_render_state(sid, "ready", output_path))
+            scene_timeline = self._replace_scene_entry_by_id(scene_timeline, scene_entry)
+            self.root.after(0, lambda entry=copy.deepcopy(scene_entry): self._apply_scene_entry_to_frame(entry))
             self.root.after(0, self.refresh_gallery)
             self._set_tutorial_runtime_progress(
                 "video_render",
-                status=f"Rendered scene {index} of {total}.",
+                status=f"Rendered scene {scene_number}, version {version_number}." if is_single_scene_render else f"Rendered scene {scene_number}, version {version_number} ({index} of {total}).",
                 current=index,
                 total=total,
-                item_label=f"Scene {index}",
+                item_label=f"Scene {scene_number} v{version_number:02d}",
                 stage="item_complete",
                 output_path=rendered_output,
             )
         else:
-            self.update_status("Scene timeline render complete.", "green")
-            self._set_tutorial_runtime_progress("video_render", status="Scene timeline render complete.", current=total, total=total, item_label="Scene timeline", stage="complete")
+            completion_status = "Scene render complete." if is_single_scene_render else "Scene timeline render complete."
+            self.update_status(completion_status, "green")
+            self._set_tutorial_runtime_progress("video_render", status=completion_status, current=total, total=total, item_label="Scene" if is_single_scene_render else "Scene timeline", stage="complete")
 
         self.scene_timeline = self._normalize_scene_timeline(scene_timeline)
         self.root.after(0, self.save_project_state)
-        self.root.after(0, lambda: self.render_scene_timeline_btn.config(state=tk.NORMAL))
-        self.root.after(0, lambda: self.add_scene_btn.config(state=tk.NORMAL))
-        if hasattr(self, "sync_t2v_to_image_queue_btn"):
-            self.root.after(0, lambda: self.sync_t2v_to_image_queue_btn.config(state=tk.NORMAL))
-        if hasattr(self, "sync_image_to_scene_btn"):
-            self.root.after(0, lambda: self.sync_image_to_scene_btn.config(state=tk.NORMAL))
-        if hasattr(self, "auto_assign_scene_images_btn"):
-            self.root.after(0, lambda: self.auto_assign_scene_images_btn.config(state=tk.NORMAL))
+        self.root.after(0, lambda: self._set_scene_render_controls_enabled(True))
 
     def add_prompt_entry(self):
         frame = tk.Frame(self.scrollable_frame, pady=6)
@@ -11995,21 +15343,29 @@ class LTXQueueManager:
         self.update_scroll_region()
         self._update_prompt_collection_summary()
 
-    def add_image_prompt_entry(self):
+    def add_image_prompt_entry(self, prompt_entry=None):
+        normalized_entries = self._normalize_image_prompt_queue_entries([prompt_entry]) if prompt_entry else []
+        resolved_entry = normalized_entries[0] if normalized_entries else self._create_image_prompt_queue_entry()
         frame = tk.Frame(self.image_scrollable_frame, pady=6)
         frame.pack(fill=tk.X, expand=True)
         self._style_panel(frame, self.colors["card"], border=True)
+        frame.prompt_entry_id = resolved_entry.get("prompt_id")
+        frame.bound_asset_id = resolved_entry.get("asset_id")
+        frame.prompt_entry_created_at = resolved_entry.get("created_at")
+        frame.prompt_entry_updated_at = resolved_entry.get("updated_at")
+        frame.version_count_sync_in_progress = False
 
         text_widget = tk.Text(frame, height=4, width=50)
         text_widget.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self._style_text_input(text_widget, multiline=True)
         frame.prompt_text_widget = text_widget
+        text_widget.insert("1.0", resolved_entry.get("prompt_text", ""))
 
         btn_frame = tk.Frame(frame)
         btn_frame.pack(side=tk.RIGHT, padx=5)
         self._style_panel(btn_frame, self.colors["card"])
 
-        generate_btn = tk.Button(btn_frame, text="Generate", command=lambda t=text_widget: self.generate_single_image_prompt(t))
+        generate_btn = tk.Button(btn_frame, text="Generate", command=lambda f=frame: self.generate_single_image_prompt(f))
         generate_btn.pack(side=tk.TOP, fill=tk.X, pady=(0, 2))
         self._style_button(generate_btn, "accent", compact=True)
 
@@ -12017,7 +15373,58 @@ class LTXQueueManager:
         remove_btn.pack(side=tk.TOP, fill=tk.X)
         self._style_button(remove_btn, "ghost", compact=True)
 
+        version_row = tk.Frame(btn_frame)
+        version_row.pack(side=tk.TOP, fill=tk.X, pady=(8, 0))
+        self._style_panel(version_row, self.colors["card"])
+
+        version_label = tk.Label(version_row, text="Versions")
+        version_label.pack(side=tk.LEFT)
+        self._style_label(version_label, "muted", self.colors["card"])
+
+        frame.version_count_var = tk.StringVar(value=str(self._coerce_image_version_count(resolved_entry.get("version_count", 1))))
+        frame.version_count_spinbox = tk.Spinbox(version_row, from_=1, to=99, width=4, textvariable=frame.version_count_var, command=lambda f=frame: self._handle_image_prompt_version_count_changed(f))
+        frame.version_count_spinbox.pack(side=tk.RIGHT)
+        frame.version_count_spinbox.bind("<FocusOut>", lambda _event, f=frame: self._handle_image_prompt_version_count_changed(f))
+        frame.version_count_spinbox.bind("<Return>", lambda _event, f=frame: self._handle_image_prompt_version_count_changed(f))
+        self._style_text_input(frame.version_count_spinbox)
+
+        saved_versions_row = tk.Frame(btn_frame)
+        saved_versions_row.pack(side=tk.TOP, fill=tk.X, pady=(8, 0))
+        self._style_panel(saved_versions_row, self.colors["card"])
+
+        saved_versions_label = tk.Label(saved_versions_row, text="Saved")
+        saved_versions_label.pack(side=tk.LEFT)
+        self._style_label(saved_versions_label, "muted", self.colors["card"])
+
+        frame.version_var = tk.StringVar(value="")
+        frame.version_combo = ttk.Combobox(saved_versions_row, textvariable=frame.version_var, state=tk.DISABLED, width=34)
+        frame.version_combo.pack(side=tk.RIGHT, fill=tk.X, expand=True)
+
+        frame.favorite_version_btn = tk.Button(btn_frame, text="Favorite Selected", command=lambda f=frame: self._handle_image_prompt_version_selected(f))
+        frame.favorite_version_btn.pack(side=tk.TOP, fill=tk.X, pady=(8, 0))
+        self._style_button(frame.favorite_version_btn, "accent", compact=True)
+
+        version_actions_row = tk.Frame(btn_frame)
+        version_actions_row.pack(side=tk.TOP, fill=tk.X, pady=(8, 0))
+        self._style_panel(version_actions_row, self.colors["card"])
+        version_actions_row.grid_columnconfigure((0, 1), weight=1)
+
+        frame.delete_version_btn = tk.Button(version_actions_row, text="Delete Selected", command=lambda f=frame: self.delete_selected_image_version(f))
+        frame.delete_version_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self._style_button(frame.delete_version_btn, "danger", compact=True)
+
+        frame.prune_versions_btn = tk.Button(version_actions_row, text="Prune Others", command=lambda f=frame: self.prune_image_versions(f))
+        frame.prune_versions_btn.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        self._style_button(frame.prune_versions_btn, "secondary", compact=True)
+
+        frame.asset_summary_label = tk.Label(frame, anchor="w")
+        frame.asset_summary_label.pack(fill=tk.X, padx=10, pady=(0, 8))
+        self._style_label(frame.asset_summary_label, "muted", self.colors["card"])
+
+        frame.version_combo.bind("<<ComboboxSelected>>", lambda _event, f=frame: self._handle_image_prompt_version_selected(f))
+
         self.image_prompts.append(text_widget)
+        self._apply_image_prompt_entry_to_frame(frame, resolved_entry)
         self.log_debug("IMAGE_PROMPT_ADDED", widget_id=id(text_widget), total_widgets=len(self.image_prompts))
         self.update_image_scroll_region()
         self._update_prompt_collection_summary()
@@ -12079,7 +15486,7 @@ class LTXQueueManager:
         return prompts_text
 
     def _collect_image_prompt_texts(self):
-        prompts_text = [w.get("1.0", tk.END).strip() for w in self._collect_image_prompt_widgets() if w.get("1.0", tk.END).strip()]
+        prompts_text = [entry.get("prompt_text", "") for entry in self._collect_image_prompt_queue_entries() if entry.get("prompt_text")]
         previews = [self._truncate_text(p, 120) for p in prompts_text]
         self.log_debug("IMAGE_PROMPTS_COLLECTED", count=len(prompts_text), previews=previews)
         return prompts_text
@@ -12186,6 +15593,8 @@ class LTXQueueManager:
         settings = {
             "api_json_path": self.api_json_path,
             "video_profile": self._get_selected_video_profile_key(),
+            "video_model_preset": self.active_video_model_preset,
+            "video_workflow_type": self.active_workflow_type,
             "video_settings": self._get_video_settings_snapshot(),
             "image_settings": self._get_image_settings_snapshot(),
             "remember_section_open_states": self.remember_section_open_states,
@@ -12233,6 +15642,31 @@ class LTXQueueManager:
                 settings.get("api_json_path"),
                 settings.get("video_settings", {})
             )
+
+            # Restore video model preset and workflow type
+            saved_preset = settings.get("video_model_preset", DEFAULT_VIDEO_MODEL_PRESET)
+            if saved_preset in VIDEO_MODEL_PRESETS:
+                self.active_video_model_preset = saved_preset
+                self._set_selected_video_model_preset_key(saved_preset)
+                self.active_workflow_type = settings.get("video_workflow_type",
+                    VIDEO_MODEL_PRESETS[saved_preset].get("workflow_type", "safetensors"))
+                # Load the matching I2V workflow
+                i2v_profile = self._get_active_i2v_profile()
+                self.i2v_json_path = i2v_profile["workflow_path"]
+                self._load_i2v_workflow_template()
+                self._update_preset_vram_label()
+
+                # Auto-fill model selections from preset (same as on_video_model_preset_changed)
+                preset = VIDEO_MODEL_PRESETS[saved_preset]
+                if "checkpoint_name" in preset:
+                    self.video_checkpoint_var.set(preset["checkpoint_name"])
+                if "text_encoder_name" in preset:
+                    self.video_text_encoder_var.set(preset["text_encoder_name"])
+                if "lora_name" in preset:
+                    self.video_lora_var.set(preset["lora_name"])
+                if "upscaler_name" in preset:
+                    self.video_upscaler_var.set(preset["upscaler_name"])
+
             self.global_image_settings_defaults = settings.get("image_settings", {})
             self.remember_section_open_states = bool(settings.get("remember_section_open_states", False))
             self._apply_saved_image_settings(self.global_image_settings_defaults)
@@ -12764,7 +16198,7 @@ class LTXQueueManager:
             self.eta_tick_id = None
 
     def save_project_state(self):
-        if not self.current_project_dir:
+        if not self.current_project_dir or self.project_state_restore_in_progress:
             return
 
         if self.project_state_save_after_id is not None:
@@ -12775,16 +16209,17 @@ class LTXQueueManager:
             self.project_state_save_after_id = None
             
         project_data_file = os.path.join(self.current_project_dir, "project_data.json")
-        image_prompts_text = self._collect_image_prompt_texts()
+        image_prompt_entries = self._collect_image_prompt_queue_entries()
+        image_prompts_text = [entry.get("prompt_text", "") for entry in image_prompt_entries if entry.get("prompt_text")]
         collected_scene_timeline = self._collect_scene_timeline_from_widgets() if hasattr(self, "scene_scrollable_frame") else []
         self.scene_timeline = self._normalize_scene_timeline(collected_scene_timeline)
         self.image_assets = self._normalize_image_assets(self.image_assets)
-        self.image_prompt_queue = image_prompts_text
+        self.image_prompt_queue = image_prompt_entries
         legacy_prompts = self._get_t2v_prompts_from_scene_timeline(self.scene_timeline)
         state = {
             "schema_version": PROJECT_STATE_SCHEMA_VERSION,
             "prompts": legacy_prompts,
-            "image_prompt_queue": image_prompts_text,
+            "image_prompt_queue": image_prompt_entries,
             "image_settings": self._get_image_settings_snapshot(),
             "image_assets": self.image_assets,
             "scene_timeline": self.scene_timeline,
@@ -12806,6 +16241,7 @@ class LTXQueueManager:
             "selected_video_for_music": self.selected_video_for_music,
             "current_final_video": getattr(self, 'current_final_video', None),
             "autonomous_target_duration": self.autonomous_target_duration,
+            "timeline_arrangement": self.timeline_arrangement,
         }
         try:
             with open(project_data_file, 'w', encoding='utf-8') as f:
@@ -12819,12 +16255,12 @@ class LTXQueueManager:
             
         project_data_file = os.path.join(self.current_project_dir, "project_data.json")
         self.project_state_restore_in_progress = True
-        
-        # Clear existing UI fields first
-        self.clear_ui_fields()
-        
-        if os.path.exists(project_data_file):
-            try:
+
+        try:
+            # Clear existing UI fields first while restore-save guards are active.
+            self.clear_ui_fields()
+
+            if os.path.exists(project_data_file):
                 with open(project_data_file, 'r', encoding='utf-8') as f:
                     state = json.load(f)
 
@@ -12839,6 +16275,7 @@ class LTXQueueManager:
                 # Load Video Prompts
                 saved_prompts = state.get("prompts", [])
                 self.image_prompt_queue = self._normalize_string_list(state.get("image_prompt_queue", []))
+                self.image_prompt_queue = self._normalize_image_prompt_queue_entries(state.get("image_prompt_queue", []))
                 self.image_assets = self._normalize_image_assets(state.get("image_assets", []))
                 self.scene_timeline = self._normalize_scene_timeline(state.get("scene_timeline", []), fallback_prompts=saved_prompts)
                 self._update_prompt_collection_summary()
@@ -12846,9 +16283,8 @@ class LTXQueueManager:
                 saved_image_prompts = self.image_prompt_queue
                 if saved_image_prompts:
                     self._clear_all_image_prompt_entries()
-                    for prompt_text in saved_image_prompts:
-                        self.add_image_prompt_entry()
-                        self.image_prompts[-1].insert(tk.END, prompt_text)
+                    for prompt_entry in saved_image_prompts:
+                        self.add_image_prompt_entry(prompt_entry)
                 self._update_prompt_collection_summary()
 
                 if self.scene_timeline:
@@ -12872,6 +16308,7 @@ class LTXQueueManager:
                 self.current_audio_source = state.get("current_audio_source") or self._infer_audio_source(self.current_generated_audio)
                 self.selected_video_for_music = state.get("selected_video_for_music")
                 self.current_final_video = state.get("current_final_video")
+                self.timeline_arrangement = state.get("timeline_arrangement", [])
 
                 # Load Autonomous Mode State
                 saved_auto_dur = state.get("autonomous_target_duration")
@@ -12913,12 +16350,25 @@ class LTXQueueManager:
                     self._apply_collapsible_ui_state_snapshot(restored_ui_state)
                 self._refresh_music_sidebar_state()
 
-            except Exception as e:
-                print(f"Error loading project state: {e}")
-            finally:
-                self.project_state_restore_in_progress = False
-        else:
+        except Exception as e:
+            print(f"Error loading project state: {e}")
+        finally:
             self.project_state_restore_in_progress = False
+
+    def _set_gallery_filter(self, mode):
+        self.gallery_filter_mode = mode
+        self._apply_gallery_filter_style()
+        self.refresh_gallery()
+
+    def _apply_gallery_filter_style(self):
+        if not hasattr(self, "gallery_filter_all_btn"):
+            return
+        for btn, btn_mode in [
+            (self.gallery_filter_all_btn, "all"),
+            (self.gallery_filter_videos_btn, "videos"),
+            (self.gallery_filter_images_btn, "images"),
+        ]:
+            self._style_button(btn, "primary" if self.gallery_filter_mode == btn_mode else "secondary")
 
     def refresh_gallery(self):
         # Clear existing
@@ -12927,6 +16377,7 @@ class LTXQueueManager:
         self.thumbnail_images.clear()
         self.video_checkbox_vars.clear()
         self.gallery_video_cards.clear()
+        scene_version_lookup = self._get_scene_output_version_lookup()
         final_files = self._get_gallery_video_files(self.final_mv_dir)
         stitched_files = self._get_gallery_video_files(self.stitched_dir)
         scene_files = self._get_gallery_video_files(self.scenes_dir)
@@ -12947,49 +16398,60 @@ class LTXQueueManager:
         self._update_gallery_overview(len(final_files), len(stitched_files), len(scene_files), len(generated_image_files) + len(imported_image_files))
         self._refresh_scene_asset_choices()
 
-        self._populate_image_gallery_section(
-            "Imported Images",
-            "Project-owned stills brought in manually for later image-to-video use.",
-            self.imported_image_dir,
-            imported_image_files
-        )
+        _mode = getattr(self, "gallery_filter_mode", "all")
 
-        self._populate_image_gallery_section(
-            "Generated Images",
-            "Still frames generated from the image phase queue.",
-            self.generated_image_dir,
-            generated_image_files
-        )
+        if _mode in ("all", "videos"):
+            self._populate_gallery_section(
+                "Final Music Videos",
+                "Finished exports ready for review or delivery.",
+                self.final_mv_dir,
+                final_files,
+                show_add_music=False
+            )
 
-        self._populate_gallery_section(
-            "Imported Clips",
-            "Project-owned clips you brought in manually or by drag and drop.",
-            self.imported_video_dir,
-            imported_files,
-            show_add_music=True
-        )
+        if _mode in ("all", "videos"):
+            self._populate_gallery_section(
+                "Generated Scenes",
+                "Newest individual scene renders from the active queue.",
+                self.scenes_dir,
+                scene_files,
+                show_add_music=False,
+                scene_version_lookup=scene_version_lookup
+            )
 
-        self._populate_gallery_section(
-            "Final Music Videos",
-            "Finished exports ready for review or delivery.",
-            self.final_mv_dir,
-            final_files,
-            show_add_music=False
-        )
-        self._populate_gallery_section(
-            "Stitched Renders",
-            "Long-form comps assembled from selected scenes.",
-            self.stitched_dir,
-            stitched_files,
-            show_add_music=True
-        )
-        self._populate_gallery_section(
-            "Generated Scenes",
-            "Newest individual scene renders from the active queue.",
-            self.scenes_dir,
-            scene_files,
-            show_add_music=False
-        )
+        if _mode in ("all", "videos"):
+            self._populate_gallery_section(
+                "Stitched Renders",
+                "Long-form comps assembled from selected scenes.",
+                self.stitched_dir,
+                stitched_files,
+                show_add_music=True
+            )
+
+        if _mode in ("all", "images"):
+            self._populate_image_gallery_section(
+                "Generated Images",
+                "Still frames generated from the image phase queue.",
+                self.generated_image_dir,
+                generated_image_files
+            )
+
+        if _mode in ("all", "videos"):
+            self._populate_gallery_section(
+                "Imported Clips",
+                "Project-owned clips you brought in manually or by drag and drop.",
+                self.imported_video_dir,
+                imported_files,
+                show_add_music=True
+            )
+
+        if _mode in ("all", "images"):
+            self._populate_image_gallery_section(
+                "Imported Images",
+                "Project-owned stills brought in manually for later image-to-video use.",
+                self.imported_image_dir,
+                imported_image_files
+            )
         self._update_video_selection_summary()
 
     def _get_gallery_video_files(self, folder_path):
@@ -13010,49 +16472,224 @@ class LTXQueueManager:
             reverse=True
         )
 
-    def _populate_gallery_section(self, title, description, folder_path, files, show_add_music=False):
-        section_frame = tk.Frame(self.gallery_inner_frame, padx=14, pady=14)
-        section_frame.pack(fill=tk.X, padx=4, pady=(0, 12))
-        self._style_panel(section_frame, self.colors["surface"], border=True)
+    def _create_gallery_collapsible_section(self, parent, key, title, description, default_open=False):
+        is_open = self.gallery_collapse_states.get(key, default_open)
 
-        header_row = tk.Frame(section_frame)
-        header_row.pack(fill=tk.X)
-        self._style_panel(header_row, self.colors["surface"])
+        outer_frame = tk.Frame(parent)
+        outer_frame.pack(fill=tk.X, padx=4, pady=(0, 12))
+        self._style_panel(outer_frame, self.colors["surface"], border=True)
 
-        text_frame = tk.Frame(header_row)
-        text_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        header_frame = tk.Frame(outer_frame, padx=14, pady=10)
+        header_frame.pack(fill=tk.X)
+        self._style_panel(header_frame, self.colors["surface"])
+
+        body_frame = tk.Frame(outer_frame, padx=14, pady=0)
+        self._style_panel(body_frame, self.colors["surface"])
+
+        def _toggle():
+            new_state = not self.gallery_collapse_states.get(key, default_open)
+            self.gallery_collapse_states[key] = new_state
+            toggle_btn.config(text="\u25bc" if new_state else "\u25b6")
+            if new_state:
+                body_frame.pack(fill=tk.X, pady=(0, 14))
+            else:
+                body_frame.pack_forget()
+            try:
+                self.gallery_canvas.configure(scrollregion=self.gallery_canvas.bbox("all"))
+            except tk.TclError:
+                pass
+
+        toggle_btn = tk.Button(
+            header_frame,
+            text="\u25bc" if is_open else "\u25b6",
+            width=2,
+            command=_toggle,
+            relief=tk.FLAT,
+            bd=0,
+            highlightthickness=0,
+            bg=self.colors["surface"],
+            fg=self.colors["text"],
+            activebackground=self.colors["surface_soft"],
+            activeforeground=self.colors["text"],
+            cursor="hand2",
+            font=self.fonts["body"],
+        )
+        toggle_btn.pack(side=tk.LEFT)
+
+        text_frame = tk.Frame(header_frame)
+        text_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
         self._style_panel(text_frame, self.colors["surface"])
 
         title_label = tk.Label(text_frame, text=title, anchor="w")
         title_label.pack(anchor="w")
         self._style_label(title_label, "section", self.colors["surface"])
 
-        description_label = tk.Label(text_frame, text=description, anchor="w", justify=tk.LEFT, wraplength=320)
-        description_label.pack(anchor="w", pady=(4, 0), fill=tk.X)
+        description_label = tk.Label(text_frame, text=description, anchor="w", justify=tk.LEFT, wraplength=280)
+        description_label.pack(anchor="w", pady=(2, 0))
         self._style_label(description_label, "muted", self.colors["surface"])
 
-        _, count_label = self._create_metric_chip(header_row, "Items", str(len(files)))
+        chip_area = tk.Frame(header_frame)
+        chip_area.pack(side=tk.RIGHT)
+        self._style_panel(chip_area, self.colors["surface"])
+
+        for widget in (header_frame, text_frame, title_label, description_label):
+            widget.bind("<Button-1>", lambda _e: _toggle())
+
+        if is_open:
+            body_frame.pack(fill=tk.X, pady=(0, 14))
+
+        return {"body": body_frame, "chip_area": chip_area}
+
+    def _populate_gallery_section(self, title, description, folder_path, files, show_add_music=False, scene_version_lookup=None, default_open=False):
+        key = f"gallery_sec_{title.lower().replace(' ', '_')}"
+        result = self._create_gallery_collapsible_section(self.gallery_inner_frame, key, title, description, default_open=default_open)
+        body_frame = result["body"]
+        chip_area = result["chip_area"]
+
+        _, count_label = self._create_metric_chip(chip_area, "Items", str(len(files)))
         count_label.master.pack(side=tk.RIGHT, padx=(12, 0))
 
         if not files:
-            empty_label = tk.Label(section_frame, text="No renders in this section yet.", anchor="w")
-            empty_label.pack(fill=tk.X, pady=(14, 0))
+            empty_label = tk.Label(body_frame, text="No renders in this section yet.", anchor="w")
+            empty_label.pack(fill=tk.X, pady=(4, 0))
             self._style_label(empty_label, "muted", self.colors["surface"])
             return
 
-        for filename in files:
+        if scene_version_lookup:
+            # Group by scene — build lookup from normcase path → meta, then bucket by scene_order
+            tracked_groups = {}  # scene_order (int) → list of (filename, meta)
+            untracked = []
+            for filename in files:
+                video_path = os.path.join(folder_path, filename)
+                meta = scene_version_lookup.get(os.path.normcase(video_path))
+                if meta:
+                    order = int(meta.get("scene_order") or 0)
+                    tracked_groups.setdefault(order, []).append((filename, meta))
+                else:
+                    untracked.append(filename)
+
+            # Sort groups ascending by scene number; within each group latest version first
+            for order in sorted(tracked_groups.keys()):
+                group_items = sorted(
+                    tracked_groups[order],
+                    key=lambda item: int(item[1].get("version_number") or 0),
+                    reverse=True
+                )
+                self._add_gallery_scene_group(body_frame, order, group_items, folder_path, show_add_music)
+
+            if untracked:
+                sep = tk.Label(body_frame, text="Untracked files", anchor="w")
+                sep.pack(fill=tk.X, pady=(14, 4), padx=4)
+                self._style_label(sep, "muted", self.colors["surface"])
+                for filename in untracked:
+                    video_path = os.path.join(folder_path, filename)
+                    thumb_path = os.path.join(self.thumbs_dir, f"{filename}.jpg")
+                    if not os.path.exists(thumb_path):
+                        self.generate_thumbnail(video_path, thumb_path)
+                    self.add_gallery_item(body_frame, video_path, thumb_path, filename, show_add_music)
+        else:
+            for filename in files:
+                video_path = os.path.join(folder_path, filename)
+                thumb_path = os.path.join(self.thumbs_dir, f"{filename}.jpg")
+                if not os.path.exists(thumb_path):
+                    self.generate_thumbnail(video_path, thumb_path)
+                self.add_gallery_item(body_frame, video_path, thumb_path, filename, show_add_music)
+
+    def _add_gallery_scene_group(self, body_frame, scene_order, group_items, folder_path, show_add_music=False):
+        """Render a collapsible scene group sub-header + its version cards."""
+        state_key = f"gallery_scene_grp_{scene_order}"
+        is_open = self.gallery_collapse_states.get(state_key, True)
+
+        # Pull metadata from first item for the group header
+        first_meta = group_items[0][1]
+        prompt_text = str(first_meta.get("scene_prompt") or "").strip()
+        prompt_excerpt = (prompt_text[:55] + "\u2026") if len(prompt_text) > 55 else prompt_text
+        has_active = any(item[1].get("is_active") for item in group_items)
+        version_count = len(group_items)
+
+        group_outer = tk.Frame(body_frame)
+        group_outer.pack(fill=tk.X, pady=(10, 0))
+        self._style_panel(group_outer, self.colors["surface"])
+
+        header_row = tk.Frame(group_outer, padx=10, pady=6)
+        header_row.pack(fill=tk.X)
+        self._style_panel(header_row, self.colors["surface_soft"])
+
+        group_body = tk.Frame(group_outer, padx=24, pady=0)
+        self._style_panel(group_body, self.colors["surface"])
+
+        def _toggle_group():
+            new_state = not self.gallery_collapse_states.get(state_key, True)
+            self.gallery_collapse_states[state_key] = new_state
+            toggle_btn.config(text="\u25bc" if new_state else "\u25b6")
+            if new_state:
+                group_body.pack(fill=tk.X)
+            else:
+                group_body.pack_forget()
+            try:
+                self.gallery_canvas.configure(scrollregion=self.gallery_canvas.bbox("all"))
+            except tk.TclError:
+                pass
+
+        toggle_btn = tk.Button(
+            header_row, text="\u25bc" if is_open else "\u25b6",
+            width=2, command=_toggle_group,
+            relief=tk.FLAT, bd=0, highlightthickness=0,
+            bg=self.colors["surface_soft"], fg=self.colors["text"],
+            activebackground=self.colors["surface_alt"], activeforeground=self.colors["text"],
+            cursor="hand2", font=self.fonts["body"],
+        )
+        toggle_btn.pack(side=tk.LEFT)
+
+        scene_lbl = tk.Label(header_row, text=f"Scene {scene_order}")
+        scene_lbl.pack(side=tk.LEFT, padx=(6, 0))
+        self._style_label(scene_lbl, "body_strong", self.colors["surface_soft"])
+
+        if prompt_excerpt:
+            sep_dot = tk.Label(header_row, text="\u2022")
+            sep_dot.pack(side=tk.LEFT, padx=(6, 0))
+            self._style_label(sep_dot, "muted", self.colors["surface_soft"])
+
+            excerpt_lbl = tk.Label(header_row, text=prompt_excerpt, anchor="w")
+            excerpt_lbl.pack(side=tk.LEFT, padx=(4, 0))
+            self._style_label(excerpt_lbl, "muted", self.colors["surface_soft"])
+
+        # Right-side chips
+        chips_frame = tk.Frame(header_row)
+        chips_frame.pack(side=tk.RIGHT)
+        self._style_panel(chips_frame, self.colors["surface_soft"])
+
+        if has_active:
+            active_chip = tk.Label(chips_frame, text="\u2605 Active", padx=6, pady=2)
+            active_chip.pack(side=tk.RIGHT, padx=(6, 0))
+            active_chip.configure(bg=self.colors["accent"], fg=self.colors["bg"],
+                                  font=self.fonts["small"], relief=tk.FLAT)
+
+        ver_chip = tk.Label(chips_frame, text=f"{version_count} version{'s' if version_count != 1 else ''}",
+                            padx=6, pady=2)
+        ver_chip.pack(side=tk.RIGHT)
+        ver_chip.configure(bg=self.colors["surface_alt"], fg=self.colors["text_muted"],
+                           font=self.fonts["small"], relief=tk.FLAT)
+
+        for widget in (header_row, scene_lbl):
+            widget.bind("<Button-1>", lambda _e: _toggle_group())
+
+        if is_open:
+            group_body.pack(fill=tk.X)
+
+        # Render version cards inside the group body
+        for filename, meta in group_items:
             video_path = os.path.join(folder_path, filename)
             thumb_path = os.path.join(self.thumbs_dir, f"{filename}.jpg")
-
             if not os.path.exists(thumb_path):
                 self.generate_thumbnail(video_path, thumb_path)
+            self.add_gallery_item(group_body, video_path, thumb_path, filename, show_add_music, scene_version_meta=meta)
 
-            self.add_gallery_item(section_frame, video_path, thumb_path, filename, show_add_music)
-
-    def _populate_image_gallery_section(self, title, description, folder_path, files):
-        section_frame = tk.Frame(self.gallery_inner_frame, padx=14, pady=14)
-        section_frame.pack(fill=tk.X, padx=4, pady=(0, 12))
-        self._style_panel(section_frame, self.colors["surface"], border=True)
+    def _populate_image_gallery_section(self, title, description, folder_path, files, default_open=False):
+        key = f"gallery_sec_{title.lower().replace(' ', '_')}"
+        result = self._create_gallery_collapsible_section(self.gallery_inner_frame, key, title, description, default_open=default_open)
+        body_frame = result["body"]
+        chip_area = result["chip_area"]
 
         usage_map = self._get_image_asset_usage_map()
         section_assets = []
@@ -13073,38 +16710,22 @@ class LTXQueueManager:
         )
         unused_count = max(len(section_assets) - used_count, 0)
 
-        header_row = tk.Frame(section_frame)
-        header_row.pack(fill=tk.X)
-        self._style_panel(header_row, self.colors["surface"])
-
-        text_frame = tk.Frame(header_row)
-        text_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self._style_panel(text_frame, self.colors["surface"])
-
-        title_label = tk.Label(text_frame, text=title, anchor="w")
-        title_label.pack(anchor="w")
-        self._style_label(title_label, "section", self.colors["surface"])
-
-        description_label = tk.Label(text_frame, text=description, anchor="w", justify=tk.LEFT, wraplength=320)
-        description_label.pack(anchor="w", pady=(4, 0), fill=tk.X)
-        self._style_label(description_label, "muted", self.colors["surface"])
-
-        _, unused_label = self._create_metric_chip(header_row, "Unused", str(unused_count))
+        _, unused_label = self._create_metric_chip(chip_area, "Unused", str(unused_count))
         unused_label.master.pack(side=tk.RIGHT, padx=(12, 0))
-        _, used_label = self._create_metric_chip(header_row, "Used", str(used_count))
+        _, used_label = self._create_metric_chip(chip_area, "Used", str(used_count))
         used_label.master.pack(side=tk.RIGHT, padx=(12, 0))
-        _, count_label = self._create_metric_chip(header_row, "Items", str(len(files)))
+        _, count_label = self._create_metric_chip(chip_area, "Items", str(len(files)))
         count_label.master.pack(side=tk.RIGHT, padx=(12, 0))
 
         if not files:
-            empty_label = tk.Label(section_frame, text="No images in this section yet.", anchor="w")
-            empty_label.pack(fill=tk.X, pady=(14, 0))
+            empty_label = tk.Label(body_frame, text="No images in this section yet.", anchor="w")
+            empty_label.pack(fill=tk.X, pady=(4, 0))
             self._style_label(empty_label, "muted", self.colors["surface"])
             return
 
         for filename, asset in section_assets:
             image_path = os.path.join(folder_path, filename)
-            self.add_gallery_image_item(section_frame, image_path, filename, image_asset=asset, usage_map=usage_map)
+            self.add_gallery_image_item(body_frame, image_path, filename, image_asset=asset, usage_map=usage_map)
 
     def generate_thumbnail(self, video_path, thumb_path):
         try:
@@ -13116,10 +16737,15 @@ class LTXQueueManager:
         except Exception as e:
             print(f"Error generating thumbnail for {video_path}: {e}")
 
-    def add_gallery_item(self, parent, video_path, thumb_path, title, show_add_music=False):
+    def add_gallery_item(self, parent, video_path, thumb_path, title, show_add_music=False, scene_version_meta=None):
         frame = tk.Frame(parent, bd=0, relief=tk.FLAT)
         frame.pack(fill=tk.X, pady=(12, 0))
         self._style_panel(frame, self.colors["card"], border=True)
+
+        # Accent stripe at top for the active/favorite version
+        if scene_version_meta and scene_version_meta.get("is_active"):
+            accent_stripe = tk.Frame(frame, height=3, bg=self.colors["accent"])
+            accent_stripe.pack(fill=tk.X, side=tk.TOP)
 
         thumb_shell = tk.Frame(frame, padx=8, pady=8)
         thumb_shell.pack(side=tk.LEFT, padx=(0, 6), pady=0)
@@ -13145,12 +16771,54 @@ class LTXQueueManager:
         info_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=10)
         self._style_panel(info_frame, self.colors["card"])
         
+        if scene_version_meta:
+            scene_order_var = tk.StringVar(value=str(int(scene_version_meta.get('scene_order') or 0)))
+            scene_id = str(scene_version_meta.get('scene_id') or '').strip()
+            current_order = int(scene_version_meta.get('scene_order') or 0)
+
+            scene_order_row = tk.Frame(info_frame)
+            scene_order_row.pack(anchor="nw", fill=tk.X)
+            self._style_panel(scene_order_row, self.colors["card"])
+
+            scene_order_prefix = tk.Label(scene_order_row, text="Scene")
+            scene_order_prefix.pack(side=tk.LEFT)
+            self._style_label(scene_order_prefix, "body_strong", self.colors["card"])
+
+            scene_order_entry = tk.Entry(
+                scene_order_row,
+                textvariable=scene_order_var,
+                width=3,
+                justify="center",
+                relief=tk.FLAT,
+                bd=0,
+                highlightthickness=1,
+                highlightbackground=self.colors["input_border"],
+                highlightcolor=self.colors["accent"],
+                bg=self.colors["input_bg"],
+                fg=self.colors["text"],
+                insertbackground=self.colors["text"],
+                font=self.fonts["body_strong"],
+            )
+            scene_order_entry.pack(side=tk.LEFT, padx=(4, 4))
+            scene_order_entry.bind("<Return>", lambda _e, sid=scene_id, v=scene_order_var, o=current_order: self._on_gallery_scene_order_confirm(sid, v, o))
+            scene_order_entry.bind("<FocusOut>", lambda _e, v=scene_order_var, o=current_order: self._on_gallery_scene_order_blur(v, o))
+
+            sep_label = tk.Label(scene_order_row, text="•")
+            sep_label.pack(side=tk.LEFT)
+            self._style_label(sep_label, "muted", self.colors["card"])
+
         lbl = tk.Label(info_frame, text=title, wraplength=260, justify=tk.LEFT)
         lbl.pack(anchor="nw")
         self._style_label(lbl, "body_strong", self.colors["card"])
 
         modified_text = datetime.fromtimestamp(os.path.getmtime(video_path)).strftime("%b %d, %Y %I:%M %p")
-        meta_label = tk.Label(info_frame, text=f"Updated {modified_text}", anchor="w")
+        meta_parts = []
+        if scene_version_meta:
+            meta_parts.append(f"Version v{int(scene_version_meta.get('version_number') or 0):02d}")
+            if scene_version_meta.get("is_active"):
+                meta_parts.append("Favorite")
+        meta_parts.append(f"Updated {modified_text}")
+        meta_label = tk.Label(info_frame, text=" • ".join(meta_parts), anchor="w")
         meta_label.pack(anchor="w", pady=(4, 6))
         self._style_label(meta_label, "muted", self.colors["card"])
         
@@ -13174,10 +16842,21 @@ class LTXQueueManager:
         delete_btn = tk.Button(btn_frame, text="Delete", fg="red", command=lambda p=video_path, t=thumb_path: self.delete_video(p, t))
         delete_btn.grid(row=0, column=1, sticky="ew", padx=(4, 0))
         self._style_button(delete_btn, "danger", compact=True)
+        favorite_btn = None
+        if scene_version_meta:
+            favorite_btn = tk.Button(
+                btn_frame,
+                text="Favorite" if not scene_version_meta.get("is_active") else "Favorite Selected",
+                command=lambda sid=scene_version_meta.get("scene_id"), vid=scene_version_meta.get("version_id"): self._gallery_favorite_scene_version(sid, vid)
+            )
+            favorite_btn.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+            self._style_button(favorite_btn, "accent", compact=True)
+            if scene_version_meta.get("is_active"):
+                favorite_btn.configure(state=tk.DISABLED)
         add_music_btn = None
         if show_add_music:
             add_music_btn = tk.Button(btn_frame, text="Add Music", command=lambda p=video_path, t=thumb_path: self.select_video_for_music(p, t))
-            add_music_btn.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+            add_music_btn.grid(row=2 if scene_version_meta else 1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
             self._style_button(add_music_btn, "accent", compact=True)
 
         self.gallery_video_cards[os.path.normcase(video_path)] = {
@@ -13187,6 +16866,7 @@ class LTXQueueManager:
             "checkbox": chk,
             "checkbox_var": var,
             "add_music_btn": add_music_btn,
+            "favorite_btn": favorite_btn,
             "open_folder_btn": open_folder_btn,
             "delete_btn": delete_btn,
             "thumb_path": thumb_path,
@@ -13199,6 +16879,7 @@ class LTXQueueManager:
         self._style_panel(frame, self.colors["card"], border=True)
 
         image_asset = image_asset or self._get_image_asset_by_path(image_path)
+        version_meta = self._get_image_output_version_lookup().get(os.path.normcase(self._normalize_path(image_path) or image_path))
         usage_map = usage_map or self._get_image_asset_usage_map()
         asset_id = str(image_asset.get("asset_id") or "").strip() if image_asset else ""
         usage_entries = usage_map.get(asset_id, []) if asset_id else []
@@ -13234,13 +16915,54 @@ class LTXQueueManager:
         info_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=10)
         self._style_panel(info_frame, self.colors["card"])
 
-        title_prefix = f"{order_index:02d} | " if order_index > 0 else ""
-        lbl = tk.Label(info_frame, text=f"{title_prefix}{label_text}", wraplength=260, justify=tk.LEFT)
+        if asset_id:
+            image_order_var = tk.StringVar(value=str(order_index))
+            fallback_order = order_index
+
+            image_order_row = tk.Frame(info_frame)
+            image_order_row.pack(anchor="nw", fill=tk.X)
+            self._style_panel(image_order_row, self.colors["card"])
+
+            image_order_prefix = tk.Label(image_order_row, text="Image")
+            image_order_prefix.pack(side=tk.LEFT)
+            self._style_label(image_order_prefix, "body_strong", self.colors["card"])
+
+            image_order_entry = tk.Entry(
+                image_order_row,
+                textvariable=image_order_var,
+                width=3,
+                justify="center",
+                relief=tk.FLAT,
+                bd=0,
+                highlightthickness=1,
+                highlightbackground=self.colors["input_border"],
+                highlightcolor=self.colors["accent"],
+                bg=self.colors["input_bg"],
+                fg=self.colors["text"],
+                insertbackground=self.colors["text"],
+                font=self.fonts["body_strong"],
+            )
+            image_order_entry.pack(side=tk.LEFT, padx=(4, 4))
+            image_order_entry.bind("<Return>", lambda _e, aid=asset_id, v=image_order_var, o=fallback_order: self._on_gallery_image_order_confirm(aid, v, o))
+            image_order_entry.bind("<FocusOut>", lambda _e, v=image_order_var, o=fallback_order: self._on_gallery_image_order_blur(v, o))
+
+            sep_label = tk.Label(image_order_row, text="•")
+            sep_label.pack(side=tk.LEFT)
+            self._style_label(sep_label, "muted", self.colors["card"])
+
+        lbl = tk.Label(info_frame, text=label_text, wraplength=260, justify=tk.LEFT)
         lbl.pack(anchor="nw")
         self._style_label(lbl, "body_strong", self.colors["card"])
 
         modified_text = datetime.fromtimestamp(os.path.getmtime(image_path)).strftime("%b %d, %Y %I:%M %p")
-        meta_label = tk.Label(info_frame, text=f"{source_text} image | {os.path.basename(image_path)} | Updated {modified_text}", anchor="w", wraplength=420, justify=tk.LEFT)
+        meta_parts = [f"{source_text} image"]
+        if version_meta:
+            meta_parts.append(f"Version v{int(version_meta.get('version_number') or 0):02d}")
+            if version_meta.get("is_active"):
+                meta_parts.append("Favorite")
+        meta_parts.append(os.path.basename(image_path))
+        meta_parts.append(f"Updated {modified_text}")
+        meta_label = tk.Label(info_frame, text=" | ".join(meta_parts), anchor="w", wraplength=420, justify=tk.LEFT)
         meta_label.pack(anchor="w", pady=(4, 6))
         self._style_label(meta_label, "muted", self.colors["card"])
 
@@ -13291,13 +17013,39 @@ class LTXQueueManager:
         if asset_id and order_index >= len(self.image_assets):
             move_down_btn.configure(state=tk.DISABLED)
 
+        favorite_btn = tk.Button(
+            btn_frame,
+            text="Favorite Selected" if version_meta and version_meta.get("is_active") else "Favorite",
+            command=lambda asset_id=asset_id, version_id=(version_meta or {}).get("version_id"): self.select_image_output_version(asset_id, version_id)
+        )
+        favorite_btn.grid(row=1, column=0, sticky="ew", padx=(0, 4), pady=(8, 0))
+        self._style_button(favorite_btn, "accent", compact=True)
+
+        prune_btn = tk.Button(
+            btn_frame,
+            text="Prune Others",
+            command=lambda asset_id=asset_id, version_id=(version_meta or {}).get("version_id"): self.prune_image_output_versions(asset_id, version_id)
+        )
+        prune_btn.grid(row=1, column=1, sticky="ew", padx=4, pady=(8, 0))
+        self._style_button(prune_btn, "secondary", compact=True)
+
         open_folder_btn = tk.Button(btn_frame, text="Open Folder", command=lambda p=image_path: self.open_folder(p))
-        open_folder_btn.grid(row=1, column=0, columnspan=2, sticky="ew", padx=(0, 4), pady=(8, 0))
+        open_folder_btn.grid(row=1, column=2, sticky="ew", padx=(4, 0), pady=(8, 0))
         self._style_button(open_folder_btn, "secondary", compact=True)
 
-        delete_btn = tk.Button(btn_frame, text="Delete", fg="red", command=lambda p=image_path, asset_id=asset_id: self.delete_image(p, asset_id=asset_id))
-        delete_btn.grid(row=1, column=2, sticky="ew", padx=(4, 0), pady=(8, 0))
+        delete_btn = tk.Button(btn_frame, text="Delete Version" if version_meta else "Delete", fg="red", command=lambda p=image_path, asset_id=asset_id: self.delete_image(p, asset_id=asset_id))
+        delete_btn.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         self._style_button(delete_btn, "danger", compact=True)
+
+        if not asset_id or not version_meta:
+            favorite_btn.configure(state=tk.DISABLED)
+            prune_btn.configure(state=tk.DISABLED)
+        else:
+            if version_meta.get("is_active"):
+                favorite_btn.configure(state=tk.DISABLED)
+            asset_versions = (image_asset or {}).get("output_versions") or []
+            if len(asset_versions) <= 1:
+                prune_btn.configure(state=tk.DISABLED)
 
     def move_image_asset(self, asset_id, direction):
         normalized_asset_id = str(asset_id or "").strip()
@@ -13313,7 +17061,8 @@ class LTXQueueManager:
         if target_index < 0 or target_index >= len(assets):
             return
 
-        assets[current_index], assets[target_index] = assets[target_index], assets[current_index]
+        item = assets.pop(current_index)
+        assets.insert(target_index, item)
         self.image_assets = self._reindex_ordered_entries(assets)
         self.save_project_state()
         self.refresh_gallery()
@@ -13362,6 +17111,11 @@ class LTXQueueManager:
         return sorted(number for number in cleared_scene_numbers if number > 0)
 
     def delete_image(self, image_path, asset_id=None):
+        version_meta = self._get_image_output_version_lookup().get(os.path.normcase(self._normalize_path(image_path) or image_path))
+        if version_meta and version_meta.get("asset_id"):
+            self.delete_image_output_version(version_meta.get("asset_id"), version_meta.get("version_id"))
+            return
+
         resolved_asset = self._get_image_asset_by_id(asset_id) if asset_id else self._get_image_asset_by_path(image_path)
         scene_numbers = self._get_image_asset_scene_numbers(resolved_asset.get("asset_id")) if resolved_asset else []
         prompt_lines = [f"Are you sure you want to delete {os.path.basename(image_path)}?"]
@@ -13393,6 +17147,10 @@ class LTXQueueManager:
             messagebox.showerror("Error", f"Could not delete image:\n{e}")
 
     def delete_video(self, video_path, thumb_path):
+        scene_version_meta = self._get_scene_output_version_lookup().get(os.path.normcase(video_path))
+        if scene_version_meta:
+            self.delete_scene_output_version(scene_version_meta.get("scene_id"), scene_version_meta.get("version_id"))
+            return
         if messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete {os.path.basename(video_path)}?"):
             try:
                 if os.path.exists(video_path):
@@ -13508,6 +17266,8 @@ class LTXQueueManager:
         filepaths = sorted(list(self.selected_videos), key=lambda x: os.path.getmtime(x))
         
         self.stitch_btn.config(state=tk.DISABLED)
+        if hasattr(self, "gallery_stitch_btn"):
+            self.gallery_stitch_btn.config(state=tk.DISABLED)
         strip_audio = self.strip_audio_var.get()
         thread = threading.Thread(target=self.process_stitching, args=(filepaths, strip_audio))
         thread.daemon = True
@@ -13590,6 +17350,8 @@ class LTXQueueManager:
                 except:
                     pass
             self.root.after(0, lambda: self.stitch_btn.config(state=tk.NORMAL))
+            if hasattr(self, "gallery_stitch_btn"):
+                self.root.after(0, lambda: self.gallery_stitch_btn.config(state=tk.NORMAL if len(self.selected_videos) > 0 else tk.DISABLED))
 
     def generate_single_prompt(self, text_widget):
         self.save_project_state()
@@ -13758,8 +17520,9 @@ class LTXQueueManager:
         if hasattr(self, "add_prompt_btn"):
             self.root.after(0, lambda: self.add_prompt_btn.config(state=tk.NORMAL))
 
-    def run_image_queue(self, prompts_text, image_settings=None):
-        total = len(prompts_text)
+    def run_image_queue(self, prompt_entries, image_settings=None):
+        render_tasks = self._build_image_render_tasks(prompt_entries)
+        total = len(render_tasks)
         self._set_tutorial_runtime_progress(
             "image_generate",
             reset=True,
@@ -13770,31 +17533,39 @@ class LTXQueueManager:
             stage="preparing",
         )
 
-        for i, prompt_text in enumerate(prompts_text, start=1):
-            self.update_status(f"Generating image {i} of {total}...", "blue")
+        for i, render_task in enumerate(render_tasks, start=1):
+            prompt_entry = self._get_image_prompt_entry_by_id(render_task.get("prompt_id")) or self._create_image_prompt_queue_entry(
+                prompt_text=render_task.get("prompt_text", ""),
+                prompt_id=render_task.get("prompt_id"),
+            )
+            prompt_text = str(prompt_entry.get("prompt_text") or render_task.get("prompt_text") or "").strip()
+            row_index = int(render_task.get("row_index") or i)
+            version_number = int(render_task.get("version_number") or 1)
+            self.update_status(f"Generating image {row_index}, version {version_number} ({i} of {total})...", "blue")
             self.update_debug_prompt_status(prompt_text, current=i, total=total)
-            self.log_debug("IMAGE_QUEUE_ITEM_START", index=i, total=total, prompt_preview=self._truncate_text(prompt_text, 140))
+            self.log_debug("IMAGE_QUEUE_ITEM_START", index=i, total=total, prompt_preview=self._truncate_text(prompt_text, 140), row_index=row_index, version_number=version_number)
             self._set_tutorial_runtime_progress(
                 "image_generate",
-                status=f"Submitting image prompt {i} of {total}...",
+                status=f"Submitting image {row_index}, version {version_number} ({i} of {total})...",
                 current=i,
                 total=total,
-                item_label=f"Image {i}",
+                item_label=f"Image {row_index} v{version_number:02d}",
                 stage="submitting",
             )
 
-            filename_prefix = self._build_image_filename_prefix("queue", i)
+            before_files = self._snapshot_media_files(self.generated_image_dir, SUPPORTED_IMAGE_EXTENSIONS)
+            filename_prefix = self._build_image_filename_prefix("queue", row_index, suffix=f"v{version_number:02d}")
             workflow_to_submit = self._build_image_workflow_for_prompt(prompt_text, filename_prefix, image_settings=image_settings)
 
             item_start = time.time()
             self.eta_item_start_time = item_start
             prompt_id = self.queue_prompt(workflow_to_submit)
             if not prompt_id:
-                self.log_debug("IMAGE_QUEUE_ITEM_ABORTED", index=i, reason="queue_prompt_failed")
-                self._set_tutorial_runtime_progress("image_generate", status=f"Image prompt {i} failed to submit.", current=i, total=total, item_label=f"Image {i}", stage="failed")
+                self.log_debug("IMAGE_QUEUE_ITEM_ABORTED", index=i, reason="queue_prompt_failed", row_index=row_index, version_number=version_number)
+                self._set_tutorial_runtime_progress("image_generate", status=f"Image {row_index}, version {version_number} failed to submit.", current=i, total=total, item_label=f"Image {row_index} v{version_number:02d}", stage="failed")
                 break
 
-            success = self.wait_for_completion(
+            success, rendered_output = self.wait_for_completion(
                 prompt_id,
                 output_kind="image",
                 destination_dir=self.generated_image_dir,
@@ -13802,33 +17573,52 @@ class LTXQueueManager:
                 tutorial_progress_phase="image_generate",
                 tutorial_progress_current=i,
                 tutorial_progress_total=total,
-                tutorial_progress_label=f"Image {i}",
+                tutorial_progress_label=f"Image {row_index} v{version_number:02d}",
+                return_output_path=True,
+                register_image_asset=False,
             )
             if not success:
-                self.log_debug("IMAGE_QUEUE_ITEM_FAILED", index=i, prompt_id=prompt_id)
+                self.log_debug("IMAGE_QUEUE_ITEM_FAILED", index=i, prompt_id=prompt_id, row_index=row_index, version_number=version_number)
                 break
 
+            if not rendered_output:
+                rendered_output = self._get_newest_rendered_media(before_files, self.generated_image_dir, SUPPORTED_IMAGE_EXTENSIONS)
+            self._register_generated_image_for_prompt_entry(prompt_entry, rendered_output, prompt_text=prompt_text)
+
             self.record_tutorial_phase_timing("image_generate", time.time() - item_start)
-            self.log_debug("IMAGE_QUEUE_ITEM_COMPLETE", index=i, prompt_id=prompt_id)
+            self.log_debug("IMAGE_QUEUE_ITEM_COMPLETE", index=i, prompt_id=prompt_id, row_index=row_index, version_number=version_number, output_path=rendered_output)
             self._set_tutorial_runtime_progress(
                 "image_generate",
-                status=f"Completed image {i} of {total}.",
+                status=f"Completed image {row_index}, version {version_number} ({i} of {total}).",
                 current=i,
                 total=total,
-                item_label=f"Image {i}",
+                item_label=f"Image {row_index} v{version_number:02d}",
                 stage="item_complete",
+                output_path=rendered_output,
             )
         else:
             self.update_status("Finished all image prompts!", "green")
             self.log_debug("IMAGE_QUEUE_COMPLETE", total=total)
             self._set_tutorial_runtime_progress("image_generate", status="Finished all image prompts.", current=total, total=total, item_label="Image queue", stage="complete")
 
-    def run_single_image_prompt_thread(self, prompt_text, image_settings=None):
+    def run_single_image_prompt_thread(self, prompt_entry, image_settings=None):
+        prompt_entry = self._create_image_prompt_queue_entry(
+            prompt_text=(prompt_entry or {}).get("prompt_text", ""),
+            prompt_id=(prompt_entry or {}).get("prompt_id"),
+            version_count=(prompt_entry or {}).get("version_count", 1),
+            asset_id=(prompt_entry or {}).get("asset_id"),
+            created_at=(prompt_entry or {}).get("created_at"),
+            updated_at=datetime.now().isoformat(timespec="seconds"),
+        )
+        prompt_text = prompt_entry.get("prompt_text", "")
         self.update_status("Generating single image...", "blue")
         self.update_debug_prompt_status(prompt_text)
         self.log_debug("SINGLE_IMAGE_PROMPT_THREAD_START", prompt_preview=self._truncate_text(prompt_text, 140))
 
-        filename_prefix = self._build_image_filename_prefix("single")
+        asset = self._get_image_asset_by_id(prompt_entry.get("asset_id"))
+        version_number = self._get_next_image_output_version_number(asset) if asset else 1
+        before_files = self._snapshot_media_files(self.generated_image_dir, SUPPORTED_IMAGE_EXTENSIONS)
+        filename_prefix = self._build_image_filename_prefix("single", suffix=f"v{version_number:02d}")
         workflow_to_submit = self._build_image_workflow_for_prompt(prompt_text, filename_prefix, image_settings=image_settings)
 
         self._set_tutorial_runtime_progress("image_single", reset=True, status="Generating image...", current=0, total=1, item_label="Single image", stage="preparing")
@@ -13837,16 +17627,21 @@ class LTXQueueManager:
             item_start = time.time()
             self.eta_item_start_time = item_start
             self._set_tutorial_runtime_progress("image_single", status="Rendering image...", current=1, total=1, item_label="Single image", stage="submitting")
-            success = self.wait_for_completion(
+            success, rendered_output = self.wait_for_completion(
                 prompt_id,
                 output_kind="image",
                 destination_dir=self.generated_image_dir,
-                prompt_text=prompt_text
+                prompt_text=prompt_text,
+                return_output_path=True,
+                register_image_asset=False,
             )
             if success:
+                if not rendered_output:
+                    rendered_output = self._get_newest_rendered_media(before_files, self.generated_image_dir, SUPPORTED_IMAGE_EXTENSIONS)
+                self._register_generated_image_for_prompt_entry(prompt_entry, rendered_output, prompt_text=prompt_text)
                 self.record_tutorial_phase_timing("image_single", time.time() - item_start)
                 self.update_status("Single image generated successfully!", "green")
-                self.log_debug("SINGLE_IMAGE_PROMPT_COMPLETE", prompt_id=prompt_id, success=True)
+                self.log_debug("SINGLE_IMAGE_PROMPT_COMPLETE", prompt_id=prompt_id, success=True, version_number=version_number, output_path=rendered_output)
                 self._set_tutorial_runtime_progress("image_single", status="Single image generated.", current=1, total=1, item_label="Single image", stage="complete")
             else:
                 self.update_status("Failed to generate single image.", "red")
@@ -13865,13 +17660,14 @@ class LTXQueueManager:
             return prompt_preview
         return self._get_workflow_role_value_from_roles(workflow, IMAGE_WORKFLOW_PROFILE["roles"], "prompt", default="")
 
-    def generate_single_image_prompt(self, text_widget):
+    def generate_single_image_prompt(self, frame):
         self.save_project_state()
         if not self.image_workflow:
             messagebox.showwarning("Warning", "Please load the image workflow JSON first.")
             return
 
-        prompt_text = text_widget.get("1.0", tk.END).strip()
+        prompt_entry = self._get_image_prompt_entry_from_frame(frame)
+        prompt_text = prompt_entry.get("prompt_text", "")
         if not prompt_text:
             messagebox.showwarning("Warning", "Image prompt is empty.")
             return
@@ -13890,7 +17686,7 @@ class LTXQueueManager:
         if hasattr(self, "sync_image_to_scene_btn"):
             self.sync_image_to_scene_btn.config(state=tk.DISABLED)
 
-        thread = threading.Thread(target=self.run_single_image_prompt_thread, args=(prompt_text, image_settings))
+        thread = threading.Thread(target=self.run_single_image_prompt_thread, args=(prompt_entry, image_settings))
         thread.daemon = True
         thread.start()
 
@@ -13900,8 +17696,8 @@ class LTXQueueManager:
             messagebox.showwarning("Warning", "Please load the image workflow JSON first.")
             return
 
-        prompts_text = self._collect_image_prompt_texts()
-        if not prompts_text:
+        prompt_entries = self._collect_image_prompt_queue_entries()
+        if not prompt_entries:
             messagebox.showwarning("Warning", "Please add at least one image prompt.")
             return
 
@@ -13911,7 +17707,7 @@ class LTXQueueManager:
             self.update_status(validation_error, "red")
             return
 
-        self.log_debug("IMAGE_QUEUE_START", prompt_count=len(prompts_text), previews=[self._truncate_text(p, 120) for p in prompts_text])
+        self.log_debug("IMAGE_QUEUE_START", prompt_count=len(prompt_entries), previews=[self._truncate_text(entry.get("prompt_text", ""), 120) for entry in prompt_entries])
 
         self.run_image_queue_btn.config(state=tk.DISABLED)
         self.add_image_prompt_btn.config(state=tk.DISABLED)
@@ -13919,13 +17715,13 @@ class LTXQueueManager:
         if hasattr(self, "sync_image_to_scene_btn"):
             self.sync_image_to_scene_btn.config(state=tk.DISABLED)
 
-        thread = threading.Thread(target=self._run_image_queue_thread, args=(prompts_text, image_settings))
+        thread = threading.Thread(target=self._run_image_queue_thread, args=(prompt_entries, image_settings))
         thread.daemon = True
         thread.start()
 
-    def _run_image_queue_thread(self, prompts_text, image_settings):
+    def _run_image_queue_thread(self, prompt_entries, image_settings):
         try:
-            self.run_image_queue(prompts_text, image_settings=image_settings)
+            self.run_image_queue(prompt_entries, image_settings=image_settings)
         finally:
             self.root.after(0, lambda: self.run_image_queue_btn.config(state=tk.NORMAL))
             self.root.after(0, lambda: self.add_image_prompt_btn.config(state=tk.NORMAL))
@@ -13973,7 +17769,7 @@ class LTXQueueManager:
                             if node_errors_list:
                                 raw_msg = node_errors_list[0].get("message", error_msg)
                                 # Provide a human-readable message for common errors
-                                if raw_msg == "Value not in list" and first_node.get("class_type") == "UNETLoader":
+                                if raw_msg == "Value not in list" and first_node.get("class_type", "") in ("UNETLoader", "UnetLoaderGGUF", "VAELoader", "LTXAVTextEncoderLoader", "LTXVAudioVAELoader", "LatentUpscaleModelLoader"):
                                     bad_value = node_errors_list[0].get("details", "")
                                     error_msg = f"Model file not found in ComfyUI: {bad_value}" if bad_value else "Selected model file not found in ComfyUI. Download it or switch variants."
                                 else:
@@ -14091,7 +17887,7 @@ class LTXQueueManager:
         self.ws_progress["active"] = False
         self.ws_thread = None
 
-    def wait_for_completion(self, prompt_id, is_music=False, output_kind=None, destination_dir=None, prompt_text="", tutorial_progress_phase=None, tutorial_progress_current=None, tutorial_progress_total=None, tutorial_progress_label=""):
+    def wait_for_completion(self, prompt_id, is_music=False, output_kind=None, destination_dir=None, prompt_text="", tutorial_progress_phase=None, tutorial_progress_current=None, tutorial_progress_total=None, tutorial_progress_label="", return_output_path=False, register_image_asset=True):
         resolved_output_kind = output_kind or ("audio" if is_music else "video")
         resolved_destination_dir = destination_dir or self._get_output_directory_for_kind(resolved_output_kind)
         progress_label = tutorial_progress_label or resolved_output_kind.title()
@@ -14100,12 +17896,13 @@ class LTXQueueManager:
         error_count = 0
         self._start_ws_progress_listener(prompt_id)
         try:
-            return self._poll_for_completion(prompt_id, is_music, resolved_output_kind, resolved_destination_dir, prompt_text, tutorial_progress_phase, progress_current, progress_total, progress_label)
+            return self._poll_for_completion(prompt_id, is_music, resolved_output_kind, resolved_destination_dir, prompt_text, tutorial_progress_phase, progress_current, progress_total, progress_label, return_output_path=return_output_path, register_image_asset=register_image_asset)
         finally:
             self._stop_ws_progress_listener()
 
-    def _poll_for_completion(self, prompt_id, is_music, resolved_output_kind, resolved_destination_dir, prompt_text, tutorial_progress_phase, progress_current, progress_total, progress_label):
+    def _poll_for_completion(self, prompt_id, is_music, resolved_output_kind, resolved_destination_dir, prompt_text, tutorial_progress_phase, progress_current, progress_total, progress_label, return_output_path=False, register_image_asset=True):
         error_count = 0
+        downloaded_output_path = None
         if tutorial_progress_phase:
             self._set_tutorial_runtime_progress(
                 tutorial_progress_phase,
@@ -14129,6 +17926,7 @@ class LTXQueueManager:
                         continue
                     if prompt_id in history:
                         self.log_debug("PROMPT_HISTORY_FOUND", prompt_id=prompt_id, is_music=is_music, output_kind=resolved_output_kind)
+                        outputs = history[prompt_id].get('outputs', {})
                         if tutorial_progress_phase:
                             self._set_tutorial_runtime_progress(
                                 tutorial_progress_phase,
@@ -14141,7 +17939,6 @@ class LTXQueueManager:
                             )
                         # Extract output filename and download
                         try:
-                            outputs = history[prompt_id].get('outputs', {})
                             downloaded_output = False
                             for node_id, node_output in outputs.items():
                                 media_list = node_output.get('gifs', []) + node_output.get('images', []) + node_output.get('audio', [])
@@ -14155,15 +17952,17 @@ class LTXQueueManager:
                                     dest_path = os.path.join(resolved_destination_dir, filename)
                                     if self.download_comfyui_media(filename, subfolder, folder_type, dest_path):
                                         downloaded_output = True
+                                        downloaded_output_path = dest_path
                                         if resolved_output_kind == "video":
                                             self.root.after(0, self.refresh_gallery)
                                         elif resolved_output_kind == "audio":
                                             self.current_generated_audio = dest_path
                                             self.current_audio_source = "generated"
                                         elif resolved_output_kind == "image":
-                                            self._upsert_image_asset(dest_path, source="generated", prompt_text=prompt_text, status="ready")
-                                            self.root.after(0, self.refresh_gallery)
-                                            self.root.after(0, self.save_project_state)
+                                            if register_image_asset:
+                                                self._upsert_image_asset(dest_path, source="generated", prompt_text=prompt_text, status="ready")
+                                                self.root.after(0, self.refresh_gallery)
+                                                self.root.after(0, self.save_project_state)
 
                                         self.log_debug("PROMPT_OUTPUT_DOWNLOADED", prompt_id=prompt_id, media_type=resolved_output_kind, filename=filename, dest_path=dest_path)
                                         break
@@ -14182,7 +17981,7 @@ class LTXQueueManager:
                                 stage="complete",
                                 prompt_id=prompt_id,
                             )
-                        return True
+                        return (True, downloaded_output_path) if return_output_path else True
                 
                 # Check queue
                 req_queue = urllib.request.Request("http://127.0.0.1:8188/queue")
@@ -14237,7 +18036,7 @@ class LTXQueueManager:
                                             stage="complete",
                                             prompt_id=prompt_id,
                                         )
-                                    return True
+                                    return (True, downloaded_output_path) if return_output_path else True
                             except json.JSONDecodeError:
                                 pass
                         
@@ -14254,7 +18053,7 @@ class LTXQueueManager:
                                 stage="failed",
                                 prompt_id=prompt_id,
                             )
-                        return False
+                        return (False, None) if return_output_path else False
 
             except urllib.error.URLError as e:
                 error_count += 1
@@ -14263,7 +18062,7 @@ class LTXQueueManager:
                     self.update_music_status("Fatal Error: Server unresponsive. Aborting.", "red")
                     if tutorial_progress_phase:
                         self._set_tutorial_runtime_progress(tutorial_progress_phase, status=f"{progress_label} aborted: ComfyUI became unresponsive.", current=progress_current, total=progress_total, item_label=progress_label, stage="failed", prompt_id=prompt_id)
-                    return False
+                    return (False, None) if return_output_path else False
                 # Don't abort on timeouts or temporary connection refusals under heavy GPU load
                 error_reason = getattr(e, 'reason', str(e))
                 self.update_status(f"Server busy or timeout ({error_reason}). Waiting...", "orange")
@@ -14279,7 +18078,7 @@ class LTXQueueManager:
                     self.update_music_status("Fatal Error: Server unresponsive. Aborting.", "red")
                     if tutorial_progress_phase:
                         self._set_tutorial_runtime_progress(tutorial_progress_phase, status=f"{progress_label} aborted after repeated polling errors.", current=progress_current, total=progress_total, item_label=progress_label, stage="failed", prompt_id=prompt_id)
-                    return False
+                    return (False, None) if return_output_path else False
                 self.update_status(f"Polling error: {str(e)}. Retrying...", "orange")
                 self.update_music_status(f"Polling error: {str(e)}. Retrying...", "orange")
                 self.log_debug("PROMPT_POLL_EXCEPTION", prompt_id=prompt_id, error=str(e), error_count=error_count)
@@ -14699,6 +18498,8 @@ class LTXQueueManager:
                 self.autonomous_duration_entry.config(state="readonly" if is_running else tk.NORMAL)
             if hasattr(self, "autonomous_aspect_combo"):
                 self.autonomous_aspect_combo.config(state="disabled" if is_running else "readonly")
+            if hasattr(self, "autonomous_model_preset_combo"):
+                self.autonomous_model_preset_combo.config(state="disabled" if is_running else "readonly")
             if hasattr(self, "autonomous_brief_text"):
                 self.autonomous_brief_text.config(state=tk.DISABLED if is_running else tk.NORMAL)
             if hasattr(self, "chatbot_send_btn"):
@@ -14743,6 +18544,16 @@ class LTXQueueManager:
         self._log_ollama_tuning_recommendations()
 
         try:
+            # ── Pre-flight: check that required models are downloaded ──
+            model_audit = self.audit_required_models()
+            missing = model_audit.get("missing", [])
+            if missing:
+                names = ", ".join(r["filename"] for r in missing[:5])
+                extra = f" (and {len(missing) - 5} more)" if len(missing) > 5 else ""
+                raise RuntimeError(
+                    f"Missing {len(missing)} required model file(s): {names}{extra}. "
+                    f"Open the Model Downloader to install them before running Autonomous Mode."
+                )
             # ═══════════════════════════════════════════════════════════════
             # LLM BLOCK — All chatbot work runs while the model is warm.
             # The model stays loaded with keep_alive="30m" between calls,
@@ -15603,6 +19414,10 @@ class LTXQueueManager:
             else:
                 workflow_to_submit = self._build_video_workflow_for_prompt(prompt_text, filename_prefix, video_settings)
 
+            if not workflow_to_submit:
+                self.root.after(0, lambda sid=scene_id: self._set_scene_entry_render_state(sid, "failed"))
+                continue
+
             # ── Submit to ComfyUI with retry ──
             success = False
             for attempt in range(2):
@@ -15781,6 +19596,14 @@ class LTXQueueManager:
     def on_closing(self):
         self._cancel_comfyui_console_poll()
         self._cancel_acestep_console_poll()
+        # Clean up any temp WAV files created for timeline audio preview
+        for tmp in list(getattr(self, '_timeline_wav_cache', {}).values()):
+            try:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+            except OSError:
+                pass
+        self._timeline_wav_cache.clear()
         self.save_global_settings()
         self.save_project_state()
         if self.chatbot_server_managed_by_app:

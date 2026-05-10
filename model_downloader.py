@@ -47,6 +47,9 @@ def probe_download_size(url, timeout=20):
 
 
 def download_file(url, dest_path, progress_callback=None, cancel_check=None, chunk_size=4 * 1024 * 1024, timeout=60):
+    if not url or not url.lower().startswith(("https://", "http://")):
+        raise ValueError(f"Unsupported or missing URL scheme: {url!r}")
+
     partial_path = f"{dest_path}.partial"
     existing_size = os.path.getsize(partial_path) if os.path.exists(partial_path) else 0
     request_headers = {}
