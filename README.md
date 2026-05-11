@@ -18,6 +18,14 @@
 
 **Local AI Music Video Studio** — Generate video scenes, compose music, and merge them into finished music videos, all from one desktop app powered by ComfyUI.
 
+## What's New in v3.1
+
+- **Gallery re-render with prompt editing** — Every scene video card and image card in the Gallery now has a **Re-render** button. Clicking it opens a modal with the full prompt pre-filled, a thumbnail for reference, a Reset button to restore the original prompt, and a Confirm button to queue a new render. For image-to-video scenes the source image filename is shown automatically.
+- **Gallery scene rearrangement** — Scene order is now fully editable directly from the Gallery.
+  - **Group header** — Each "Scene N" header now shows an editable number field. Changing it and pressing Enter moves the entire group (all its versions) to the target position. If that slot is already occupied a dialog lets you choose between *Move Here* (push the occupying scene down) or *Merge All* (combine all versions into the target scene).
+  - **Version card** — Every individual render card also has its own editable scene number. Changing it moves just that single render to the target scene (it becomes an alternate version there) or splits it into a brand-new scene. Confirmation dialogs show version counts before committing.
+  - **Total freedom** — All entries remain editable at all times, including after merges. Empty source scenes are automatically cleaned up. New split scenes appear immediately with their own editable header.
+
 ## What's New in v3.0
 
 - **Timeline Editor NLE** — A full non-linear editor tab for arranging your music video. Drag clips left and right on the timeline rail to reorder scenes. A built-in video preview plays each clip with Play/Stop transport controls, a timecode display, and a follow-playhead mode. Zoom in/out to see fine-grained or high-level views of your edit. Overlay an AI-generated song on the audio track and export the finished video directly from the editor.
@@ -213,7 +221,7 @@ python ltx_queue_manager.py
 
 ```powershell
 .\build_exe.bat              # → dist\Prompt2MTV\Prompt2MTV.exe
-.\.build_installer.bat        # → dist_installer\Prompt2MTV-Setup-3.0.0.exe
+.\.build_installer.bat        # → dist_installer\Prompt2MTV-Setup-3.1.0.exe
 ```
 
 ### Upgrade helper

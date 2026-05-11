@@ -1,5 +1,5 @@
 #define MyAppName "Prompt2MTV"
-#define MyAppVersion "3.0.0"
+#define MyAppVersion "3.1.0"
 #define MyAppPublisher "Prompt2MTV"
 #define MyAppTagline "Local AI Music Video Studio"
 #define MyAppURL "https://buymeacoffee.com/rorrimaesu"

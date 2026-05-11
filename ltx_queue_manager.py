@@ -207,7 +207,7 @@ WINDOWS_HIDE = 0
 WINDOWS_SHOW = 5
 WINDOWS_RESTORE = 9
 APP_NAME = "Prompt2MTV"
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.1.0"
 APP_PUBLISHER = "Prompt2MTV"
 APP_TAGLINE = "Local AI Music Video Studio"
 ENV_COMFYUI_ROOT_KEYS = ("PROMPT2MTV_COMFYUI_ROOT", "COMFYUI_ROOT")
@@ -1757,6 +1757,35 @@ class LTXQueueManager:
             delta = int(-1 * (event.delta / 120)) if getattr(event, "delta", 0) else (-1 if getattr(event, "num", None) == 4 else 1)
             self.scene_canvas.yview_scroll(delta, "units")
         return "break"
+
+    def _auto_resize_prompt_text(self, widget, scrollbar, min_lines=3, max_lines=8):
+        """Resize a scene prompt Text widget to fit its content, showing scrollbar only when needed."""
+        try:
+            display_lines = widget.count("1.0", "end", "displaylines")
+            display_lines = display_lines[0] if display_lines else 1
+            clamped = max(min_lines, min(max_lines, display_lines))
+            if widget.cget("height") != clamped:
+                widget.config(height=clamped)
+            if widget.yview() == (0.0, 1.0):
+                scrollbar.pack_forget()
+            else:
+                if not scrollbar.winfo_ismapped():
+                    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        except tk.TclError:
+            pass
+
+    def _update_prompt_word_count(self, widget, label):
+        """Update a word count label based on a Text widget's current content."""
+        try:
+            content = widget.get("1.0", tk.END).strip()
+            if not content:
+                label.config(text="Empty")
+                return
+            word_count = len(content.split())
+            char_count = len(content)
+            label.config(text=f"{word_count} word{'s' if word_count != 1 else ''} · {char_count} chars")
+        except tk.TclError:
+            pass
 
     def _on_chatbot_transcript_mousewheel(self, event):
         if not hasattr(self, "chatbot_transcript_canvas"):
@@ -9962,6 +9991,10 @@ class LTXQueueManager:
         self.auto_assign_scene_images_btn.pack(side=tk.LEFT, padx=(10, 0))
         self.render_scene_timeline_btn = tk.Button(self.scene_timeline_actions_frame, text="Render Scene Timeline", command=self.start_scene_timeline_render)
         self.render_scene_timeline_btn.pack(side=tk.LEFT, padx=(10, 0))
+        self.render_selected_scenes_btn = tk.Button(self.scene_timeline_actions_frame, text="Render Selected", state=tk.DISABLED, command=self.start_selected_scenes_render)
+        self.render_selected_scenes_btn.pack(side=tk.LEFT, padx=(10, 0))
+        self.select_all_scenes_btn = tk.Button(self.scene_timeline_actions_frame, text="Select All", command=self._toggle_scene_select_all)
+        self.select_all_scenes_btn.pack(side=tk.LEFT, padx=(10, 0))
 
         self.scene_canvas_shell = tk.Frame(self.scene_timeline_frame)
         self.scene_canvas_shell.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
@@ -14245,6 +14278,10 @@ class LTXQueueManager:
         self._schedule_project_state_save()
 
     def _handle_scene_prompt_edit(self, frame):
+        if hasattr(frame, "prompt_text") and hasattr(frame, "prompt_scrollbar"):
+            self._auto_resize_prompt_text(frame.prompt_text, frame.prompt_scrollbar)
+        if hasattr(frame, "prompt_text") and hasattr(frame, "prompt_word_count_label"):
+            self._update_prompt_word_count(frame.prompt_text, frame.prompt_word_count_label)
         self._mark_scene_frame_stale(frame)
 
     def _handle_scene_mode_changed(self, frame):
@@ -14299,6 +14336,84 @@ class LTXQueueManager:
         self._refresh_scene_asset_choices()
         self.update_scene_scroll_region()
         self._update_prompt_collection_summary()
+        self._on_scene_selection_changed()
+
+    def _on_scene_selection_changed(self):
+        if not hasattr(self, "render_selected_scenes_btn"):
+            return
+        frames = [f for f in self._collect_scene_entry_frames() if hasattr(f, "selected_var")]
+        checked_count = sum(1 for f in frames if f.selected_var.get())
+        if checked_count == 0:
+            self.render_selected_scenes_btn.config(state=tk.DISABLED, text="Render Selected")
+        else:
+            self.render_selected_scenes_btn.config(state=tk.NORMAL, text=f"Render Selected ({checked_count})")
+        if hasattr(self, "select_all_scenes_btn"):
+            all_checked = len(frames) > 0 and checked_count == len(frames)
+            self.select_all_scenes_btn.config(text="Deselect All" if all_checked else "Select All")
+
+    def _toggle_scene_select_all(self):
+        frames = [f for f in self._collect_scene_entry_frames() if hasattr(f, "selected_var")]
+        all_checked = len(frames) > 0 and all(f.selected_var.get() for f in frames)
+        for f in frames:
+            f.selected_var.set(not all_checked)
+        self._on_scene_selection_changed()
+
+    def start_selected_scenes_render(self):
+        if self.scene_render_in_progress:
+            return
+        frames = self._collect_scene_entry_frames()
+        selected_frames = [f for f in frames if hasattr(f, "selected_var") and f.selected_var.get()]
+        if not selected_frames:
+            messagebox.showwarning("Render Selected", "No scenes are selected. Check the boxes next to scenes to select them.")
+            return
+        target_ids = {f.scene_id for f in selected_frames}
+        scene_timeline = self._collect_scene_timeline_from_widgets()
+        selected_entries = [e for e in scene_timeline if str(e.get("scene_id") or "").strip() in {str(sid) for sid in target_ids}]
+        video_settings, validation_error = self._collect_validated_video_settings()
+        if validation_error:
+            messagebox.showerror("Workflow Settings Error", validation_error)
+            self.update_status(validation_error, "red")
+            return
+        if not self._validate_scene_entries_for_render(selected_entries):
+            return
+        self.save_project_state()
+        self.scene_timeline = self._normalize_scene_timeline(scene_timeline)
+        self._set_scene_render_controls_enabled(False)
+        thread = threading.Thread(
+            target=self._run_scene_timeline_thread,
+            args=(self.scene_timeline, video_settings),
+            kwargs={"target_scene_ids": target_ids}
+        )
+        thread.daemon = True
+        thread.start()
+
+    def _clear_scene_selections(self):
+        for frame in self._collect_scene_entry_frames():
+            if hasattr(frame, "selected_var"):
+                frame.selected_var.set(False)
+        self._on_scene_selection_changed()
+
+    def _collect_image_prompt_frames(self):
+        if not hasattr(self, "image_scrollable_frame"):
+            return []
+        frames = []
+        for frame in self.image_scrollable_frame.winfo_children():
+            text_widget = getattr(frame, "prompt_text_widget", None)
+            if text_widget is None:
+                continue
+            if not getattr(frame, "prompt_entry_id", None):
+                continue
+            try:
+                if int(text_widget.winfo_exists()) == 1:
+                    frames.append(frame)
+            except tk.TclError:
+                continue
+        return frames
+
+    def _refresh_image_prompt_entry_rows(self):
+        for index, frame in enumerate(self._collect_image_prompt_frames(), start=1):
+            if hasattr(frame, "order_var"):
+                frame.order_var.set(str(index))
 
     def _clear_all_scene_timeline_entries(self):
         if not hasattr(self, "scene_scrollable_frame"):
@@ -14331,6 +14446,12 @@ class LTXQueueManager:
         header_row = tk.Frame(frame, padx=10, pady=8)
         header_row.pack(fill=tk.X)
         self._style_panel(header_row, self.colors["card"])
+
+        frame.selected_var = tk.BooleanVar(value=False)
+        frame.select_cb = tk.Checkbutton(header_row, variable=frame.selected_var,
+                                         command=self._on_scene_selection_changed)
+        self._style_checkbutton(frame.select_cb, self.colors["card"])
+        frame.select_cb.pack(side=tk.LEFT, padx=(0, 6))
 
         order_prefix_label = tk.Label(header_row, text="Scene")
         order_prefix_label.pack(side=tk.LEFT)
@@ -14395,35 +14516,56 @@ class LTXQueueManager:
         body_row.grid_columnconfigure(1, weight=1)
 
         prompt_label = tk.Label(body_row, text="Scene Prompt")
-        prompt_label.grid(row=0, column=0, sticky="nw", pady=(0, 6))
+        prompt_label.grid(row=0, column=0, sticky="nw", pady=(0, 2))
         self._style_label(prompt_label, "muted", self.colors["card"])
 
-        frame.prompt_text = tk.Text(body_row, height=3, width=50)
-        frame.prompt_text.grid(row=0, column=1, sticky="ew", pady=(0, 6))
+        prompt_shell = tk.Frame(body_row)
+        prompt_shell.grid(row=0, column=1, sticky="ew", pady=(0, 2))
+        self._style_panel(prompt_shell, self.colors["card"])
+
+        frame.prompt_text = tk.Text(prompt_shell, height=3, width=50, wrap=tk.WORD)
+        frame.prompt_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self._style_text_input(frame.prompt_text, multiline=True)
+
+        frame.prompt_scrollbar = tk.Scrollbar(prompt_shell, orient=tk.VERTICAL, command=frame.prompt_text.yview)
+        frame.prompt_text.configure(yscrollcommand=frame.prompt_scrollbar.set)
+        # scrollbar starts hidden; appears only when content overflows
+
         scene_prompt_text = self._get_scene_prompt_text(scene_data)
         if scene_prompt_text:
             frame.prompt_text.insert("1.0", scene_prompt_text)
 
+        frame.prompt_word_count_label = tk.Label(body_row, text="Empty", anchor="w")
+        frame.prompt_word_count_label.grid(row=1, column=1, sticky="w", pady=(0, 6))
+        self._style_label(frame.prompt_word_count_label, "muted", self.colors["card"])
+        try:
+            frame.prompt_word_count_label.config(font=self.fonts["micro"])
+        except tk.TclError:
+            pass
+
+        frame.prompt_text.bind("<Configure>", lambda _e, w=frame.prompt_text, sb=frame.prompt_scrollbar: self._auto_resize_prompt_text(w, sb))
+        self._auto_resize_prompt_text(frame.prompt_text, frame.prompt_scrollbar)
+        self._update_prompt_word_count(frame.prompt_text, frame.prompt_word_count_label)
+
         frame.image_picker_label = tk.Label(body_row, text="Source Image")
-        frame.image_picker_label.grid(row=1, column=0, sticky="w", pady=(0, 6))
+        frame.image_picker_label.grid(row=2, column=0, sticky="w", pady=(0, 6))
         self._style_label(frame.image_picker_label, "muted", self.colors["card"])
 
         frame.image_asset_var = tk.StringVar(value="Unassigned")
         frame.image_asset_combo = ttk.Combobox(body_row, textvariable=frame.image_asset_var, state="readonly", width=48)
-        frame.image_asset_combo.grid(row=1, column=1, sticky="ew", pady=(0, 6))
+        frame.image_asset_combo.grid(row=2, column=1, sticky="ew", pady=(0, 6))
         frame.selected_asset_id = str(scene_data.get("image_asset_id") or "").strip()
 
         frame.asset_summary_label = tk.Label(body_row, text="No source image assigned.", anchor="w", justify=tk.LEFT, wraplength=680)
-        frame.asset_summary_label.grid(row=2, column=1, sticky="ew", pady=(0, 6))
+        frame.asset_summary_label.grid(row=3, column=1, sticky="ew", pady=(0, 6))
         self._style_label(frame.asset_summary_label, "muted", self.colors["card"])
 
         versions_label = tk.Label(body_row, text="Versions")
-        versions_label.grid(row=3, column=0, sticky="w", pady=(0, 6))
+        versions_label.grid(row=4, column=0, sticky="w", pady=(0, 6))
         self._style_label(versions_label, "muted", self.colors["card"])
 
         versions_row = tk.Frame(body_row)
-        versions_row.grid(row=3, column=1, sticky="ew", pady=(0, 6))
+        versions_row.grid(row=4, column=1, sticky="ew", pady=(0, 6))
         self._style_panel(versions_row, self.colors["card"])
 
         count_label = tk.Label(versions_row, text="Generate")
@@ -14447,7 +14589,7 @@ class LTXQueueManager:
         frame.version_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         versions_actions_row = tk.Frame(body_row)
-        versions_actions_row.grid(row=4, column=1, sticky="ew", pady=(0, 6))
+        versions_actions_row.grid(row=5, column=1, sticky="ew", pady=(0, 6))
         self._style_panel(versions_actions_row, self.colors["card"])
         versions_actions_row.grid_columnconfigure((0, 1), weight=1)
 
@@ -14460,7 +14602,7 @@ class LTXQueueManager:
         self._style_button(frame.prune_versions_btn, "secondary", compact=True)
 
         frame.version_summary_label = tk.Label(body_row, text="No saved versions yet.", anchor="w", justify=tk.LEFT, wraplength=680)
-        frame.version_summary_label.grid(row=5, column=1, sticky="ew", pady=(0, 6))
+        frame.version_summary_label.grid(row=6, column=1, sticky="ew", pady=(0, 6))
         self._style_label(frame.version_summary_label, "muted", self.colors["card"])
 
         output_text = os.path.basename(frame.output_path) if frame.output_path and os.path.exists(frame.output_path) else "No render yet"
@@ -14550,6 +14692,10 @@ class LTXQueueManager:
                     frame.version_count_var.set(normalized_count)
             self._refresh_scene_version_controls(frame)
             self._set_scene_entry_render_state(frame.scene_id, frame.render_status, frame.output_path)
+            if hasattr(frame, "prompt_text") and hasattr(frame, "prompt_scrollbar"):
+                self.root.after(10, lambda w=frame.prompt_text, sb=frame.prompt_scrollbar: self._auto_resize_prompt_text(w, sb))
+            if hasattr(frame, "prompt_text") and hasattr(frame, "prompt_word_count_label"):
+                self._update_prompt_word_count(frame.prompt_text, frame.prompt_word_count_label)
             break
 
     def _handle_scene_version_count_changed(self, frame):
@@ -14701,6 +14847,175 @@ class LTXQueueManager:
 
         self.refresh_gallery()
 
+    # ── Gallery re-render ────────────────────────────────────────────────────
+
+    def _show_gallery_rerender_dialog(self, title, thumb_path, initial_prompt, on_confirm, i2v_source_filename=None):
+        """Show a modal dialog allowing the user to edit a prompt before re-rendering."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.configure(bg=self.colors["bg"])
+
+        # ── Header: thumbnail + title copy ──
+        header = tk.Frame(dialog, padx=16, pady=14)
+        header.pack(fill=tk.X)
+        header.configure(bg=self.colors["bg"])
+
+        if thumb_path and os.path.exists(thumb_path):
+            try:
+                img = Image.open(thumb_path)
+                img.thumbnail((120, 68))
+                photo = ImageTk.PhotoImage(img)
+                self.thumbnail_images.append(photo)
+                thumb_lbl = tk.Label(header, image=photo, bg=self.colors.get("black", "#000000"))
+                thumb_lbl.pack(side=tk.LEFT, padx=(0, 14))
+            except Exception:
+                pass
+
+        title_frame = tk.Frame(header)
+        title_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        title_frame.configure(bg=self.colors["bg"])
+
+        title_lbl = tk.Label(title_frame, text=title, anchor="w")
+        title_lbl.pack(anchor="w")
+        self._style_label(title_lbl, "section", self.colors["bg"])
+
+        copy_lbl = tk.Label(title_frame, text="Edit the prompt below, then confirm to re-render.", anchor="w", wraplength=400, justify=tk.LEFT)
+        copy_lbl.pack(anchor="w", pady=(4, 0))
+        self._style_label(copy_lbl, "muted", self.colors["bg"])
+
+        if i2v_source_filename:
+            src_lbl = tk.Label(title_frame, text=f"Source image: {i2v_source_filename}", anchor="w", wraplength=400, justify=tk.LEFT)
+            src_lbl.pack(anchor="w", pady=(2, 0))
+            self._style_label(src_lbl, "muted", self.colors["bg"])
+
+        # ── Prompt area ──
+        prompt_frame = tk.Frame(dialog, padx=16, pady=0)
+        prompt_frame.pack(fill=tk.BOTH, expand=True)
+        prompt_frame.configure(bg=self.colors["bg"])
+
+        prompt_label_row = tk.Frame(prompt_frame)
+        prompt_label_row.pack(fill=tk.X, pady=(0, 4))
+        prompt_label_row.configure(bg=self.colors["bg"])
+
+        prompt_lbl = tk.Label(prompt_label_row, text="Prompt", anchor="w")
+        prompt_lbl.pack(side=tk.LEFT)
+        self._style_label(prompt_lbl, "muted", self.colors["bg"])
+
+        reset_btn = tk.Button(
+            prompt_label_row, text="Reset to original",
+            command=lambda: (_text.delete("1.0", tk.END), _text.insert("1.0", initial_prompt))
+        )
+        reset_btn.pack(side=tk.RIGHT)
+        self._style_button(reset_btn, "ghost", compact=True)
+
+        _text = tk.Text(prompt_frame, height=8, wrap=tk.WORD)
+        _text.pack(fill=tk.BOTH, expand=True)
+        self._style_text_input(_text, multiline=True)
+        if initial_prompt:
+            _text.insert("1.0", initial_prompt)
+
+        # ── Action buttons ──
+        action_row = tk.Frame(dialog, padx=16, pady=14)
+        action_row.pack(fill=tk.X)
+        action_row.configure(bg=self.colors["bg"])
+
+        cancel_btn = tk.Button(action_row, text="Cancel", command=dialog.destroy)
+        cancel_btn.pack(side=tk.RIGHT, padx=(8, 0))
+        self._style_button(cancel_btn, "secondary", compact=True)
+
+        def _confirm():
+            new_prompt = _text.get("1.0", tk.END).strip()
+            dialog.destroy()
+            on_confirm(new_prompt)
+
+        confirm_btn = tk.Button(action_row, text="Confirm Re-render", command=_confirm)
+        confirm_btn.pack(side=tk.RIGHT)
+        self._style_button(confirm_btn, "accent", compact=True)
+
+        dialog.update_idletasks()
+        dialog.minsize(580, 0)
+        self.root.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_reqwidth()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_reqheight()) // 2
+        dialog.geometry(f"+{x}+{y}")
+
+    def _open_gallery_scene_rerender_dialog(self, scene_id, initial_prompt, scene_order, thumb_path):
+        """Look up I2V source image if applicable, then open the re-render dialog for a scene."""
+        i2v_source = None
+        scene_entry = self._get_scene_entry_by_id(self.scene_timeline, scene_id)
+        if scene_entry and scene_entry.get("mode") == SCENE_MODE_I2V:
+            img_asset = self._get_image_asset_by_id(scene_entry.get("image_asset_id"))
+            if img_asset:
+                _img_path = img_asset.get("project_path") or ""
+                i2v_source = os.path.basename(_img_path) if _img_path else None
+        self._show_gallery_rerender_dialog(
+            f"Re-render Scene {scene_order}",
+            thumb_path,
+            initial_prompt,
+            lambda new_prompt: self._gallery_rerender_scene(scene_id, new_prompt),
+            i2v_source_filename=i2v_source,
+        )
+
+    def _gallery_rerender_scene(self, scene_id, new_prompt):
+        """Update prompt for scene_id and trigger a single-scene render."""
+        if self.scene_render_in_progress:
+            messagebox.showwarning("Render In Progress", "A render is already in progress. Please wait for it to finish.")
+            return
+        # Update widget frame so _collect_scene_timeline_from_widgets picks it up
+        for frame in self._collect_scene_entry_frames():
+            if str(getattr(frame, "scene_id", "") or "").strip() == str(scene_id or "").strip():
+                try:
+                    frame.prompt_text.delete("1.0", tk.END)
+                    frame.prompt_text.insert("1.0", new_prompt)
+                except tk.TclError:
+                    pass
+                break
+        # Also update in-memory scene_timeline as fallback
+        for i, entry in enumerate(self.scene_timeline or []):
+            if str(entry.get("scene_id") or "").strip() == str(scene_id or "").strip():
+                if entry.get("mode", SCENE_MODE_T2V) == SCENE_MODE_I2V:
+                    self.scene_timeline[i]["i2v_prompt_text"] = new_prompt
+                else:
+                    self.scene_timeline[i]["prompt_text"] = new_prompt
+                break
+        self.save_project_state()
+        self.start_single_scene_render(scene_id)
+
+    def _gallery_rerender_image(self, asset_id, new_prompt):
+        """Update prompt for image asset and trigger a single-image render."""
+        try:
+            if self.run_image_queue_btn["state"] == tk.DISABLED:
+                messagebox.showwarning("Render In Progress", "An image render is already in progress. Please wait for it to finish.")
+                return
+        except (tk.TclError, AttributeError):
+            pass
+        image_settings, validation_error = self._collect_validated_image_settings()
+        if validation_error:
+            messagebox.showerror("Image Workflow Settings Error", validation_error)
+            self.update_status(validation_error, "red")
+            return
+        asset = self._get_image_asset_by_id(asset_id)
+        if asset:
+            asset["prompt_text"] = new_prompt
+            self._schedule_project_state_save()
+        prompt_entry = self._create_image_prompt_queue_entry(
+            prompt_text=new_prompt,
+            asset_id=asset_id,
+        )
+        self.run_image_queue_btn.config(state=tk.DISABLED)
+        self.add_image_prompt_btn.config(state=tk.DISABLED)
+        self.import_image_btn.config(state=tk.DISABLED)
+        if hasattr(self, "sync_image_to_scene_btn"):
+            self.sync_image_to_scene_btn.config(state=tk.DISABLED)
+        thread = threading.Thread(target=self.run_single_image_prompt_thread, args=(prompt_entry, image_settings))
+        thread.daemon = True
+        thread.start()
+
+    # ─────────────────────────────────────────────────────────────────────────
+
     def delete_scene_output_version(self, scene_id, version_id, confirm=True):
         scene_timeline = self._collect_scene_timeline_from_widgets() if hasattr(self, "scene_scrollable_frame") else self.scene_timeline
         scene_entry = self._get_scene_entry_by_id(scene_timeline, scene_id)
@@ -14789,6 +15104,7 @@ class LTXQueueManager:
         item = scene_state.pop(current_index)
         scene_state.insert(target_index, item)
         self._rebuild_scene_timeline_from_state(scene_state)
+        self.save_project_state()
 
     def _on_scene_order_entry_confirm(self, frame):
         frames = self._collect_scene_entry_frames()
@@ -14811,6 +15127,7 @@ class LTXQueueManager:
         item = scene_state.pop(current_index)
         scene_state.insert(target_index, item)
         self._rebuild_scene_timeline_from_state(scene_state)
+        self.save_project_state()
 
     def _on_scene_order_entry_blur(self, frame):
         try:
@@ -14824,7 +15141,43 @@ class LTXQueueManager:
         current_index = frames.index(frame)
         frame.order_var.set(str(current_index + 1))
 
-    def _on_gallery_scene_order_confirm(self, scene_id, entry_var, fallback_order):
+    def _on_image_prompt_order_confirm(self, frame):
+        frames = self._collect_image_prompt_frames()
+        if frame not in frames:
+            return
+        raw = frame.order_var.get().strip()
+        try:
+            target_1based = int(raw)
+        except (ValueError, TypeError):
+            self._on_image_prompt_order_blur(frame)
+            return
+        total = len(frames)
+        target_1based = max(1, min(target_1based, total))
+        current_index = frames.index(frame)
+        target_index = target_1based - 1
+        if target_index == current_index:
+            frame.order_var.set(str(current_index + 1))
+            return
+        entries = self._collect_image_prompt_queue_entries()
+        item = entries.pop(current_index)
+        entries.insert(target_index, item)
+        self._rebuild_image_prompt_queue_from_texts(entries)
+        self._schedule_project_state_save()
+
+    def _on_image_prompt_order_blur(self, frame):
+        try:
+            if not frame.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        frames = self._collect_image_prompt_frames()
+        if frame not in frames:
+            return
+        current_index = frames.index(frame)
+        frame.order_var.set(str(current_index + 1))
+
+    def _on_gallery_scene_group_move(self, scene_id, entry_var, fallback_order):
+        """Move the whole scene group to a new position. On collision, ask: reorder or merge."""
         raw = entry_var.get().strip()
         try:
             target_1based = int(raw)
@@ -14848,6 +15201,17 @@ class LTXQueueManager:
         if target_index == current_index:
             entry_var.set(str(current_index + 1))
             return
+        occupant = scene_state[target_index]
+        if str(occupant.get("scene_id") or "").strip() != scene_id:
+            target_ver_count = len(occupant.get("output_versions") or [])
+            choice = self._show_group_move_collision_dialog(fallback_order, target_1based, target_ver_count)
+            if choice == "cancel":
+                entry_var.set(str(fallback_order))
+                return
+            if choice == "merge":
+                self._merge_all_versions_into_scene(scene_state[current_index], occupant, scene_state)
+                return
+            # choice == "move" → fall through to plain reorder
         item = scene_state.pop(current_index)
         scene_state.insert(target_index, item)
         self._rebuild_scene_timeline_from_state(scene_state)
@@ -14856,6 +15220,201 @@ class LTXQueueManager:
 
     def _on_gallery_scene_order_blur(self, entry_var, fallback_order):
         entry_var.set(str(fallback_order))
+
+    def _show_group_move_collision_dialog(self, source_order, target_order, target_ver_count):
+        """Ask user what to do when moving a scene group to an occupied slot. Returns 'move', 'merge', or 'cancel'."""
+        result = {"choice": "cancel"}
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"Scene {target_order} Is Already Occupied")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.configure(bg=self.colors["bg"])
+
+        msg_frame = tk.Frame(dialog, padx=20, pady=16)
+        msg_frame.pack(fill=tk.X)
+        msg_frame.configure(bg=self.colors["bg"])
+        noun = "version" if target_ver_count == 1 else "versions"
+        msg_lbl = tk.Label(
+            msg_frame,
+            text=f"Scene {target_order} already has {target_ver_count} {noun}. What would you like to do?",
+            wraplength=380, justify=tk.LEFT, anchor="w",
+        )
+        msg_lbl.pack(anchor="w")
+        self._style_label(msg_lbl, "body", self.colors["bg"])
+
+        btn_frame = tk.Frame(dialog, padx=20, pady=(0, 16))
+        btn_frame.pack(fill=tk.X)
+        btn_frame.configure(bg=self.colors["bg"])
+
+        def _choose(choice):
+            result["choice"] = choice
+            dialog.destroy()
+
+        move_btn = tk.Button(btn_frame, text=f"Move Here (push Scene {target_order} down)", command=lambda: _choose("move"))
+        move_btn.pack(fill=tk.X, pady=(0, 6))
+        self._style_button(move_btn, "accent", compact=True)
+        merge_btn = tk.Button(btn_frame, text=f"Merge All Into Scene {target_order}", command=lambda: _choose("merge"))
+        merge_btn.pack(fill=tk.X, pady=(0, 6))
+        self._style_button(merge_btn, "secondary", compact=True)
+        cancel_btn = tk.Button(btn_frame, text="Cancel", command=lambda: _choose("cancel"))
+        cancel_btn.pack(fill=tk.X)
+        self._style_button(cancel_btn, "ghost", compact=True)
+
+        dialog.update_idletasks()
+        self.root.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_reqwidth()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_reqheight()) // 2
+        dialog.geometry(f"+{x}+{y}")
+        dialog.wait_window()
+        return result["choice"]
+
+    def _on_gallery_version_scene_change(self, scene_id, version_id, entry_var, fallback_order):
+        """Move a single output version to a different scene slot."""
+        raw = entry_var.get().strip()
+        try:
+            target_1based = int(raw)
+        except (ValueError, TypeError):
+            entry_var.set(str(fallback_order))
+            return
+        scene_state = self._collect_scene_timeline_from_widgets() if hasattr(self, "scene_scrollable_frame") and self._collect_scene_entry_frames() else list(self.scene_timeline)
+        total = len(scene_state)
+        if total == 0:
+            entry_var.set(str(fallback_order))
+            return
+        # Allow one beyond total so user can split to a new trailing position
+        target_1based = max(1, min(target_1based, total + 1))
+        source_scene = next((e for e in scene_state if str(e.get("scene_id") or "").strip() == scene_id), None)
+        if source_scene is None:
+            entry_var.set(str(fallback_order))
+            return
+        if target_1based == fallback_order:
+            entry_var.set(str(fallback_order))
+            return
+        # Find what is currently at the target position
+        target_scene = scene_state[target_1based - 1] if target_1based <= total else None
+        if target_scene and str(target_scene.get("scene_id") or "").strip() == scene_id:
+            # Same scene group — nothing to do
+            entry_var.set(str(fallback_order))
+            return
+        if target_scene:
+            target_ver_count = len(target_scene.get("output_versions") or [])
+            noun = "version" if target_ver_count == 1 else "versions"
+            confirmed = messagebox.askyesno(
+                f"Move Render to Scene {target_1based}",
+                f"Add this render as an alternate version of Scene {target_1based}?\n\n"
+                f"Scene {target_1based} currently has {target_ver_count} {noun}.",
+            )
+            if not confirmed:
+                entry_var.set(str(fallback_order))
+                return
+            self._move_version_to_scene(source_scene, version_id, target_scene, scene_state)
+        else:
+            confirmed = messagebox.askyesno(
+                f"Split Render to Scene {target_1based}",
+                f"Move this render into a new Scene {target_1based}?\n\n"
+                f"It will be split out from Scene {fallback_order}.",
+            )
+            if not confirmed:
+                entry_var.set(str(fallback_order))
+                return
+            self._split_version_to_new_scene(source_scene, version_id, target_1based, scene_state)
+
+    def _move_version_to_scene(self, source_scene, version_id, target_scene, scene_state):
+        """Move a single output version from source_scene into target_scene."""
+        norm_vid = str(version_id or "").strip()
+        version_to_move = next(
+            (v for v in (source_scene.get("output_versions") or [])
+             if str(v.get("version_id") or "").strip() == norm_vid),
+            None,
+        )
+        if not version_to_move:
+            return
+        source_versions = [
+            v for v in (source_scene.get("output_versions") or [])
+            if str(v.get("version_id") or "").strip() != norm_vid
+        ]
+        source_scene["output_versions"] = source_versions
+        if str(source_scene.get("active_output_version_id") or "").strip() == norm_vid:
+            source_scene["active_output_version_id"] = (
+                str(source_versions[0].get("version_id") or "").strip() if source_versions else None
+            )
+        target_versions = list(target_scene.get("output_versions") or []) + [dict(version_to_move)]
+        target_scene["output_versions"] = self._renumber_versions_by_created_at(target_versions)
+        if not source_versions:
+            scene_state[:] = [
+                e for e in scene_state
+                if str(e.get("scene_id") or "").strip() != str(source_scene.get("scene_id") or "").strip()
+            ]
+        self._rebuild_scene_timeline_from_state(scene_state)
+        self.save_project_state()
+        self.refresh_gallery()
+
+    def _split_version_to_new_scene(self, source_scene, version_id, target_pos, scene_state):
+        """Split a single output version out of source_scene into a brand-new scene at target_pos."""
+        norm_vid = str(version_id or "").strip()
+        version_to_split = next(
+            (v for v in (source_scene.get("output_versions") or [])
+             if str(v.get("version_id") or "").strip() == norm_vid),
+            None,
+        )
+        if not version_to_split:
+            return
+        source_versions = [
+            v for v in (source_scene.get("output_versions") or [])
+            if str(v.get("version_id") or "").strip() != norm_vid
+        ]
+        source_scene["output_versions"] = source_versions
+        if str(source_scene.get("active_output_version_id") or "").strip() == norm_vid:
+            source_scene["active_output_version_id"] = (
+                str(source_versions[0].get("version_id") or "").strip() if source_versions else None
+            )
+        if not source_versions:
+            scene_state[:] = [
+                e for e in scene_state
+                if str(e.get("scene_id") or "").strip() != str(source_scene.get("scene_id") or "").strip()
+            ]
+        new_version = dict(version_to_split)
+        new_version["version_number"] = 1
+        split_prompt = str(
+            version_to_split.get("prompt_snapshot") or self._get_scene_prompt_text(source_scene) or ""
+        ).strip()
+        new_scene = self._create_scene_entry(
+            target_pos,
+            mode=version_to_split.get("mode") or source_scene.get("mode") or SCENE_MODE_T2V,
+            prompt=split_prompt,
+            image_asset_id=source_scene.get("image_asset_id"),
+            output_versions=[new_version],
+            active_output_version_id=new_version.get("version_id"),
+            output_path=new_version.get("path"),
+            render_status="ready",
+        )
+        insert_index = min(target_pos - 1, len(scene_state))
+        scene_state.insert(insert_index, new_scene)
+        self._rebuild_scene_timeline_from_state(scene_state)
+        self.save_project_state()
+        self.refresh_gallery()
+
+    def _merge_all_versions_into_scene(self, source_scene, target_scene, scene_state):
+        """Merge all output versions from source_scene into target_scene, then remove source."""
+        source_versions = [dict(v) for v in (source_scene.get("output_versions") or [])]
+        target_versions = list(target_scene.get("output_versions") or []) + source_versions
+        target_scene["output_versions"] = self._renumber_versions_by_created_at(target_versions)
+        source_sid = str(source_scene.get("scene_id") or "").strip()
+        scene_state[:] = [e for e in scene_state if str(e.get("scene_id") or "").strip() != source_sid]
+        self._rebuild_scene_timeline_from_state(scene_state)
+        self.save_project_state()
+        self.refresh_gallery()
+
+    def _renumber_versions_by_created_at(self, versions):
+        """Sort versions by created_at ascending and assign sequential version_numbers."""
+        sorted_versions = sorted(versions, key=lambda v: str(v.get("created_at") or ""))
+        result = []
+        for i, v in enumerate(sorted_versions, start=1):
+            v_copy = dict(v)
+            v_copy["version_number"] = i
+            result.append(v_copy)
+        return result
 
     def _on_gallery_image_order_confirm(self, asset_id, entry_var, fallback_order):
         raw = entry_var.get().strip()
@@ -14923,6 +15482,7 @@ class LTXQueueManager:
         self.image_prompt_queue = list(normalized_entries)
         for prompt_entry in normalized_entries:
             self.add_image_prompt_entry(prompt_entry)
+        self._refresh_image_prompt_entry_rows()
         self._update_prompt_collection_summary()
 
     def _get_image_prompt_frame_by_id(self, prompt_id):
@@ -15120,9 +15680,15 @@ class LTXQueueManager:
             self.sync_image_to_scene_btn.config(state=state)
         if hasattr(self, "auto_assign_scene_images_btn"):
             self.auto_assign_scene_images_btn.config(state=state)
+        if hasattr(self, "select_all_scenes_btn"):
+            self.select_all_scenes_btn.config(state=state)
+        if hasattr(self, "render_selected_scenes_btn") and not enabled:
+            self.render_selected_scenes_btn.config(state=tk.DISABLED)
         for frame in self._collect_scene_entry_frames():
             if hasattr(frame, "render_btn"):
                 frame.render_btn.config(state=state)
+            if hasattr(frame, "select_cb"):
+                frame.select_cb.config(state=state)
 
     def _validate_scene_entries_for_render(self, scene_timeline):
         has_i2v_scene = any(entry.get("mode") == SCENE_MODE_I2V for entry in scene_timeline)
@@ -15314,6 +15880,7 @@ class LTXQueueManager:
 
         self.scene_timeline = self._normalize_scene_timeline(scene_timeline)
         self.root.after(0, self.save_project_state)
+        self.root.after(0, self._clear_scene_selections)
         self.root.after(0, lambda: self._set_scene_render_controls_enabled(True))
 
     def add_prompt_entry(self):
@@ -15355,76 +15922,165 @@ class LTXQueueManager:
         frame.prompt_entry_updated_at = resolved_entry.get("updated_at")
         frame.version_count_sync_in_progress = False
 
-        text_widget = tk.Text(frame, height=4, width=50)
-        text_widget.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self._style_text_input(text_widget, multiline=True)
-        frame.prompt_text_widget = text_widget
-        text_widget.insert("1.0", resolved_entry.get("prompt_text", ""))
+        # ── Header row: order entry on the left, action buttons on the right ──
+        header_row = tk.Frame(frame, padx=10, pady=8)
+        header_row.pack(fill=tk.X)
+        self._style_panel(header_row, self.colors["card"])
 
-        btn_frame = tk.Frame(frame)
-        btn_frame.pack(side=tk.RIGHT, padx=5)
-        self._style_panel(btn_frame, self.colors["card"])
+        order_prefix_label = tk.Label(header_row, text="Scene")
+        order_prefix_label.pack(side=tk.LEFT)
+        self._style_label(order_prefix_label, "section", self.colors["card"])
 
-        generate_btn = tk.Button(btn_frame, text="Generate", command=lambda f=frame: self.generate_single_image_prompt(f))
-        generate_btn.pack(side=tk.TOP, fill=tk.X, pady=(0, 2))
-        self._style_button(generate_btn, "accent", compact=True)
+        frame.order_var = tk.StringVar(value="")
+        frame.order_label = tk.Entry(
+            header_row,
+            textvariable=frame.order_var,
+            width=3,
+            justify="center",
+            relief=tk.FLAT,
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=self.colors["input_border"],
+            highlightcolor=self.colors["accent"],
+            bg=self.colors["input_bg"],
+            fg=self.colors["text"],
+            insertbackground=self.colors["text"],
+            font=self.fonts["section"],
+        )
+        frame.order_label.pack(side=tk.LEFT, padx=(4, 0))
+        frame.order_label.bind("<Return>", lambda _e, f=frame: self._on_image_prompt_order_confirm(f))
+        frame.order_label.bind("<FocusOut>", lambda _e, f=frame: self._on_image_prompt_order_blur(f))
 
-        remove_btn = tk.Button(btn_frame, text="Remove", command=lambda f=frame, t=text_widget: self.remove_image_prompt_entry(f, t))
-        remove_btn.pack(side=tk.TOP, fill=tk.X)
+        # Action buttons in the header (right side) — primary action immediately visible
+        header_btn_frame = tk.Frame(header_row)
+        header_btn_frame.pack(side=tk.RIGHT)
+        self._style_panel(header_btn_frame, self.colors["card"])
+
+        remove_btn = tk.Button(header_btn_frame, text="Remove", command=lambda f=frame: self.remove_image_prompt_entry(f, f.prompt_text_widget))
+        remove_btn.pack(side=tk.RIGHT, padx=(6, 0))
         self._style_button(remove_btn, "ghost", compact=True)
 
-        version_row = tk.Frame(btn_frame)
-        version_row.pack(side=tk.TOP, fill=tk.X, pady=(8, 0))
-        self._style_panel(version_row, self.colors["card"])
+        generate_btn = tk.Button(header_btn_frame, text="Generate Image", command=lambda f=frame: self.generate_single_image_prompt(f))
+        generate_btn.pack(side=tk.RIGHT, padx=(6, 0))
+        self._style_button(generate_btn, "accent", compact=True)
 
-        version_label = tk.Label(version_row, text="Versions")
-        version_label.pack(side=tk.LEFT)
-        self._style_label(version_label, "muted", self.colors["card"])
+        # ── Body: clean two-column grid matching the video card layout ──
+        body_row = tk.Frame(frame, padx=10, pady=10)
+        body_row.pack(fill=tk.X, expand=True)
+        self._style_panel(body_row, self.colors["card"])
+        body_row.grid_columnconfigure(1, weight=1)
+
+        # Row 0: prompt label + auto-resizing text area with scrollbar
+        prompt_label = tk.Label(body_row, text="Prompt")
+        prompt_label.grid(row=0, column=0, sticky="nw", pady=(0, 2), padx=(0, 10))
+        self._style_label(prompt_label, "muted", self.colors["card"])
+
+        prompt_shell = tk.Frame(body_row)
+        prompt_shell.grid(row=0, column=1, sticky="ew", pady=(0, 2))
+        self._style_panel(prompt_shell, self.colors["card"])
+
+        text_widget = tk.Text(prompt_shell, height=3, width=50, wrap=tk.WORD)
+        text_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._style_text_input(text_widget, multiline=True)
+        frame.prompt_text_widget = text_widget
+
+        img_prompt_scrollbar = tk.Scrollbar(prompt_shell, orient=tk.VERTICAL, command=text_widget.yview)
+        text_widget.configure(yscrollcommand=img_prompt_scrollbar.set)
+        # scrollbar stays hidden; appears only when content overflows
+
+        prompt_text_initial = resolved_entry.get("prompt_text", "")
+        if prompt_text_initial:
+            text_widget.insert("1.0", prompt_text_initial)
+
+        # Row 1: word count label below the text area
+        frame.prompt_word_count_label = tk.Label(body_row, text="Empty", anchor="w")
+        frame.prompt_word_count_label.grid(row=1, column=1, sticky="w", pady=(0, 8))
+        self._style_label(frame.prompt_word_count_label, "muted", self.colors["card"])
+        try:
+            frame.prompt_word_count_label.config(font=self.fonts["micro"])
+        except tk.TclError:
+            pass
+
+        # Wire auto-resize and word count
+        text_widget.bind(
+            "<Configure>",
+            lambda _e, w=text_widget, sb=img_prompt_scrollbar: self._auto_resize_prompt_text(w, sb),
+        )
+        text_widget.bind(
+            "<KeyRelease>",
+            lambda _e, w=text_widget, sb=img_prompt_scrollbar, lbl=frame.prompt_word_count_label: (
+                self._auto_resize_prompt_text(w, sb),
+                self._update_prompt_word_count(w, lbl),
+                self._update_prompt_collection_summary(),
+            ),
+        )
+        self._auto_resize_prompt_text(text_widget, img_prompt_scrollbar)
+        self._update_prompt_word_count(text_widget, frame.prompt_word_count_label)
+
+        # Row 2: versions controls — spinbox + saved combo in one full-width row
+        versions_label = tk.Label(body_row, text="Versions")
+        versions_label.grid(row=2, column=0, sticky="w", pady=(0, 6), padx=(0, 10))
+        self._style_label(versions_label, "muted", self.colors["card"])
+
+        versions_row = tk.Frame(body_row)
+        versions_row.grid(row=2, column=1, sticky="ew", pady=(0, 6))
+        self._style_panel(versions_row, self.colors["card"])
+
+        versions_count_label = tk.Label(versions_row, text="Generate")
+        versions_count_label.pack(side=tk.LEFT)
+        self._style_label(versions_count_label, "muted", self.colors["card"])
 
         frame.version_count_var = tk.StringVar(value=str(self._coerce_image_version_count(resolved_entry.get("version_count", 1))))
-        frame.version_count_spinbox = tk.Spinbox(version_row, from_=1, to=99, width=4, textvariable=frame.version_count_var, command=lambda f=frame: self._handle_image_prompt_version_count_changed(f))
-        frame.version_count_spinbox.pack(side=tk.RIGHT)
-        frame.version_count_spinbox.bind("<FocusOut>", lambda _event, f=frame: self._handle_image_prompt_version_count_changed(f))
-        frame.version_count_spinbox.bind("<Return>", lambda _event, f=frame: self._handle_image_prompt_version_count_changed(f))
+        frame.version_count_spinbox = tk.Spinbox(
+            versions_row, from_=1, to=99, width=4,
+            textvariable=frame.version_count_var,
+            command=lambda f=frame: self._handle_image_prompt_version_count_changed(f),
+        )
+        frame.version_count_spinbox.pack(side=tk.LEFT, padx=(6, 6))
+        frame.version_count_spinbox.bind("<FocusOut>", lambda _e, f=frame: self._handle_image_prompt_version_count_changed(f))
+        frame.version_count_spinbox.bind("<Return>", lambda _e, f=frame: self._handle_image_prompt_version_count_changed(f))
         self._style_text_input(frame.version_count_spinbox)
 
-        saved_versions_row = tk.Frame(btn_frame)
-        saved_versions_row.pack(side=tk.TOP, fill=tk.X, pady=(8, 0))
-        self._style_panel(saved_versions_row, self.colors["card"])
+        versions_count_suffix = tk.Label(versions_row, text="render(s)")
+        versions_count_suffix.pack(side=tk.LEFT)
+        self._style_label(versions_count_suffix, "muted", self.colors["card"])
 
-        saved_versions_label = tk.Label(saved_versions_row, text="Saved")
-        saved_versions_label.pack(side=tk.LEFT)
-        self._style_label(saved_versions_label, "muted", self.colors["card"])
+        saved_label = tk.Label(versions_row, text="Saved")
+        saved_label.pack(side=tk.LEFT, padx=(14, 6))
+        self._style_label(saved_label, "muted", self.colors["card"])
 
         frame.version_var = tk.StringVar(value="")
-        frame.version_combo = ttk.Combobox(saved_versions_row, textvariable=frame.version_var, state=tk.DISABLED, width=34)
-        frame.version_combo.pack(side=tk.RIGHT, fill=tk.X, expand=True)
+        frame.version_combo = ttk.Combobox(versions_row, textvariable=frame.version_var, state=tk.DISABLED)
+        frame.version_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        frame.favorite_version_btn = tk.Button(btn_frame, text="Favorite Selected", command=lambda f=frame: self._handle_image_prompt_version_selected(f))
-        frame.favorite_version_btn.pack(side=tk.TOP, fill=tk.X, pady=(8, 0))
+        # Row 3: versions action buttons — Favorite | Delete | Prune
+        versions_actions_row = tk.Frame(body_row)
+        versions_actions_row.grid(row=3, column=1, sticky="ew", pady=(0, 6))
+        self._style_panel(versions_actions_row, self.colors["card"])
+        versions_actions_row.grid_columnconfigure((0, 1, 2), weight=1)
+
+        frame.favorite_version_btn = tk.Button(versions_actions_row, text="Favorite Selected", command=lambda f=frame: self._handle_image_prompt_version_selected(f))
+        frame.favorite_version_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
         self._style_button(frame.favorite_version_btn, "accent", compact=True)
 
-        version_actions_row = tk.Frame(btn_frame)
-        version_actions_row.pack(side=tk.TOP, fill=tk.X, pady=(8, 0))
-        self._style_panel(version_actions_row, self.colors["card"])
-        version_actions_row.grid_columnconfigure((0, 1), weight=1)
-
-        frame.delete_version_btn = tk.Button(version_actions_row, text="Delete Selected", command=lambda f=frame: self.delete_selected_image_version(f))
-        frame.delete_version_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        frame.delete_version_btn = tk.Button(versions_actions_row, text="Delete Selected", command=lambda f=frame: self.delete_selected_image_version(f))
+        frame.delete_version_btn.grid(row=0, column=1, sticky="ew", padx=(0, 4))
         self._style_button(frame.delete_version_btn, "danger", compact=True)
 
-        frame.prune_versions_btn = tk.Button(version_actions_row, text="Prune Others", command=lambda f=frame: self.prune_image_versions(f))
-        frame.prune_versions_btn.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        frame.prune_versions_btn = tk.Button(versions_actions_row, text="Prune Others", command=lambda f=frame: self.prune_image_versions(f))
+        frame.prune_versions_btn.grid(row=0, column=2, sticky="ew")
         self._style_button(frame.prune_versions_btn, "secondary", compact=True)
 
-        frame.asset_summary_label = tk.Label(frame, anchor="w")
-        frame.asset_summary_label.pack(fill=tk.X, padx=10, pady=(0, 8))
+        # Row 4: asset / status summary label
+        frame.asset_summary_label = tk.Label(body_row, anchor="w", justify=tk.LEFT, wraplength=680)
+        frame.asset_summary_label.grid(row=4, column=1, sticky="ew", pady=(0, 2))
         self._style_label(frame.asset_summary_label, "muted", self.colors["card"])
 
         frame.version_combo.bind("<<ComboboxSelected>>", lambda _event, f=frame: self._handle_image_prompt_version_selected(f))
 
         self.image_prompts.append(text_widget)
         self._apply_image_prompt_entry_to_frame(frame, resolved_entry)
+        self._refresh_image_prompt_entry_rows()
         self.log_debug("IMAGE_PROMPT_ADDED", widget_id=id(text_widget), total_widgets=len(self.image_prompts))
         self.update_image_scroll_region()
         self._update_prompt_collection_summary()
@@ -15447,6 +16103,7 @@ class LTXQueueManager:
         for frame in list(self.image_scrollable_frame.winfo_children()):
             frame.destroy()
         self.image_prompts.clear()
+        self._refresh_image_prompt_entry_rows()
         self.log_debug("IMAGE_PROMPTS_CLEARED", cleared_count=cleared_count)
         self.update_image_scroll_region()
         self._update_prompt_collection_summary()
@@ -15530,6 +16187,7 @@ class LTXQueueManager:
             self.add_image_prompt_entry()
         else:
             self._collect_image_prompt_widgets()
+            self._refresh_image_prompt_entry_rows()
 
         self.log_debug(
             "IMAGE_PROMPT_REMOVED",
@@ -16641,9 +17299,23 @@ class LTXQueueManager:
         )
         toggle_btn.pack(side=tk.LEFT)
 
-        scene_lbl = tk.Label(header_row, text=f"Scene {scene_order}")
-        scene_lbl.pack(side=tk.LEFT, padx=(6, 0))
-        self._style_label(scene_lbl, "body_strong", self.colors["surface_soft"])
+        scene_prefix_lbl = tk.Label(header_row, text="Scene")
+        scene_prefix_lbl.pack(side=tk.LEFT, padx=(6, 0))
+        self._style_label(scene_prefix_lbl, "body_strong", self.colors["surface_soft"])
+
+        _grp_scene_id = str(group_items[0][1].get("scene_id") or "").strip()
+        _grp_order_var = tk.StringVar(value=str(scene_order))
+        _grp_order_entry = tk.Entry(
+            header_row, textvariable=_grp_order_var, width=3, justify="center",
+            relief=tk.FLAT, bd=0, highlightthickness=1,
+            highlightbackground=self.colors["input_border"],
+            highlightcolor=self.colors["accent"],
+            bg=self.colors["surface_soft"], fg=self.colors["text"],
+            insertbackground=self.colors["text"], font=self.fonts["body_strong"],
+        )
+        _grp_order_entry.pack(side=tk.LEFT, padx=(2, 0))
+        _grp_order_entry.bind("<Return>", lambda _e, sid=_grp_scene_id, v=_grp_order_var, o=scene_order: self._on_gallery_scene_group_move(sid, v, o))
+        _grp_order_entry.bind("<FocusOut>", lambda _e, v=_grp_order_var, o=scene_order: self._on_gallery_scene_order_blur(v, o))
 
         if prompt_excerpt:
             sep_dot = tk.Label(header_row, text="\u2022")
@@ -16671,7 +17343,7 @@ class LTXQueueManager:
         ver_chip.configure(bg=self.colors["surface_alt"], fg=self.colors["text_muted"],
                            font=self.fonts["small"], relief=tk.FLAT)
 
-        for widget in (header_row, scene_lbl):
+        for widget in (header_row, scene_prefix_lbl):
             widget.bind("<Button-1>", lambda _e: _toggle_group())
 
         if is_open:
@@ -16800,7 +17472,8 @@ class LTXQueueManager:
                 font=self.fonts["body_strong"],
             )
             scene_order_entry.pack(side=tk.LEFT, padx=(4, 4))
-            scene_order_entry.bind("<Return>", lambda _e, sid=scene_id, v=scene_order_var, o=current_order: self._on_gallery_scene_order_confirm(sid, v, o))
+            _card_ver_id = str(scene_version_meta.get("version_id") or "").strip()
+            scene_order_entry.bind("<Return>", lambda _e, sid=scene_id, vid=_card_ver_id, v=scene_order_var, o=current_order: self._on_gallery_version_scene_change(sid, vid, v, o))
             scene_order_entry.bind("<FocusOut>", lambda _e, v=scene_order_var, o=current_order: self._on_gallery_scene_order_blur(v, o))
 
             sep_label = tk.Label(scene_order_row, text="•")
@@ -16843,16 +17516,28 @@ class LTXQueueManager:
         delete_btn.grid(row=0, column=1, sticky="ew", padx=(4, 0))
         self._style_button(delete_btn, "danger", compact=True)
         favorite_btn = None
+        rerender_scene_btn = None
         if scene_version_meta:
             favorite_btn = tk.Button(
                 btn_frame,
                 text="Favorite" if not scene_version_meta.get("is_active") else "Favorite Selected",
                 command=lambda sid=scene_version_meta.get("scene_id"), vid=scene_version_meta.get("version_id"): self._gallery_favorite_scene_version(sid, vid)
             )
-            favorite_btn.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+            favorite_btn.grid(row=1, column=0, sticky="ew", padx=(0, 4), pady=(8, 0))
             self._style_button(favorite_btn, "accent", compact=True)
             if scene_version_meta.get("is_active"):
                 favorite_btn.configure(state=tk.DISABLED)
+            _rr_sid = scene_version_meta.get("scene_id")
+            _rr_sp = str(scene_version_meta.get("scene_prompt") or "")
+            _rr_so = scene_version_meta.get("scene_order", "")
+            _rr_tp = thumb_path
+            rerender_scene_btn = tk.Button(
+                btn_frame,
+                text="Re-render",
+                command=lambda sid=_rr_sid, sp=_rr_sp, so=_rr_so, tp=_rr_tp: self._open_gallery_scene_rerender_dialog(sid, sp, so, tp)
+            )
+            rerender_scene_btn.grid(row=1, column=1, sticky="ew", padx=(4, 0), pady=(8, 0))
+            self._style_button(rerender_scene_btn, "secondary", compact=True)
         add_music_btn = None
         if show_add_music:
             add_music_btn = tk.Button(btn_frame, text="Add Music", command=lambda p=video_path, t=thumb_path: self.select_video_for_music(p, t))
@@ -16867,6 +17552,7 @@ class LTXQueueManager:
             "checkbox_var": var,
             "add_music_btn": add_music_btn,
             "favorite_btn": favorite_btn,
+            "rerender_scene_btn": rerender_scene_btn,
             "open_folder_btn": open_folder_btn,
             "delete_btn": delete_btn,
             "thumb_path": thumb_path,
@@ -17034,10 +17720,24 @@ class LTXQueueManager:
         self._style_button(open_folder_btn, "secondary", compact=True)
 
         delete_btn = tk.Button(btn_frame, text="Delete Version" if version_meta else "Delete", fg="red", command=lambda p=image_path, asset_id=asset_id: self.delete_image(p, asset_id=asset_id))
-        delete_btn.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        delete_btn.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         self._style_button(delete_btn, "danger", compact=True)
 
+        rerender_image_btn = tk.Button(
+            btn_frame,
+            text="Re-render",
+            command=lambda aid=asset_id, tp=image_path, pp=prompt_text: self._show_gallery_rerender_dialog(
+                "Re-render Image",
+                tp,
+                pp,
+                lambda new_prompt: self._gallery_rerender_image(aid, new_prompt),
+            )
+        )
+        rerender_image_btn.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        self._style_button(rerender_image_btn, "secondary", compact=True)
+
         if not asset_id or not version_meta:
+            rerender_image_btn.configure(state=tk.DISABLED)
             favorite_btn.configure(state=tk.DISABLED)
             prune_btn.configure(state=tk.DISABLED)
         else:

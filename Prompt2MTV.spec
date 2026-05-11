@@ -5,7 +5,7 @@ from PyInstaller.utils.hooks import collect_all
 
 
 APP_NAME = 'Prompt2MTV'
-APP_VERSION = '3.0.0'
+APP_VERSION = '3.1.0'
 APP_COMPANY = 'Prompt2MTV'
 APP_DESCRIPTION = 'Prompt2MTV Local AI Music Video Studio'
 
@@ -14,7 +14,11 @@ imageio_datas, imageio_binaries, imageio_hiddenimports = collect_all('imageio_ff
 dnd_datas, dnd_binaries, dnd_hiddenimports = collect_all('tkinterdnd2')
 workflow_datas = [
     (str(project_root / 'video_ltx2_3_t2v.json'), '.'),
+    (str(project_root / 'video_ltx2_3_t2v_gguf.json'), '.'),
+    (str(project_root / 'video_ltx2_3_t2v_gguf_distilled.json'), '.'),
     (str(project_root / 'video_ltx2_3_i2v.json'), '.'),
+    (str(project_root / 'video_ltx2_3_i2v_gguf.json'), '.'),
+    (str(project_root / 'video_ltx2_3_i2v_gguf_distilled.json'), '.'),
     (str(project_root / 'image_z_image.json'), '.'),
     (str(project_root / 'ACE_Step_AI_Music_Generator_Workflow.json'), '.'),
     (str(project_root / 'model_manifest.json'), '.'),
