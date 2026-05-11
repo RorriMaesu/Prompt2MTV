@@ -16,6 +16,9 @@
 
 # Prompt2MTV
 
+[![Version](https://img.shields.io/badge/version-3.1.0-blue)](https://github.com/RorriMaesu/Prompt2MTV/releases/tag/v3.1.0)
+[![Platform](https://img.shields.io/badge/platform-Windows-lightgrey?logo=windows)](https://github.com/RorriMaesu/Prompt2MTV/releases/latest)
+
 **Local AI Music Video Studio** — Generate video scenes, compose music, and merge them into finished music videos, all from one desktop app powered by ComfyUI.
 
 ## What's New in v3.1
