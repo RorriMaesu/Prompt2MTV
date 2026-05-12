@@ -36,8 +36,8 @@
 - **AI Chatbot** — Plan and refine scene prompts, brainstorm song concepts, and generate structured lyrics with a local Qwen 3 or Gemma 4 assistant
 - **Autonomous Mode** — One-click pipeline that takes a creative brief and automatically generates all scenes, composes music, and merges the final video
 - **Agentic Quality Control** — Selective thinking mode, per-scene confidence scoring with auto-retry, and batch continuity review with targeted regeneration
-- **One-click merge** — Stitch clips, sync audio, and export final music videos
-- **Timeline Editor NLE** — Drag-and-drop non-linear editor: reorder clips, preview video with transport controls, overlay audio, zoom in/out, and export directly from the editor
+- **One-click merge** — Stitch clips **with custom transition effects**, sync audio, and export final music videos
+- **Timeline Editor NLE** — Drag-and-drop non-linear editor: reorder clips, **trim video lengths**, preview video with transport controls, overlay audio, zoom in/out, and export directly from the editor
 - **Project management** — Batch prompt queue, media gallery, drag-and-drop import, per-project settings
 
 ## Screenshots
