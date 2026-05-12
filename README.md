@@ -10,7 +10,7 @@
 	</a>
 </p>
 
-**Watch a full music video generated in about 8 hours on an RTX 5060 Ti, using Autonomous mode with a single click.**
+**Watch a full music video generated in about 8 hours on an RTX 5060 Ti, using Autonomous mode with a single click.** *(made with v2.0)*
 
 <p align="center">
 	<a href="https://www.youtube.com/watch?v=b0FMM0dyxqE" target="_blank">
@@ -18,7 +18,7 @@
 	</a>
 </p>
 
-**Another full music video generated with Prompt2MTV.**
+**Another full music video generated with Prompt2MTV.** *(made with v3.2)*
 
 ---
 
