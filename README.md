@@ -18,13 +18,13 @@
 	</a>
 </p>
 
-**Another full music video generated with Prompt2MTV.** *(made with v3.2)*
+**Another full music video generated with Prompt2MTV.** *(made with v3.3)*
 
 ---
 
 # Prompt2MTV
 
-[![Version](https://img.shields.io/badge/version-3.2.0-blue)](https://github.com/RorriMaesu/Prompt2MTV/releases/tag/v3.2.0)
+[![Version](https://img.shields.io/badge/version-3.3.0-blue)](https://github.com/RorriMaesu/Prompt2MTV/releases/tag/v3.3.0)
 [![Platform](https://img.shields.io/badge/platform-Windows-lightgrey?logo=windows)](https://github.com/RorriMaesu/Prompt2MTV/releases/latest)
 
 **Local AI Music Video Studio** — Generate video scenes, compose music, and merge them into finished music videos, all from one desktop app powered by ComfyUI.
@@ -250,10 +250,10 @@ PyInstaller is installed automatically by the build script; you don't need to in
 
 ```powershell
 .\build_installer.bat
-# Output: dist_installer\Prompt2MTV-Setup-3.2.0.exe
+# Output: dist_installer\Prompt2MTV-Setup-3.3.0.exe
 ```
 
-Run the resulting `Prompt2MTV-Setup-3.2.0.exe` to install the app — it adds a desktop shortcut and Start Menu entry.
+Run the resulting `Prompt2MTV-Setup-3.3.0.exe` to install the app — it adds a desktop shortcut and Start Menu entry.
 
 ### Upgrade helper
 
