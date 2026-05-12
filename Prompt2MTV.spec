@@ -5,7 +5,7 @@ from PyInstaller.utils.hooks import collect_all
 
 
 APP_NAME = 'Prompt2MTV'
-APP_VERSION = '3.1.0'
+APP_VERSION = '3.2.0'
 APP_COMPANY = 'Prompt2MTV'
 APP_DESCRIPTION = 'Prompt2MTV Local AI Music Video Studio'
 
@@ -22,6 +22,7 @@ workflow_datas = [
     (str(project_root / 'image_z_image.json'), '.'),
     (str(project_root / 'ACE_Step_AI_Music_Generator_Workflow.json'), '.'),
     (str(project_root / 'model_manifest.json'), '.'),
+    (str(project_root / 'Prompt2MTV.ico'), '.'),  # splash screen logo
 ]
 app_icon = str(project_root / 'Prompt2MTV.ico')
 version_file = str(project_root / 'Prompt2MTV_version_info.txt')

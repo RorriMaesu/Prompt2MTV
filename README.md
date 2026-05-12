@@ -16,7 +16,7 @@
 
 # Prompt2MTV
 
-[![Version](https://img.shields.io/badge/version-3.1.0-blue)](https://github.com/RorriMaesu/Prompt2MTV/releases/tag/v3.1.0)
+[![Version](https://img.shields.io/badge/version-3.2.0-blue)](https://github.com/RorriMaesu/Prompt2MTV/releases/tag/v3.2.0)
 [![Platform](https://img.shields.io/badge/platform-Windows-lightgrey?logo=windows)](https://github.com/RorriMaesu/Prompt2MTV/releases/latest)
 
 **Local AI Music Video Studio** — Generate video scenes, compose music, and merge them into finished music videos, all from one desktop app powered by ComfyUI.
@@ -222,10 +222,30 @@ python ltx_queue_manager.py
 
 ### Build
 
+**Prerequisites**
+
+| Tool | Required for | Download |
+|------|-------------|----------|
+| Python 3.11+ + venv | Both build targets | [python.org](https://www.python.org/downloads/) |
+| [Inno Setup 6](https://jrsoftware.org/isdl.php) | Installer only (`build_installer.bat`) | [jrsoftware.org](https://jrsoftware.org/isdl.php) |
+
+PyInstaller is installed automatically by the build script; you don't need to install it manually.
+
+**Build the standalone EXE** (no installer, just the runnable folder):
+
 ```powershell
-.\build_exe.bat              # → dist\Prompt2MTV\Prompt2MTV.exe
-.\.build_installer.bat        # → dist_installer\Prompt2MTV-Setup-3.1.0.exe
+.\build_exe.bat
+# Output: dist\Prompt2MTV\Prompt2MTV.exe
 ```
+
+**Build the Windows installer** (runs `build_exe.bat` first, then packages with Inno Setup):
+
+```powershell
+.\build_installer.bat
+# Output: dist_installer\Prompt2MTV-Setup-3.2.0.exe
+```
+
+Run the resulting `Prompt2MTV-Setup-3.2.0.exe` to install the app — it adds a desktop shortcut and Start Menu entry.
 
 ### Upgrade helper
 

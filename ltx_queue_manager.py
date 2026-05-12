@@ -18,6 +18,7 @@ import tempfile
 import ctypes
 import queue
 import uuid
+import webbrowser
 from datetime import datetime
 from PIL import Image, ImageTk
 import ttkbootstrap as tb
@@ -207,9 +208,10 @@ WINDOWS_HIDE = 0
 WINDOWS_SHOW = 5
 WINDOWS_RESTORE = 9
 APP_NAME = "Prompt2MTV"
-APP_VERSION = "3.1.0"
+APP_VERSION = "3.2.0"
 APP_PUBLISHER = "Prompt2MTV"
 APP_TAGLINE = "Local AI Music Video Studio"
+BUYMEACOFFEE_URL = "https://buymeacoffee.com/rorrimaesu"
 ENV_COMFYUI_ROOT_KEYS = ("PROMPT2MTV_COMFYUI_ROOT", "COMFYUI_ROOT")
 ENV_COMFYUI_LAUNCHER_KEY = "PROMPT2MTV_COMFYUI_LAUNCHER"
 ENV_MODEL_ROOTS_KEY = "PROMPT2MTV_MODEL_ROOTS"
@@ -616,9 +618,308 @@ else:
     class Prompt2MTVWindow(tb.Window):
         pass
 
-class LTXQueueManager:
+class SplashScreen:
+    """Branded splash screen shown during startup while the main window loads."""
+
+    _BG        = "#08111f"
+    _BORDER    = "#223657"
+    _ACCENT    = "#42d6d0"
+    _MUTED     = "#99a8c7"
+    _TEXT      = "#edf4ff"
+    _BAR_TRACK = "#223657"
+    _BAR_FILL  = "#42d6d0"
+    _WIDTH     = 745
+    _HEIGHT    = 850
+    _LOGO_SIZE = 400
+    _BAR_PADX  = 107
+
+    # ── Startup timing constants ──────────────────────────────────────────
+    _EMA_ALPHA         = 0.3
+    _TIMING_STAGE_KEYS = ["s0_s1", "s1_s2", "s2_s3", "s3_s4", "s4_s5", "s5_s6", "s6_done"]
+    # progress checkpoint value -> index of the stage that just completed
+    _PROGRESS_CHECKPOINTS = {0.05: 0, 0.20: 1, 0.35: 2, 0.55: 3, 0.72: 4, 0.88: 5, 1.0: 6}
+
     def __init__(self, root):
+        self._root = root
+        self._photo = None
+
+        # ── Load startup timing data ──────────────────────────────────────
+        _lad = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or ""
+        self._timing_file = os.path.join(_lad, APP_NAME, "startup_timing.json") if _lad else ""
+        self._ema = {}
+        self._run_count = 0
+        if self._timing_file and os.path.exists(self._timing_file):
+            try:
+                with open(self._timing_file, "r", encoding="utf-8") as _tf:
+                    _td = json.load(_tf)
+                self._ema = {
+                    k: float(v) for k, v in _td.get("ema", {}).items()
+                    if k in self._TIMING_STAGE_KEYS
+                    and isinstance(v, (int, float)) and v > 0
+                }
+                self._run_count = int(_td.get("run_count", 0))
+            except Exception:
+                self._ema = {}
+                self._run_count = 0
+
+        # Timing state for this run
+        self._t_start       = time.perf_counter()
+        self._t_stage_start = self._t_start
+        self._stage_times   = {}
+        self._completed     = False
+        self._eta_ticker_id = None
+        self._eta_deadline  = 0.0  # absolute perf_counter deadline; 0 = not yet set
+
+        sw = root.winfo_screenwidth()
+        sh = root.winfo_screenheight()
+        x = (sw - self._WIDTH) // 2
+        y = (sh - self._HEIGHT) // 2
+
+        self._top = tk.Toplevel(root)
+        self._top.overrideredirect(True)
+        self._top.attributes("-topmost", True)
+        self._top.geometry(f"{self._WIDTH}x{self._HEIGHT}+{x}+{y}")
+        self._top.configure(bg=self._BG,
+                            highlightbackground=self._BORDER,
+                            highlightthickness=1)
+
+        # ── Logo (ICO → PIL image, 100×100) ────────────────────────────────
+        logo_loaded = False
+        try:
+            from PIL import Image as _PImage, ImageTk as _PImageTk
+            resource_root = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+            ico_path = os.path.join(resource_root, "Prompt2MTV.ico")
+            if os.path.exists(ico_path):
+                img = _PImage.open(ico_path)
+                # ICO may have multiple sizes; pick the largest
+                sizes = getattr(img, "n_frames", 1)
+                best = img
+                if sizes > 1:
+                    best_size = 0
+                    for i in range(sizes):
+                        img.seek(i)
+                        w, h = img.size
+                        if w > best_size:
+                            best_size = w
+                            best = img.copy()
+                best = best.convert("RGBA").resize(
+                    (self._LOGO_SIZE, self._LOGO_SIZE), _PImage.LANCZOS)
+                self._photo = _PImageTk.PhotoImage(best)
+                tk.Label(self._top, image=self._photo,
+                         bg=self._BG, bd=0).pack(pady=(28, 0))
+                logo_loaded = True
+        except Exception:
+            pass
+
+        if not logo_loaded:
+            tk.Label(self._top, text="\U0001f3ac", font=("Segoe UI Emoji", 160),
+                     bg=self._BG, fg=self._ACCENT).pack(pady=(28, 0))
+
+        # ── App name ───────────────────────────────────────────────────────
+        tk.Label(self._top,
+                 text=APP_NAME,
+                 font=("Segoe UI Semibold", 36),
+                 bg=self._BG, fg=self._ACCENT).pack(pady=(20, 0))
+
+        # ── Version ────────────────────────────────────────────────────────
+        tk.Label(self._top,
+                 text=f"v{APP_VERSION}",
+                 font=("Segoe UI", 13),
+                 bg=self._BG, fg=self._ACCENT).pack(pady=(2, 0))
+
+        # ── Tagline ────────────────────────────────────────────────────────
+        tk.Label(self._top,
+                 text=APP_TAGLINE,
+                 font=("Segoe UI", 16),
+                 bg=self._BG, fg=self._MUTED).pack(pady=(8, 0))
+
+        # ── Author ─────────────────────────────────────────────────────────
+        tk.Label(self._top,
+                 text="By Rorri Maesu",
+                 font=("Segoe UI", 13),
+                 bg=self._BG, fg=self._MUTED).pack(pady=(4, 0))
+
+        # ── Buy Me a Coffee link ──────────────────────────────────────
+        _coffee_lbl = tk.Label(self._top,
+                               text="☕  buymeacoffee.com/rorrimaesu",
+                               font=("Segoe UI", 11),
+                               bg=self._BG, fg=self._MUTED,
+                               cursor="hand2")
+        _coffee_lbl.pack(pady=(6, 0))
+        _coffee_lbl.bind("<Button-1>", lambda _e: webbrowser.open(BUYMEACOFFEE_URL))
+        _coffee_lbl.bind("<Enter>",   lambda _e: _coffee_lbl.config(fg=self._ACCENT))
+        _coffee_lbl.bind("<Leave>",   lambda _e: _coffee_lbl.config(fg=self._MUTED))
+
+        # ── Progress bar canvas ────────────────────────────────────────────
+        bar_frame = tk.Frame(self._top, bg=self._BG)
+        bar_frame.pack(fill=tk.X, padx=self._BAR_PADX, pady=(20, 0))
+
+        self._bar_w = self._WIDTH - self._BAR_PADX * 2
+        self._bar_h = 12
+        self._bar_canvas = tk.Canvas(bar_frame,
+                                     width=self._bar_w, height=self._bar_h,
+                                     bg=self._BG, bd=0, highlightthickness=0)
+        self._bar_canvas.pack()
+
+        # Track rectangle
+        self._bar_canvas.create_rectangle(0, 0, self._bar_w, self._bar_h,
+                                          fill=self._BAR_TRACK, outline="",
+                                          tags="track")
+        # Fill rectangle (starts at 0 width)
+        self._fill_id = self._bar_canvas.create_rectangle(0, 0, 0, self._bar_h,
+                                                          fill=self._BAR_FILL,
+                                                          outline="", tags="fill")
+
+        # ── Status label (fixed-height zone so text never clips) ──────────
+        status_zone = tk.Frame(self._top, bg=self._BG, height=54)
+        status_zone.pack(fill=tk.X, pady=(16, 4))
+        status_zone.pack_propagate(False)
+        self._status_var = tk.StringVar(value="Starting up\u2026")
+        self._status_lbl = tk.Label(status_zone,
+                                    textvariable=self._status_var,
+                                    font=("Segoe UI", 13),
+                                    bg=self._BG, fg=self._MUTED,
+                                    wraplength=self._WIDTH - 40,
+                                    justify=tk.CENTER)
+        self._status_lbl.pack(expand=True)
+
+        # ── ETA label (fixed-height; blank until run 2+) ──────────────────
+        eta_zone = tk.Frame(self._top, bg=self._BG, height=24)
+        eta_zone.pack(fill=tk.X, pady=(0, 14))
+        eta_zone.pack_propagate(False)
+        self._eta_var = tk.StringVar(value="")
+        self._eta_lbl = tk.Label(eta_zone,
+                                 textvariable=self._eta_var,
+                                 font=("Segoe UI", 10),
+                                 bg=self._BG, fg=self._MUTED,
+                                 justify=tk.CENTER)
+        self._eta_lbl.pack(expand=True)
+
+        # Force an immediate paint so the window renders before __init__ blocks
+        self._top.update()
+
+    def set_progress(self, value: float, status: str = ""):
+        """Update the progress bar (0.0–1.0), status text, and ETA."""
+        if not self._top.winfo_exists():
+            return
+        fill_w = max(0, min(int(self._bar_w * value), self._bar_w))
+        self._bar_canvas.coords(self._fill_id, 0, 0, fill_w, self._bar_h)
+        if status:
+            self._status_var.set(status)
+
+        # ── Per-stage timing & adaptive ETA ───────────────────────────────
+        now = time.perf_counter()
+        stage_idx = self._PROGRESS_CHECKPOINTS.get(value)
+        if stage_idx is not None:
+            self._stage_times[self._TIMING_STAGE_KEYS[stage_idx]] = now - self._t_stage_start
+            if value >= 1.0:
+                self._completed = True
+            if self._run_count > 0 and self._ema:
+                done_keys       = self._TIMING_STAGE_KEYS[:stage_idx + 1]
+                pending_keys    = self._TIMING_STAGE_KEYS[stage_idx + 1:]
+                expected_so_far = sum(self._ema.get(k, 0.0) for k in done_keys)
+                if expected_so_far > 0 and pending_keys:
+                    speed_ratio      = max(0.3, min(3.0, (now - self._t_start) / expected_so_far))
+                    eta_secs         = speed_ratio * sum(self._ema.get(k, 0.0) for k in pending_keys)
+                    self._eta_deadline = now + eta_secs
+                    self._update_eta_label(eta_secs)
+                    if self._eta_ticker_id is not None:
+                        try:
+                            self._top.after_cancel(self._eta_ticker_id)
+                        except Exception:
+                            pass
+                    self._eta_ticker_id = self._top.after(200, self._tick_eta)
+                elif not pending_keys:
+                    # Final checkpoint — show "Almost ready…" instead of going blank
+                    self._update_eta_label(0.0)
+                else:
+                    self._eta_var.set("")
+            self._t_stage_start = now
+
+        self._top.update_idletasks()
+
+    def _update_eta_label(self, secs: float):
+        """Format and display the ETA value."""
+        if self._run_count == 0:
+            self._eta_var.set("")
+            return
+        if secs < 1.5:
+            self._eta_var.set("Almost ready\u2026")
+        elif secs < 60:
+            self._eta_var.set(f"~{int(secs)}s remaining")
+        else:
+            mins, rem = divmod(int(secs), 60)
+            self._eta_var.set(f"~{mins}m {rem}s remaining")
+
+    def _tick_eta(self):
+        """Live countdown — fires every 200 ms, uses absolute deadline so drift is impossible."""
+        try:
+            if not self._top.winfo_exists():
+                return
+        except Exception:
+            return
+        remaining = max(0.0, self._eta_deadline - time.perf_counter())
+        self._update_eta_label(remaining)
+        self._eta_ticker_id = self._top.after(200, self._tick_eta)
+
+    def tick(self):
+        """Explicit pump for long-running blocking phases (e.g. deferred tab builds).
+        Refreshes the ETA label and flushes pending Tkinter events."""
+        try:
+            if not self._top.winfo_exists():
+                return
+        except Exception:
+            return
+        if self._eta_deadline > 0:
+            remaining = max(0.0, self._eta_deadline - time.perf_counter())
+            self._update_eta_label(remaining)
+        self._top.update_idletasks()
+
+    def close(self):
+        """Persist timing EMA and destroy the splash window."""
+        # Cancel live ticker
+        if self._eta_ticker_id is not None:
+            try:
+                self._top.after_cancel(self._eta_ticker_id)
+            except Exception:
+                pass
+            self._eta_ticker_id = None
+
+        # Update EMA and write to disk when startup completed normally
+        if self._completed and self._timing_file:
+            try:
+                for key, actual in self._stage_times.items():
+                    if key in self._ema:
+                        self._ema[key] = self._EMA_ALPHA * actual + (1.0 - self._EMA_ALPHA) * self._ema[key]
+                    else:
+                        self._ema[key] = actual  # seed on first ever run
+                self._run_count += 1
+                payload = {
+                    "app_version": APP_VERSION,
+                    "run_count":   self._run_count,
+                    "ema":         {k: round(v, 4) for k, v in self._ema.items()},
+                }
+                os.makedirs(os.path.dirname(self._timing_file), exist_ok=True)
+                tmp = self._timing_file + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as _f:
+                    json.dump(payload, _f, indent=2)
+                os.replace(tmp, self._timing_file)
+            except Exception:
+                pass
+
+        try:
+            if self._top.winfo_exists():
+                self._top.destroy()
+        except Exception:
+            pass
+
+
+class LTXQueueManager:
+    def __init__(self, root, splash=None):
+        self.splash = splash
         self.root = root
+        if self.splash:
+            self.splash.set_progress(0.05, "Starting up…")
         self.root.title(f"{APP_NAME} {APP_VERSION}")
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
@@ -626,7 +927,7 @@ class LTXQueueManager:
         default_height = min(920, max(760, int(screen_height * 0.86)))
         self.root.geometry(f"{default_width}x{default_height}")
         self.root.minsize(980, 720)
-        self.root.after(0, self._maximize_window)
+        self._maximize_window()
         self.colors = dict(UI_COLORS)
         self.fonts = dict(UI_FONTS)
         self.app_root_dir = self._get_app_root_dir()
@@ -634,7 +935,9 @@ class LTXQueueManager:
         self.user_data_dir = self._get_user_data_dir()
         os.makedirs(self.user_data_dir, exist_ok=True)
         self._configure_theme_system()
-        
+        if self.splash:
+            self.splash.set_progress(0.20, "Loading settings & theme configuration\u2026")
+
         self.api_json_path = VIDEO_WORKFLOW_PROFILES[DEFAULT_VIDEO_PROFILE]["workflow_path"]
         self.image_json_path = IMAGE_WORKFLOW_PROFILE["workflow_path"]
         self.i2v_json_path = I2V_WORKFLOW_PROFILE["workflow_path"]
@@ -690,6 +993,7 @@ class LTXQueueManager:
         self.comfyui_poll_started_at = None
         self.comfyui_readiness_eta_job = None
         self.comfyui_readiness_flash_job = None
+        self._comfyui_pending_callback = None
         self.debug_lock = threading.Lock()
         self.debug_log_file = None
         self.comfyui_root = None
@@ -794,6 +1098,8 @@ class LTXQueueManager:
         self.base_output_dir = self._get_default_output_dir()
         os.makedirs(self.base_output_dir, exist_ok=True)
         self._load_model_manifest()
+        if self.splash:
+            self.splash.set_progress(0.35, "Loading AI model manifest & workflow profiles\u2026")
         
         self.thumbnail_images = []
         self.generated_image_dir = None
@@ -802,13 +1108,17 @@ class LTXQueueManager:
         self.scene_timeline = []
         self.image_prompt_queue = []
         
+        if self.splash:
+            self.splash.set_progress(0.55, "Building the main interface\u2026")
         self.setup_ui()
-        self._enable_drag_and_drop()
+        # _enable_drag_and_drop is called from _build_deferred_tabs after tabs are built
+        if self.splash:
+            self.splash.set_progress(0.72, "Restoring last project state\u2026")
         self.load_default_json()
         self.load_global_settings() # Load global settings after workflows are available so project state restoration wins
-        self.run_startup_preflight(interactive=True)
-        self.launch_comfyui()
-        self._start_comfyui_readiness_poll()
+        if self.splash:
+            self.splash.set_progress(0.88, "Finalizing tabs & layout\u2026")
+        self.root.after(200, lambda: self.run_startup_preflight(interactive=True))
 
     def _get_app_root_dir(self):
         if getattr(sys, "frozen", False):
@@ -7621,7 +7931,7 @@ class LTXQueueManager:
     def _is_comfyui_running(self):
         try:
             req = urllib.request.Request("http://127.0.0.1:8188/system_stats")
-            urllib.request.urlopen(req, timeout=1)
+            urllib.request.urlopen(req, timeout=0.3)
             return True
         except Exception:
             return False
@@ -7884,8 +8194,8 @@ class LTXQueueManager:
         dialog.title(f"About {APP_NAME}")
         dialog.transient(self.root)
         dialog.grab_set()
-        dialog.geometry("520x340")
-        dialog.minsize(480, 300)
+        dialog.geometry("520x380")
+        dialog.minsize(480, 340)
         self._style_panel(dialog, self.colors["bg"])
 
         shell = tk.Frame(dialog, padx=22, pady=20)
@@ -7925,6 +8235,11 @@ class LTXQueueManager:
         close_btn = tk.Button(footer, text="Close", command=dialog.destroy)
         close_btn.pack(side=tk.RIGHT)
         self._style_button(close_btn, "primary", compact=True)
+
+        coffee_btn = tk.Button(footer, text="☕  Buy Me a Coffee",
+                               command=lambda: webbrowser.open(BUYMEACOFFEE_URL))
+        coffee_btn.pack(side=tk.LEFT)
+        self._style_button(coffee_btn, "ghost", compact=True)
 
         dialog.bind("<Escape>", lambda _event: dialog.destroy())
         dialog.wait_visibility()
@@ -8037,7 +8352,7 @@ class LTXQueueManager:
         return "\n".join(lines)
 
     def _configure_theme_system(self):
-        self.style = tb.Style(theme=THEME_NAME)
+        self.style = self.root.style
         self.root.configure(bg=self.colors["bg"])
         self.root.option_add("*Font", self.fonts["body"])
         self.root.option_add("*Menu.font", self.fonts["body"])
@@ -8296,9 +8611,6 @@ class LTXQueueManager:
         return {
             "scene_timeline": False,
             "video_settings": False,
-            "video_preflight": False,
-            "video_debug": False,
-            "video_utilities": False,
             "image_utilities": False,
             "image_workflow_settings": False,
             "image_prompt_queue": False,
@@ -8339,10 +8651,12 @@ class LTXQueueManager:
         self._refresh_responsive_copy()
 
     def _apply_header_density_mode(self, is_compact):
-        self.video_header_eyebrow_label.config(text="" if is_compact else "VIDEO STUDIO")
-        self.video_header_copy_label.config(
-            text="Workflow, prompts, and output review." if is_compact else "Keep workflow control, prompting, and output review in one screen."
-        )
+        if hasattr(self, "video_header_eyebrow_label"):
+            self.video_header_eyebrow_label.config(text="" if is_compact else "VIDEO STUDIO")
+        if hasattr(self, "video_header_copy_label"):
+            self.video_header_copy_label.config(
+                text="Workflow, prompts, and output review." if is_compact else "Keep workflow control, prompting, and output review in one screen."
+            )
         if hasattr(self, "image_header_eyebrow_label"):
             self.image_header_eyebrow_label.config(text="" if is_compact else "IMAGE PHASE")
         if hasattr(self, "image_header_copy_label"):
@@ -8417,8 +8731,6 @@ class LTXQueueManager:
         accordion_order = [
             "scene_timeline",
             "video_settings",
-            "video_preflight",
-            "video_debug"
         ]
         active_support = next(
             (
@@ -8508,7 +8820,7 @@ class LTXQueueManager:
             return
 
     def _update_chatbot_workspace_balance(self):
-        if not hasattr(self, "chatbot_focus_workspace_frame"):
+        if not hasattr(self, "chatbot_output_card"):
             return
 
         try:
@@ -8661,7 +8973,6 @@ class LTXQueueManager:
     def _reflow_video_left_panel(self):
         layout_sequence = [
             (self.video_config_row, {"side": tk.TOP, "fill": tk.BOTH, "expand": True, "padx": 18, "pady": (0, 12)}),
-            (self.video_utilities_section["container"], {"side": tk.BOTTOM, "fill": tk.X, "padx": 18, "pady": (0, 12)})
         ]
 
         for widget, pack_options in layout_sequence:
@@ -8682,7 +8993,6 @@ class LTXQueueManager:
             self.prompt_count_value_label.config(text=f"{scene_count} scene{'s' if scene_count != 1 else ''}")
             if hasattr(self, "selection_count_value_label"):
                 selection_count_text = self.selection_count_value_label.cget("text")
-                self._update_collapsible_section_meta("video_utilities", f"{scene_count} scenes • {selection_count_text}")
 
         image_prompt_count = len(self.image_scrollable_frame.winfo_children()) if hasattr(self, "image_scrollable_frame") else 0
         if hasattr(self, "image_queue_count_value_label"):
@@ -8709,9 +9019,6 @@ class LTXQueueManager:
         selection_count = len(self.selected_videos)
         if hasattr(self, "selection_count_value_label"):
             self.selection_count_value_label.config(text=f"{selection_count} selected")
-            if hasattr(self, "prompt_count_value_label"):
-                scene_count_text = self.prompt_count_value_label.cget("text")
-                self._update_collapsible_section_meta("video_utilities", f"{scene_count_text} • {selection_count} selected")
         if hasattr(self, "gallery_selection_label"):
             self.gallery_selection_label.config(text=f"{selection_count} selected")
         if hasattr(self, "gallery_stitch_btn"):
@@ -8896,6 +9203,8 @@ class LTXQueueManager:
             self._timeline_update_audio_selector()
 
     def _reset_selected_video_preview(self):
+        if not hasattr(self, 'selected_video_lbl'):
+            return
         self.selected_video_lbl.config(text="No video selected.\nGo to Video Generation tab\nand click 'Add Music'.")
         self.selected_video_thumb.config(image="")
         self.selected_video_thumb.image = None
@@ -8904,6 +9213,8 @@ class LTXQueueManager:
         self._refresh_music_sidebar_state()
 
     def _set_selected_video_preview(self, video_path, thumb_path=None):
+        if not hasattr(self, 'selected_video_lbl'):
+            return
         self.selected_video_lbl.config(text=os.path.basename(video_path))
         if hasattr(self, "selected_video_meta_label"):
             modified_text = datetime.fromtimestamp(os.path.getmtime(video_path)).strftime("Updated %b %d, %Y %I:%M %p")
@@ -8939,12 +9250,10 @@ class LTXQueueManager:
             self.chatbot_tab,
             self.left_frame,
             self.right_frame,
-            self.video_utilities_section["container"],
-            self.video_utilities_section["header"],
-            self.video_utilities_frame,
-            self.video_header_frame,
-            self.workflow_toolbar_card,
             self.video_config_row,
+            self.video_status_bar,
+            self.scene_stitch_bar,
+            self.post_process_actions_frame,
             self.image_scroll_shell,
             self.image_main_frame,
             self.image_utilities_section["container"],
@@ -8961,16 +9270,9 @@ class LTXQueueManager:
             self.video_settings_section["header"],
             self.settings_scroll_shell,
             self.settings_frame,
-            self.video_preflight_section["container"],
-            self.video_preflight_section["header"],
-            self.preflight_frame,
             self.image_prompt_section_frame,
             self.scene_timeline_frame,
             self.scene_timeline_header_frame,
-            self.video_debug_section["container"],
-            self.video_debug_section["header"],
-            self.bottom_frame,
-            self.post_process_frame,
             self.gallery_header_frame,
             self.gallery_actions_frame,
             self.gallery_shell_frame,
@@ -9069,8 +9371,6 @@ class LTXQueueManager:
         self._style_panel(self.music_sidebar_card, self.colors["surface_alt"], border=True)
         self._style_panel(self.music_preview_card, self.colors["surface"], border=True)
         self._style_panel(self.settings_frame, self.colors["surface"])
-        self._style_panel(self.preflight_frame, self.colors["surface"])
-        self._style_panel(self.workflow_toolbar_card, self.colors["surface_alt"], border=True)
         self._style_panel(self.image_prompt_section_frame, self.colors["surface"])
         self._style_panel(self.scene_timeline_frame, self.colors["surface"])
         self._style_panel(self.gallery_shell_frame, self.colors["surface_alt"], border=True)
@@ -9080,9 +9380,9 @@ class LTXQueueManager:
             self._style_panel(self.gallery_filter_bar_frame, self.colors["surface_alt"])
             self._apply_gallery_filter_style()
 
-        for key in ["image_utilities", "image_prompt_queue", "image_workflow_settings", "scene_timeline", "video_settings", "video_preflight", "video_debug", "video_utilities", "music_prompt", "music_lyrics", "music_playback", "music_generation", "music_advanced", "music_actions", "music_songs_library", "music_media_state", "music_preview"]:
+        for key in ["image_utilities", "image_prompt_queue", "image_workflow_settings", "scene_timeline", "video_settings", "music_prompt", "music_lyrics", "music_playback", "music_generation", "music_advanced", "music_actions", "music_songs_library", "music_media_state", "music_preview"]:
             section = self.collapsible_sections[key]
-            section_bg = self.colors["surface_alt"] if key in ["image_utilities", "video_utilities", "music_media_state", "music_preview"] else self.colors["surface"]
+            section_bg = self.colors["surface_alt"] if key in ["image_utilities", "music_media_state", "music_preview"] else self.colors["surface"]
             self._style_panel(section["container"], section_bg, border=True)
             self._style_panel(section["header"], section_bg)
             self._style_panel(section["body"], section_bg)
@@ -9093,7 +9393,6 @@ class LTXQueueManager:
 
         self.project_label.configure(bg=self.colors["surface_alt"], fg=self.colors["text"], font=self.fonts["body_strong"])
         self.status_frame.configure(bg=self.colors["surface_alt"], highlightbackground=self.colors["border"], highlightthickness=1)
-        self.separator.configure(bg=self.colors["border"], height=1, bd=0, relief=tk.FLAT)
 
         self.notebook.configure(style="App.TNotebook")
         for child in self.notebook.winfo_children():
@@ -9106,11 +9405,7 @@ class LTXQueueManager:
         self.notebook.enable_traversal()
         self.notebook.tab(0)
 
-        self._style_label(self.json_label, "muted", self.top_frame.cget("bg"))
-        self._style_label(self.video_header_eyebrow_label, "muted", self.video_header_frame.cget("bg"))
-        self.video_header_eyebrow_label.configure(font=self.fonts["micro"])
-        self._style_label(self.video_header_title_label, "title", self.video_header_frame.cget("bg"))
-        self._style_label(self.video_header_copy_label, "muted", self.video_header_frame.cget("bg"))
+        self._style_label(self.json_label, "muted", self.workflow_load_row.cget("bg"))
         self._style_label(self.image_header_eyebrow_label, "muted", self.image_header_frame.cget("bg"))
         self.image_header_eyebrow_label.configure(font=self.fonts["micro"])
         self._style_label(self.image_header_title_label, "title", self.image_header_frame.cget("bg"))
@@ -9121,10 +9416,15 @@ class LTXQueueManager:
         self.scene_section_eyebrow_label.configure(font=self.fonts["micro"])
         self._style_label(self.scene_section_title_label, "section", self.scene_timeline_header_frame.cget("bg"))
         self._style_label(self.scene_section_copy_label, "muted", self.scene_timeline_header_frame.cget("bg"))
-        self._style_label(self.debug_prompt_label, "muted", self.video_debug_section["body"].cget("bg"))
-        self._style_label(self.status_label, "muted", self.bottom_frame.cget("bg"))
+        self._style_label(self.status_label, "muted", self.video_status_bar.cget("bg"))
         self._style_label(self.version_label, "muted", self.status_frame.cget("bg"))
         self.version_label.configure(font=self.fonts["small"])
+        self._style_label(self.coffee_link_label, "muted", self.status_frame.cget("bg"))
+        self.coffee_link_label.configure(font=self.fonts["small"])
+        _c_muted = self.colors["text_muted"]
+        _c_accent = self.colors["accent"]
+        self.coffee_link_label.bind("<Enter>", lambda _e: self.coffee_link_label.config(fg=_c_accent))
+        self.coffee_link_label.bind("<Leave>", lambda _e: self.coffee_link_label.config(fg=_c_muted))
         self._style_label(self.music_header_eyebrow_label, "muted", self.music_header_frame.cget("bg"))
         self.music_header_eyebrow_label.configure(font=self.fonts["micro"])
         self._style_label(self.music_header_title_label, "title", self.music_header_frame.cget("bg"))
@@ -9266,7 +9566,6 @@ class LTXQueueManager:
         for entry_widget in [
             self.music_tags_text,
             self.music_lyrics_text,
-            self.video_preflight_text,
             self.chatbot_briefing_text
         ]:
             self._style_text_input(entry_widget, multiline=True)
@@ -9426,6 +9725,8 @@ class LTXQueueManager:
         if self._is_comfyui_running():
             self.comfyui_ready = True
             self.update_status("ComfyUI already running on port 8188.", "blue")
+            self._update_comfyui_banner("ready", "✅ ComfyUI already running")
+            self._fire_comfyui_pending_callback()
             self.comfyui_process = None
             self.comfyui_console_hwnd = None
             self.comfyui_console_visible = False
@@ -9437,6 +9738,7 @@ class LTXQueueManager:
         bat_path = self._normalize_path(self.comfyui_launcher_path)
         if bat_path and os.path.exists(bat_path):
             self.update_status("Launching ComfyUI...", "blue")
+            self._update_comfyui_banner("launching", "⌛ Launching ComfyUI…")
             try:
                 console_title = f"{APP_NAME} ComfyUI {uuid.uuid4().hex[:8]}"
                 launcher_expression = f'title {console_title} && "{bat_path}"'
@@ -9470,6 +9772,7 @@ class LTXQueueManager:
                 self.root.after(5000, lambda: self.update_status("ComfyUI Launched. Waiting for connection...", "blue"))
             except Exception as e:
                 self.update_status(f"Error launching ComfyUI: {e}", "red")
+                self._update_comfyui_banner("error", f"⚠ Error launching ComfyUI: {e}")
                 self.comfyui_process = None
                 self.comfyui_console_hwnd = None
                 self.comfyui_console_visible = False
@@ -9478,6 +9781,7 @@ class LTXQueueManager:
                 self._refresh_comfyui_terminal_button()
         else:
             self.update_status("ComfyUI launcher not configured. Use Project > Configure Runtime Paths.", "red")
+            self._update_comfyui_banner("error", "⚠ ComfyUI launcher not configured. Use Project → Configure Runtime Paths.")
 
     def _load_comfyui_readiness_history(self):
         history = {"samples": [], "average_seconds": 0.0}
@@ -9575,6 +9879,7 @@ class LTXQueueManager:
                 eta_text = "⏳ Waiting for ComfyUI to become ready... (any moment now)"
             if hasattr(self, "autonomous_status_label"):
                 self.autonomous_status_label.config(text=eta_text)
+            self._update_comfyui_banner("waiting", eta_text)
         self.comfyui_readiness_eta_job = self.root.after(1000, self._update_comfyui_readiness_eta)
 
     def _start_comfyui_readiness_poll(self):
@@ -9586,6 +9891,7 @@ class LTXQueueManager:
             self.autonomous_start_btn.config(state=tk.DISABLED)
         if hasattr(self, "autonomous_status_label"):
             self.autonomous_status_label.config(text="⏳ Waiting for ComfyUI to become ready...")
+        self._update_comfyui_banner("waiting", "⏳ Waiting for ComfyUI to become ready…")
         self._update_comfyui_readiness_eta()
         self._poll_comfyui_readiness()
 
@@ -9614,8 +9920,97 @@ class LTXQueueManager:
             if hasattr(self, "autonomous_start_btn") and not getattr(self, "autonomous_active", False):
                 self.autonomous_start_btn.config(state=tk.NORMAL)
             self.update_status("ComfyUI is online and ready.", "green")
+            self._update_comfyui_banner("ready", "✅ ComfyUI is ready")
+            self._fire_comfyui_pending_callback()
         else:
             self.comfyui_ready_poll_id = self.root.after(3000, self._poll_comfyui_readiness)
+
+    # ------------------------------------------------------------------ #
+    #  ComfyUI on-demand launch helpers                                    #
+    # ------------------------------------------------------------------ #
+
+    def _update_comfyui_banner(self, state, text=""):
+        """Show / update the global ComfyUI status banner.
+
+        States:
+          hidden    – hide the banner entirely
+          launching – amber spinner, no Launch-Now button
+          waiting   – amber spinner with ETA text
+          ready     – green tick, auto-hides after 4 s
+          error     – red text + Launch-Now button
+        """
+        if not hasattr(self, "comfyui_banner_frame"):
+            return
+        if self._comfyui_banner_autohide_job is not None:
+            self.root.after_cancel(self._comfyui_banner_autohide_job)
+            self._comfyui_banner_autohide_job = None
+
+        if state == "hidden":
+            self.comfyui_banner_bar.stop()
+            self.comfyui_banner_frame.pack_forget()
+            return
+
+        color_map = {
+            "launching": "#b35c00",
+            "waiting":   "#b35c00",
+            "ready":     "#1a7a1a",
+            "error":     "#cc0000",
+        }
+        fg = color_map.get(state, "black")
+
+        # Show the frame just below the project status bar
+        if not self.comfyui_banner_frame.winfo_ismapped():
+            self.comfyui_banner_frame.pack(fill=tk.X, after=self.status_frame)
+
+        self.comfyui_banner_label.config(text=text, fg=fg)
+
+        if state in ("launching", "waiting"):
+            self.comfyui_banner_bar.pack(fill=tk.X, padx=10, pady=(2, 0))
+            self.comfyui_banner_bar.start(12)
+            self.comfyui_banner_launch_btn.pack_forget()
+        elif state == "ready":
+            self.comfyui_banner_bar.stop()
+            self.comfyui_banner_bar.pack_forget()
+            self.comfyui_banner_launch_btn.pack_forget()
+            self._comfyui_banner_autohide_job = self.root.after(
+                4000, lambda: self._update_comfyui_banner("hidden")
+            )
+        elif state == "error":
+            self.comfyui_banner_bar.stop()
+            self.comfyui_banner_bar.pack_forget()
+            self.comfyui_banner_launch_btn.pack(side=tk.RIGHT, padx=(8, 0))
+
+    def _banner_launch_now(self):
+        """Called when the user clicks Launch Now in the banner."""
+        self._ensure_comfyui_ready_or_launch(lambda: None)
+
+    def _ensure_comfyui_ready_or_launch(self, callback):
+        """Call *callback* immediately if ComfyUI is ready, otherwise launch it first."""
+        if self.comfyui_ready:
+            callback()
+            return
+        if self._is_comfyui_running():
+            self.comfyui_ready = True
+            callback()
+            return
+        if not self.comfyui_launcher_path:
+            messagebox.showwarning(
+                "ComfyUI Not Configured",
+                "No ComfyUI launcher is configured.\n"
+                "Use Project \u2192 Configure Runtime Paths.",
+            )
+            return
+        # Store callback; it will be fired by _fire_comfyui_pending_callback once ready
+        self._comfyui_pending_callback = callback
+        self.launch_comfyui()
+        self._start_comfyui_readiness_poll()
+
+    def _fire_comfyui_pending_callback(self):
+        """Execute and clear the pending callback registered by _ensure_comfyui_ready_or_launch."""
+        cb = self._comfyui_pending_callback
+        self._comfyui_pending_callback = None
+        if cb is not None:
+            self.root.after(0, cb)
 
     def setup_ui(self):
         # Top Menu Bar
@@ -9654,6 +10049,22 @@ class LTXQueueManager:
         self.project_label.pack(side=tk.LEFT, padx=10, fill=tk.X, expand=True)
         self.version_label = tk.Label(self.status_frame, text=f"{APP_NAME} {APP_VERSION}")
         self.version_label.pack(side=tk.RIGHT, padx=10)
+        self.coffee_link_label = tk.Label(self.status_frame, text="☕  Support", cursor="hand2")
+        self.coffee_link_label.pack(side=tk.RIGHT, padx=(0, 6))
+        self.coffee_link_label.bind("<Button-1>", lambda _e: webbrowser.open(BUYMEACOFFEE_URL))
+
+        # ComfyUI Status Banner (hidden by default, shown when launching/waiting/error/ready)
+        self.comfyui_banner_frame = tk.Frame(self.root, pady=3)
+        # Not packed initially; shown on demand via _update_comfyui_banner
+        banner_row = tk.Frame(self.comfyui_banner_frame)
+        banner_row.pack(fill=tk.X, padx=10)
+        self.comfyui_banner_label = tk.Label(banner_row, text="", anchor="w")
+        self.comfyui_banner_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.comfyui_banner_launch_btn = tk.Button(
+            banner_row, text="Launch Now", command=self._banner_launch_now
+        )
+        self.comfyui_banner_bar = ttk.Progressbar(self.comfyui_banner_frame, mode="indeterminate")
+        self._comfyui_banner_autohide_job = None
 
         # ETA Progress Panel (hidden by default)
         self.eta_panel_frame = tk.Frame(self.root, relief=tk.GROOVE, borderwidth=1, padx=8, pady=4)
@@ -9791,6 +10202,13 @@ class LTXQueueManager:
         self.image_vae_name_var = tk.StringVar()
         self.image_unet_name_var = tk.StringVar()
 
+        self.workflow_load_row = tk.Frame(self.settings_frame, padx=0, pady=0)
+        self.workflow_load_row.pack(fill=tk.X, pady=(0, 8))
+        self.load_btn = tk.Button(self.workflow_load_row, text="Load Workflow JSON", command=self.load_json_dialog)
+        self.load_btn.pack(side=tk.LEFT)
+        self.json_label = tk.Label(self.workflow_load_row, text="No JSON loaded", anchor="w", justify=tk.LEFT)
+        self.json_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 0))
+
         settings_header_frame = tk.Frame(self.settings_frame)
         settings_header_frame.pack(fill=tk.X, pady=(0, 4))
         settings_header_frame.grid_columnconfigure((0, 1, 2, 3), weight=1)
@@ -9921,46 +10339,6 @@ class LTXQueueManager:
 
         self.refresh_video_model_choices(initial_load=True)
 
-        self.video_preflight_section = self._create_collapsible_section(
-            self.video_config_row,
-            "video_preflight",
-            "Preflight",
-            meta_text="Not validated",
-            is_open=False,
-            body_expand=True,
-            group="video_left_support"
-        )
-        self.video_preflight_section["container"].pack(fill=tk.X, pady=(10, 0))
-
-        self.preflight_frame = tk.Frame(self.video_preflight_section["body"], padx=8, pady=5)
-        self.preflight_frame.pack(fill=tk.BOTH, expand=True)
-
-        self.video_preflight_status_label = tk.Label(self.preflight_frame, text="Status: Not validated", fg="gray", anchor="w")
-        self.video_preflight_status_label.pack(fill=tk.X, pady=(0, 4))
-
-        self.video_preflight_text = tk.Text(self.preflight_frame, height=3, wrap="word")
-        self.video_preflight_text.pack(fill=tk.BOTH, expand=True)
-        self.video_preflight_text.configure(state=tk.DISABLED)
-
-        self.preflight_action_frame = tk.Frame(self.preflight_frame)
-        self.preflight_action_frame.pack(fill=tk.X, pady=(8, 0))
-        self._style_panel(self.preflight_action_frame, self.colors["surface"])
-
-        self.install_models_btn = tk.Button(self.preflight_action_frame, text="Install Missing Models", command=self.install_missing_models)
-        self.install_models_btn.pack(side=tk.RIGHT, padx=(8, 0))
-        self._style_button(self.install_models_btn, "accent", compact=True)
-
-        self.recheck_preflight_btn = tk.Button(
-            self.preflight_action_frame,
-            text="Re-Run Startup Check",
-            command=lambda: self.run_startup_preflight(interactive=True)
-        )
-        self.recheck_preflight_btn.pack(side=tk.RIGHT)
-        self._style_button(self.recheck_preflight_btn, "secondary", compact=True)
-
-        self._set_video_preflight_summary("Validation not run for current settings.", "Not validated", "gray")
-        self._update_model_install_controls({"installable_missing": []})
-
         self.scene_timeline_frame = tk.Frame(self.scene_timeline_section["body"], padx=18, pady=16)
         self.scene_timeline_frame.pack(fill=tk.BOTH, expand=True)
 
@@ -10018,107 +10396,33 @@ class LTXQueueManager:
         self.scene_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=(0, 8))
         self.scene_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        self.video_debug_section = self._create_collapsible_section(
-            self.video_config_row,
-            "video_debug",
-            "Diagnostics",
-            meta_text="Queued prompt preview",
-            is_open=False,
-            body_expand=True,
-            group="video_left_support"
-        )
-        self.video_debug_section["container"].pack(fill=tk.X)
+        self.scene_stitch_bar = tk.Frame(self.scene_timeline_frame, padx=0, pady=8)
+        self.scene_stitch_bar.pack(side=tk.TOP, fill=tk.X)
 
-        self.debug_prompt_label = tk.Label(
-            self.video_debug_section["body"],
-            text="Debug: Queued Prompt: (none)",
-            fg="gray",
-            anchor="w",
-            justify=tk.LEFT,
-            wraplength=520,
-            font=self.fonts["small"]
-        )
-        self.debug_prompt_label.pack(side=tk.TOP, fill=tk.X)
+        self.strip_audio_var = tk.BooleanVar(value=True)
+        self.strip_audio_cb = tk.Checkbutton(self.scene_stitch_bar, text="Strip Audio (Mute Final Video)", variable=self.strip_audio_var)
+        self.strip_audio_cb.pack(side=tk.LEFT)
+
+        self.post_process_actions_frame = tk.Frame(self.scene_stitch_bar)
+        self.post_process_actions_frame.pack(side=tk.RIGHT)
+
+        self.stitch_btn = tk.Button(self.post_process_actions_frame, text="Stitch Selected Videos", command=self.stitch_selected_videos)
+        self.stitch_btn.pack(side=tk.RIGHT)
+
+        self.clear_sel_btn = tk.Button(self.post_process_actions_frame, text="Clear Selection", command=self.clear_selection)
+        self.clear_sel_btn.pack(side=tk.RIGHT, padx=5)
+
+        self.select_all_btn = tk.Button(self.post_process_actions_frame, text="Select All", command=self.select_all_videos)
+        self.select_all_btn.pack(side=tk.RIGHT, padx=5)
 
         self._update_video_workspace_balance()
 
-        self.video_utilities_section = self._create_collapsible_section(
-            self.left_frame,
-            "video_utilities",
-            "Project Utilities",
-            meta_text="workflow, status, stitch",
-            is_open=False,
-            body_expand=False
-        )
-        self.video_utilities_section["container"].pack(side=tk.BOTTOM, fill=tk.X, padx=18, pady=(0, 12))
-
-        self.video_utilities_frame = tk.Frame(self.video_utilities_section["body"], padx=18, pady=12)
-        self.video_utilities_frame.pack(fill=tk.BOTH, expand=True)
-
-        self.video_header_frame = tk.Frame(self.video_utilities_frame, padx=0, pady=0)
-        self.video_header_frame.pack(side=tk.TOP, fill=tk.X)
-
-        self.video_header_text_frame = tk.Frame(self.video_header_frame)
-        self.video_header_text_frame.pack(side=tk.TOP, fill=tk.X, expand=True)
-        header_intro = self._create_section_intro(
-            self.video_header_text_frame,
-            "Video Studio",
-            "Workflow context and delivery controls",
-            "Use this drawer for workflow setup, delivery status, and stitch actions while keeping the Scene Timeline as the primary workspace above."
-        )
-        self.video_header_eyebrow_label, self.video_header_title_label, self.video_header_copy_label = header_intro
-
-        self.video_header_stats_frame = tk.Frame(self.video_header_frame)
-        self.video_header_stats_frame.pack(side=tk.TOP, fill=tk.X, pady=(12, 0))
-        _, self.prompt_count_value_label = self._create_metric_chip(self.video_header_stats_frame, "Scenes", "0 scenes")
-        self.prompt_count_value_label.master.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        _, self.selection_count_value_label = self._create_metric_chip(self.video_header_stats_frame, "Stitch", "0 selected")
-        self.selection_count_value_label.master.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 0))
-
-        self.workflow_toolbar_card = tk.Frame(self.video_utilities_frame, padx=18, pady=10)
-        self.workflow_toolbar_card.pack(side=tk.TOP, fill=tk.X, pady=(10, 0))
-
-        self.top_frame = tk.Frame(self.workflow_toolbar_card)
-        self.top_frame.pack(side=tk.TOP, fill=tk.X)
-        self.top_frame.grid_columnconfigure(1, weight=1)
-
-        self.load_btn = tk.Button(self.top_frame, text="Load Workflow JSON", command=self.load_json_dialog)
-        self.load_btn.grid(row=0, column=0, sticky="w")
-
-        self.json_label = tk.Label(self.workflow_toolbar_card, text="No JSON loaded", anchor="w", justify=tk.LEFT)
-        self.json_label.pack(side=tk.TOP, fill=tk.X, expand=True, pady=(6, 0))
-
         self.left_frame.bind("<Configure>", self._on_left_panel_resize)
 
-        self.separator = tk.Frame(self.video_utilities_frame, height=2, bd=1, relief=tk.SUNKEN)
-        self.separator.pack(side=tk.TOP, fill=tk.X, pady=8)
-
-        self.bottom_frame = tk.Frame(self.video_utilities_frame, padx=0, pady=0)
-        self.bottom_frame.pack(side=tk.TOP, fill=tk.X)
-        self.bottom_frame.grid_columnconfigure(1, weight=1)
-
-        self.status_label = tk.Label(self.bottom_frame, text="Status: Idle", fg="blue")
-        self.status_label.grid(row=0, column=0, sticky="w")
-
-        self.post_process_frame = tk.Frame(self.video_utilities_frame, padx=0, pady=0)
-        self.post_process_frame.pack(side=tk.TOP, fill=tk.X, pady=(10, 0))
-        self.post_process_frame.grid_columnconfigure(1, weight=1)
-
-        self.strip_audio_var = tk.BooleanVar(value=True)
-        self.strip_audio_cb = tk.Checkbutton(self.post_process_frame, text="Strip Audio (Mute Final Video)", variable=self.strip_audio_var)
-        self.strip_audio_cb.grid(row=0, column=0, sticky="w")
-
-        self.post_process_actions_frame = tk.Frame(self.post_process_frame)
-        self.post_process_actions_frame.grid(row=0, column=1, sticky="e")
-        
-        self.stitch_btn = tk.Button(self.post_process_actions_frame, text="Stitch Selected Videos", command=self.stitch_selected_videos)
-        self.stitch_btn.pack(side=tk.RIGHT)
-        
-        self.clear_sel_btn = tk.Button(self.post_process_actions_frame, text="Clear Selection", command=self.clear_selection)
-        self.clear_sel_btn.pack(side=tk.RIGHT, padx=5)
-        
-        self.select_all_btn = tk.Button(self.post_process_actions_frame, text="Select All", command=self.select_all_videos)
-        self.select_all_btn.pack(side=tk.RIGHT, padx=5)
+        self.video_status_bar = tk.Frame(self.left_frame, padx=18, pady=6)
+        self.video_status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        self.status_label = tk.Label(self.video_status_bar, text="Status: Idle", fg="blue", anchor="w")
+        self.status_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
         
         # Global mousewheel scrolling
         def _on_mousewheel(event):
@@ -10136,17 +10440,40 @@ class LTXQueueManager:
                     widget = widget.master
                     
         self.root.bind_all("<MouseWheel>", _on_mousewheel)
-        # --- Image and Music Tab Content ---
-        self.setup_image_tab()
-        self.setup_gallery_tab()
-        self.setup_timeline_editor_tab()
-        self.setup_music_tab()
-        self.setup_chatbot_tab()
+        # --- Image and Music Tab Content deferred to after mainloop starts ---
         self._reflow_video_left_panel()
-        self._apply_static_theme()
         self.notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
         self.root.bind("<Configure>", self._on_window_resize)
-        self.root.after(0, self._finalize_initial_layout)
+        self.root.after(0, self._build_deferred_tabs)
+
+    def _build_deferred_tabs(self):
+        """Build secondary tabs after mainloop starts so the window appears faster."""
+        self.setup_image_tab()
+        if self.splash: self.splash.tick()
+        self.setup_gallery_tab()
+        if self.splash: self.splash.tick()
+        self.setup_timeline_editor_tab()
+        if self.splash: self.splash.tick()
+        self.setup_music_tab()
+        if self.splash: self.splash.tick()
+        self.setup_chatbot_tab()
+        if self.splash: self.splash.tick()
+        self._apply_static_theme()
+        self._enable_drag_and_drop()
+        # Re-apply image settings now that the image tab exists
+        if hasattr(self, "image_width_var"):
+            self._reset_image_settings_to_loaded_workflow()
+            self._apply_saved_image_settings(self.global_image_settings_defaults)
+        # Reload project state to apply music/chatbot/gallery that was skipped during __init__
+        if self.current_project_dir:
+            self.load_project_state()
+            self.refresh_gallery()
+        if self.splash:
+            self.splash.set_progress(1.0, "Ready.")
+            self.root.update_idletasks()
+            self.splash.close()
+            self.splash = None
+        self._finalize_initial_layout()
 
     def _finalize_initial_layout(self):
         self._apply_responsive_section_defaults()
@@ -10157,7 +10484,8 @@ class LTXQueueManager:
 
     def _on_left_panel_resize(self, event):
         available_width = max(320, event.width - 40)
-        self.debug_prompt_label.config(wraplength=available_width)
+        if hasattr(self, 'debug_prompt_label'):
+            self.debug_prompt_label.config(wraplength=available_width)
 
     def setup_image_tab(self):
         self.image_scroll_shell = tk.Frame(self.image_tab, padx=0, pady=0)
@@ -11275,6 +11603,132 @@ class LTXQueueManager:
 
     # ── Drag & drop ───────────────────────────────────────────────────────
 
+    def _timeline_canvas_mousewheel(self, event):
+        """Scroll the timeline canvas horizontally with the mouse wheel."""
+        c = self.timeline_canvas
+        if getattr(event, "delta", 0):
+            # Windows / macOS: delta is a multiple of 120
+            units = int(-1 * (event.delta / 120))
+        elif getattr(event, "num", None) == 4:
+            units = -1
+        elif getattr(event, "num", None) == 5:
+            units = 1
+        else:
+            return
+        c.xview_scroll(units, "units")
+        return "break"
+
+    def _timeline_canvas_right_click(self, event):
+        """Right-click context menu on a scene card: Play Clip or Move to position."""
+        c = self.timeline_canvas
+        cx = c.canvasx(event.x)
+        cy = c.canvasy(event.y)
+        # Only act on clicks in the card zone (below ruler + audio bar)
+        SCRUB_ZONE = self._TL_RULER_H + self._TL_AUDIO_H
+        if cy <= SCRUB_ZONE:
+            return
+        # Hit-test for a clip tag
+        items = c.find_overlapping(cx - 2, cy - 2, cx + 2, cy + 2)
+        scene_id = None
+        for item in items:
+            for t in c.gettags(item):
+                if t.startswith("clip_"):
+                    scene_id = t[len("clip_"):]
+                    break
+            if scene_id:
+                break
+        if not scene_id:
+            return
+        # Find clip path for Play action
+        clip_path = ""
+        for sc, _, _ in getattr(self, "_timeline_current_scenes", []):
+            if sc["scene_id"] == scene_id:
+                clip_path = sc.get("clip_path", "")
+                break
+        menu = tk.Menu(self.root, tearoff=0)
+        if clip_path and os.path.exists(clip_path):
+            menu.add_command(
+                label="\u25b6  Play Clip",
+                command=lambda: self.play_video(clip_path)
+            )
+            menu.add_separator()
+        menu.add_command(
+            label="\u2195  Move to Position\u2026",
+            command=lambda sid=scene_id: self._timeline_move_scene_to_position(sid)
+        )
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _timeline_move_scene_to_position(self, scene_id):
+        """Prompt the user for a 1-based target position and reorder the timeline."""
+        scenes = self._get_timeline_ordered_scenes()
+        n = len(scenes)
+        if n < 2:
+            return
+        current_ids = [sc["scene_id"] for sc in scenes]
+        if scene_id not in current_ids:
+            return
+        current_pos = current_ids.index(scene_id) + 1  # 1-based
+        target = simpledialog.askinteger(
+            "Move Scene",
+            f"Current position: {current_pos} of {n}\nMove to position (1\u2013{n}):",
+            minvalue=1,
+            maxvalue=n,
+            parent=self.root,
+        )
+        if target is None or target == current_pos:
+            return
+        # Rebuild arrangement with the scene spliced to the new slot
+        arrangement = list(self.timeline_arrangement) if self.timeline_arrangement else current_ids[:]
+        # Ensure all scene IDs from scenes are represented
+        seen = set(arrangement)
+        for sid in current_ids:
+            if sid not in seen:
+                arrangement.append(sid)
+        # Remove then insert
+        try:
+            arrangement.remove(scene_id)
+        except ValueError:
+            return
+        arrangement.insert(target - 1, scene_id)
+        self.timeline_arrangement = arrangement
+        self._save_timeline_arrangement()
+        self.refresh_timeline_editor()
+
+    def _timeline_card_edge_scroll_tick(self):
+        """Timer callback: scroll the timeline canvas while a card is held at the edge."""
+        state = self._timeline_drag_state
+        if not state or state.get("mode") == "scrub":
+            return
+        state["scroll_job"] = None
+        vel = state.get("edge_vel", 0)
+        if vel == 0:
+            return
+        c = self.timeline_canvas
+        try:
+            sr = c.cget("scrollregion").split()
+            total_w = float(sr[2]) if len(sr) >= 3 else 0
+        except Exception:
+            total_w = 0
+        if total_w <= 0:
+            return
+        lo, _ = c.xview()
+        new_lo = max(0.0, min(1.0, lo + vel / total_w))
+        if new_lo == lo:
+            return  # already at boundary — stop scrolling
+        c.xview_moveto(new_lo)
+        # Move the dragged card with the canvas so it stays under the cursor
+        scene_id = state.get("scene_id")
+        if scene_id:
+            c.move(f"clip_{scene_id}", vel, 0)
+        # Compensate last_x so the next mouse-motion delta is correct
+        state["last_x"] = state.get("last_x", 0) + vel
+        # Reschedule as long as vel is non-zero
+        if state.get("edge_vel", 0) != 0:
+            state["scroll_job"] = self.root.after(16, self._timeline_card_edge_scroll_tick)
+
     def _timeline_drag_start(self, event):
         c = self.timeline_canvas
         cx = c.canvasx(event.x)
@@ -11320,6 +11774,8 @@ class LTXQueueManager:
             "dragging": False,
             "was_playing": self._timeline_playback_active,
             "saved_pos": self._timeline_playback_pos,
+            "edge_vel": 0,
+            "scroll_job": None,
         }
         if self._timeline_playback_active:
             self._timeline_pause()
@@ -11361,11 +11817,31 @@ class LTXQueueManager:
         self._timeline_drag_state["last_x"] = cx
         self._timeline_drag_state["dragging"] = True
 
+        # Edge-scroll: detect proximity to left/right canvas edge
+        EDGE_ZONE = 60
+        widget_w = c.winfo_width() or 600
+        ex = event.x  # widget-relative x
+        vel = 0
+        if ex < EDGE_ZONE:
+            vel = -(5 + (EDGE_ZONE - ex) * 0.25)
+        elif ex > widget_w - EDGE_ZONE:
+            vel = 5 + (ex - (widget_w - EDGE_ZONE)) * 0.25
+        self._timeline_drag_state["edge_vel"] = vel
+        if vel != 0 and not self._timeline_drag_state.get("scroll_job"):
+            self._timeline_drag_state["scroll_job"] = self.root.after(
+                16, self._timeline_card_edge_scroll_tick
+            )
+
     def _timeline_drag_release(self, event):
         if not self._timeline_drag_state:
             return
         state = self._timeline_drag_state
         self._timeline_drag_state = None
+
+        # Cancel any pending edge-scroll timer
+        job = state.get("scroll_job")
+        if job:
+            self.root.after_cancel(job)
 
         # ── Scrub release ────────────────────────────────────────────────
         if state.get("mode") == "scrub":
@@ -11595,6 +12071,11 @@ class LTXQueueManager:
         self.timeline_canvas.bind("<B1-Motion>", self._timeline_drag_move)
         self.timeline_canvas.bind("<ButtonRelease-1>", self._timeline_drag_release)
         self.timeline_canvas.bind("<Motion>", self._timeline_canvas_motion)
+        self.timeline_canvas.bind("<Button-3>", self._timeline_canvas_right_click)
+        # Mouse-wheel horizontal scroll (Windows + Linux)
+        self.timeline_canvas.bind("<MouseWheel>", self._timeline_canvas_mousewheel)
+        self.timeline_canvas.bind("<Button-4>", self._timeline_canvas_mousewheel)
+        self.timeline_canvas.bind("<Button-5>", self._timeline_canvas_mousewheel)
 
         # Status bar
         self.timeline_status_row = tk.Frame(self.timeline_tab, padx=14, pady=3)
@@ -13781,6 +14262,8 @@ class LTXQueueManager:
         return [root for root in self.model_search_roots if os.path.exists(root)]
 
     def _set_video_preflight_summary(self, summary_text, status_text, color):
+        if not hasattr(self, 'video_preflight_status_label'):
+            return
         self.video_preflight_status_label.config(text=f"Status: {status_text}", fg=color)
         self.video_preflight_text.configure(state=tk.NORMAL)
         self.video_preflight_text.delete("1.0", tk.END)
@@ -14427,6 +14910,8 @@ class LTXQueueManager:
         self._update_prompt_collection_summary()
 
     def add_scene_timeline_entry(self, scene_data=None):
+        if not hasattr(self, 'scene_scrollable_frame'):
+            return
         scene_data = scene_data or self._create_scene_entry(
             len(self._collect_scene_entry_frames()) + 1,
             mode=SCENE_MODE_T2V,
@@ -15010,6 +15495,9 @@ class LTXQueueManager:
         self.import_image_btn.config(state=tk.DISABLED)
         if hasattr(self, "sync_image_to_scene_btn"):
             self.sync_image_to_scene_btn.config(state=tk.DISABLED)
+        self._ensure_comfyui_ready_or_launch(lambda: self._launch_gallery_image_rerender_thread(prompt_entry, image_settings))
+
+    def _launch_gallery_image_rerender_thread(self, prompt_entry, image_settings):
         thread = threading.Thread(target=self.run_single_image_prompt_thread, args=(prompt_entry, image_settings))
         thread.daemon = True
         thread.start()
@@ -15763,6 +16251,9 @@ class LTXQueueManager:
         self.scene_timeline = self._normalize_scene_timeline(scene_timeline)
         self._set_scene_render_controls_enabled(False)
 
+        self._ensure_comfyui_ready_or_launch(lambda: self._launch_single_scene_render_thread(video_settings, scene_id))
+
+    def _launch_single_scene_render_thread(self, video_settings, scene_id):
         thread = threading.Thread(
             target=self._run_scene_timeline_thread,
             args=(self.scene_timeline, video_settings, {str(scene_id).strip()})
@@ -15911,6 +16402,8 @@ class LTXQueueManager:
         self._update_prompt_collection_summary()
 
     def add_image_prompt_entry(self, prompt_entry=None):
+        if not hasattr(self, 'image_scrollable_frame'):
+            return
         normalized_entries = self._normalize_image_prompt_queue_entries([prompt_entry]) if prompt_entry else []
         resolved_entry = normalized_entries[0] if normalized_entries else self._create_image_prompt_queue_entry()
         frame = tk.Frame(self.image_scrollable_frame, pady=6)
@@ -16224,9 +16717,10 @@ class LTXQueueManager:
         self._update_video_selection_summary()
         
         # Clear Music Settings
-        self.music_tags_text.delete("1.0", tk.END)
-        self.music_lyrics_text.delete("1.0", tk.END)
-        self._reset_music_settings_to_loaded_workflow()
+        if hasattr(self, 'music_tags_text'):
+            self.music_tags_text.delete("1.0", tk.END)
+            self.music_lyrics_text.delete("1.0", tk.END)
+            self._reset_music_settings_to_loaded_workflow()
         self.strip_audio_var.set(True)
         
         self.current_generated_audio = None
@@ -16241,8 +16735,9 @@ class LTXQueueManager:
         self._refresh_chatbot_output_preview()
         self._refresh_chatbot_runtime_ui()
         
-        self.preview_music_btn.config(state=tk.DISABLED)
-        self.merge_music_btn.config(state=tk.DISABLED)
+        if hasattr(self, 'preview_music_btn'):
+            self.preview_music_btn.config(state=tk.DISABLED)
+            self.merge_music_btn.config(state=tk.DISABLED)
         if hasattr(self, 'preview_final_btn'):
             self.preview_final_btn.config(state=tk.DISABLED)
         self._refresh_music_sidebar_state()
@@ -16956,8 +17451,9 @@ class LTXQueueManager:
                 self._refresh_chatbot_output_preview()
                 
                 # Load Music Settings
-                self.music_tags_text.insert(tk.END, state.get("music_tags", ""))
-                self.music_lyrics_text.insert(tk.END, state.get("music_lyrics", ""))
+                if hasattr(self, 'music_tags_text'):
+                    self.music_tags_text.insert(tk.END, state.get("music_tags", ""))
+                    self.music_lyrics_text.insert(tk.END, state.get("music_lyrics", ""))
                 self._apply_music_settings_snapshot(state.get("music_settings"), legacy_state=state)
                 self.strip_audio_var.set(state.get("strip_audio", True))
                 
@@ -16983,15 +17479,20 @@ class LTXQueueManager:
                     self.selected_video_for_music = None
                     self._reset_selected_video_preview()
                     
-                if self.current_generated_audio and os.path.exists(self.current_generated_audio):
-                    self.preview_music_btn.config(state=tk.NORMAL)
-                    if self.selected_video_for_music:
-                        self.merge_music_btn.config(state=tk.NORMAL)
+                if hasattr(self, 'preview_music_btn'):
+                    if self.current_generated_audio and os.path.exists(self.current_generated_audio):
+                        self.preview_music_btn.config(state=tk.NORMAL)
+                        if self.selected_video_for_music:
+                            self.merge_music_btn.config(state=tk.NORMAL)
+                    else:
+                        self.current_generated_audio = None
+                        self.current_audio_source = None
+                        self.preview_music_btn.config(state=tk.DISABLED)
+                        self.merge_music_btn.config(state=tk.DISABLED)
                 else:
-                    self.current_generated_audio = None
-                    self.current_audio_source = None
-                    self.preview_music_btn.config(state=tk.DISABLED)
-                    self.merge_music_btn.config(state=tk.DISABLED)
+                    if not (self.current_generated_audio and os.path.exists(self.current_generated_audio)):
+                        self.current_generated_audio = None
+                        self.current_audio_source = None
                     
                 if self.current_final_video and os.path.exists(self.current_final_video):
                     if hasattr(self, 'preview_final_btn'):
@@ -17029,6 +17530,8 @@ class LTXQueueManager:
             self._style_button(btn, "primary" if self.gallery_filter_mode == btn_mode else "secondary")
 
     def refresh_gallery(self):
+        if not hasattr(self, 'gallery_inner_frame'):
+            return
         # Clear existing
         for widget in self.gallery_inner_frame.winfo_children():
             widget.destroy()
@@ -17951,6 +18454,8 @@ class LTXQueueManager:
         self.tutorial_runtime_progress.pop(phase, None)
 
     def update_debug_prompt_status(self, prompt_text, current=None, total=None):
+        if not hasattr(self, 'debug_prompt_label'):
+            return
         if current is not None and total is not None:
             message = f"Debug: Queued Prompt ({current}/{total}): {prompt_text}"
         else:
@@ -18140,7 +18645,10 @@ class LTXQueueManager:
             self.run_queue_btn.config(state=tk.DISABLED)
         if hasattr(self, "add_prompt_btn"):
             self.add_prompt_btn.config(state=tk.DISABLED)
-        
+
+        self._ensure_comfyui_ready_or_launch(lambda: self._launch_queue_thread(prompts_text, video_settings))
+
+    def _launch_queue_thread(self, prompts_text, video_settings):
         thread = threading.Thread(target=self.run_queue, args=(prompts_text, video_settings))
         thread.daemon = True
         thread.start()
@@ -18386,6 +18894,9 @@ class LTXQueueManager:
         if hasattr(self, "sync_image_to_scene_btn"):
             self.sync_image_to_scene_btn.config(state=tk.DISABLED)
 
+        self._ensure_comfyui_ready_or_launch(lambda: self._launch_single_image_prompt_thread(prompt_entry, image_settings))
+
+    def _launch_single_image_prompt_thread(self, prompt_entry, image_settings):
         thread = threading.Thread(target=self.run_single_image_prompt_thread, args=(prompt_entry, image_settings))
         thread.daemon = True
         thread.start()
@@ -18415,6 +18926,9 @@ class LTXQueueManager:
         if hasattr(self, "sync_image_to_scene_btn"):
             self.sync_image_to_scene_btn.config(state=tk.DISABLED)
 
+        self._ensure_comfyui_ready_or_launch(lambda: self._launch_image_queue_thread(prompt_entries, image_settings))
+
+    def _launch_image_queue_thread(self, prompt_entries, image_settings):
         thread = threading.Thread(target=self._run_image_queue_thread, args=(prompt_entries, image_settings))
         thread.daemon = True
         thread.start()
@@ -19134,9 +19648,9 @@ class LTXQueueManager:
         return errors
 
     def _start_autonomous_pipeline(self):
-        if not self.comfyui_ready:
-            self._flash_autonomous_status()
-            return
+        self._ensure_comfyui_ready_or_launch(self._start_autonomous_pipeline_inner)
+
+    def _start_autonomous_pipeline_inner(self):
         brief = self.autonomous_brief_text.get("1.0", tk.END).strip() if hasattr(self, "autonomous_brief_text") else ""
         if not brief:
             messagebox.showwarning("Autonomous Mode", "Enter a creative brief in the Autonomous Mode panel.\n\nDescribe the music video concept, mood, style, or any visual ideas.")
@@ -20332,6 +20846,9 @@ class LTXQueueManager:
 
 if __name__ == "__main__":
     root = Prompt2MTVWindow(themename=THEME_NAME)
-    app = LTXQueueManager(root)
+    root.withdraw()                         # hide blank window until app is fully loaded
+    splash = SplashScreen(root)
+    app = LTXQueueManager(root, splash=splash)
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
+    root.deiconify()
     root.mainloop()
