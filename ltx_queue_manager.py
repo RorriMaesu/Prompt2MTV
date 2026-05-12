@@ -208,7 +208,7 @@ WINDOWS_HIDE = 0
 WINDOWS_SHOW = 5
 WINDOWS_RESTORE = 9
 APP_NAME = "Prompt2MTV"
-APP_VERSION = "3.2.0"
+APP_VERSION = "3.3.0"
 APP_PUBLISHER = "Prompt2MTV"
 APP_TAGLINE = "Local AI Music Video Studio"
 BUYMEACOFFEE_URL = "https://buymeacoffee.com/rorrimaesu"
@@ -618,16 +618,151 @@ else:
     class Prompt2MTVWindow(tb.Window):
         pass
 
+
+# ---------------------------------------------------------------------------
+# Neon gradient border — neon turquoise (#00e5ff) → neon purple (#c800ff)
+# Continuous loop around the full perimeter with rounded corners.
+# Used on both the splash screen and the main application window.
+# ---------------------------------------------------------------------------
+
+import math as _math
+
+# Fixed gradient endpoints (intentionally not theme-dependent)
+_NEON_LEFT_HEX  = "#00e5ff"   # neon turquoise
+_NEON_RIGHT_HEX = "#c800ff"   # neon purple
+_NEON_L = (0x00, 0xe5, 0xff)
+_NEON_R = (0xc8, 0x00, 0xff)
+
+
+def _neon_colour_at(t):
+    """Return a hex colour string for position *t* (0.0–1.0) along the perimeter.
+
+    The gradient loops: turquoise at t=0 (top-left), purple at t=0.5
+    (bottom-right), back to turquoise at t=1.0.  This gives a symmetric
+    left=turquoise, right=purple appearance on both sides.
+    """
+    # Mirror so second half goes purple→turquoise
+    u = t if t <= 0.5 else 1.0 - t
+    # Scale 0.0–0.5 → 0.0–1.0
+    u2 = u * 2.0
+    rl, gl, bl = _NEON_L
+    rr, gr, br = _NEON_R
+    r = int(rl + (rr - rl) * u2)
+    g = int(gl + (gr - gl) * u2)
+    b = int(bl + (br - bl) * u2)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _draw_neon_rounded_border(canvas, w, h, thickness=6, radius=12, bg="#000000"):
+    """Draw a rounded-corner neon gradient border on *canvas*.
+
+    The border is a single closed path traced clockwise around the perimeter.
+    Each short segment is coloured according to its position along the total
+    perimeter so the gradient flows continuously around all four sides and
+    corners.
+
+    Parameters
+    ----------
+    canvas    : tk.Canvas — must already be sized w×h
+    w, h      : int — canvas dimensions in pixels
+    thickness : int — stroke width in pixels
+    radius    : int — corner arc radius in pixels
+    bg        : str — background colour to paint first (clears canvas)
+    """
+    if w < (radius + thickness) * 2 + 4 or h < (radius + thickness) * 2 + 4:
+        return
+    canvas.delete("neon_border")
+
+    # Clamp radius so it can never exceed half the shortest side minus thickness
+    r = min(radius, (min(w, h) - thickness * 2) // 2)
+    if r < 2:
+        r = 2
+
+    half = thickness // 2          # inset so stroke stays inside the canvas
+    T = half                        # alias
+
+    # ── Build the full perimeter as a list of (x, y) points ──────────────
+    # Clockwise from top-left corner arc.
+    # Straight segments contribute their pixel length; arc segments are
+    # approximated by N_ARC points so each sub-segment is ~2 px.
+    N_ARC = max(6, int(_math.pi * r / 2 / 2))   # pts per 90° arc
+
+    points = []   # list of (x, y)
+
+    # Helper: append a 90° arc
+    def arc(cx, cy, start_angle_deg, end_angle_deg):
+        for i in range(N_ARC + 1):
+            a = _math.radians(
+                start_angle_deg + (end_angle_deg - start_angle_deg) * i / N_ARC
+            )
+            points.append((cx + r * _math.cos(a), cy + r * _math.sin(a)))
+
+    # Top-left corner: arc from 180° to 270° (quadrant: x-, y-)
+    arc(T + r, T + r,  180, 270)
+    # Top edge straight
+    points.append((w - T - r, T))
+    # Top-right corner: arc from 270° to 0°
+    arc(w - T - r, T + r, 270, 360)
+    # Right edge straight
+    points.append((w - T, h - T - r))
+    # Bottom-right corner: arc from 0° to 90°
+    arc(w - T - r, h - T - r, 0, 90)
+    # Bottom edge straight
+    points.append((T + r, h - T))
+    # Bottom-left corner: arc from 90° to 180°
+    arc(T + r, h - T - r, 90, 180)
+    # Left edge straight
+    points.append((T, T + r))
+
+    # ── Compute cumulative perimeter distances ────────────────────────────
+    dists = [0.0]
+    for i in range(1, len(points)):
+        dx = points[i][0] - points[i-1][0]
+        dy = points[i][1] - points[i-1][1]
+        dists.append(dists[-1] + _math.hypot(dx, dy))
+    total = dists[-1]
+    if total < 1:
+        return
+
+    # ── Draw each segment as a coloured line ─────────────────────────────
+    for i in range(1, len(points)):
+        t_mid = (dists[i-1] + dists[i]) * 0.5 / total
+        colour = _neon_colour_at(t_mid)
+        x0, y0 = points[i-1]
+        x1, y1 = points[i]
+        canvas.create_line(
+            x0, y0, x1, y1,
+            fill=colour, width=thickness,
+            capstyle="round", joinstyle="round",
+            tags="neon_border",
+        )
+
+    # Close the loop — connect last point back to first
+    t_mid = (dists[-1] + total) * 0.5 / total % 1.0
+    colour = _neon_colour_at(t_mid)
+    x0, y0 = points[-1]
+    x1, y1 = points[0]
+    canvas.create_line(
+        x0, y0, x1, y1,
+        fill=colour, width=thickness,
+        capstyle="round", joinstyle="round",
+        tags="neon_border",
+    )
+
+
 class SplashScreen:
     """Branded splash screen shown during startup while the main window loads."""
 
-    _BG        = "#08111f"
-    _BORDER    = "#223657"
-    _ACCENT    = "#42d6d0"
-    _MUTED     = "#99a8c7"
-    _TEXT      = "#edf4ff"
-    _BAR_TRACK = "#223657"
-    _BAR_FILL  = "#42d6d0"
+    _BG          = "#08111f"
+    _BORDER      = "#223657"       # kept for internal use; outer border is now gradient
+    _ACCENT      = "#00e5ff"       # neon turquoise (matches logo left-side glow)
+    _MUTED       = "#99a8c7"
+    _TEXT        = "#edf4ff"
+    _BAR_TRACK   = "#223657"
+    _BAR_FILL    = "#00e5ff"       # neon turquoise progress fill
+    _GRAD_LEFT   = "#00e5ff"       # neon turquoise
+    _GRAD_RIGHT  = "#c800ff"       # neon purple
+    _BORDER_THICK = 5              # px — neon gradient border thickness
     _WIDTH     = 745
     _HEIGHT    = 850
     _LOGO_SIZE = 400
@@ -669,6 +804,10 @@ class SplashScreen:
         self._completed     = False
         self._eta_ticker_id = None
         self._eta_deadline  = 0.0  # absolute perf_counter deadline; 0 = not yet set
+        # ── Smooth bar interpolation state ─────────────────────────────────
+        self._interp_from      = 0.0   # bar value when last ETA was computed
+        self._interp_eta_start = 0.0   # perf_counter when interpolation began
+        self._interp_eta_total = 0.0   # total seconds to interpolate over (0 = disabled)
 
         sw = root.winfo_screenwidth()
         sh = root.winfo_screenheight()
@@ -679,11 +818,28 @@ class SplashScreen:
         self._top.overrideredirect(True)
         self._top.attributes("-topmost", True)
         self._top.geometry(f"{self._WIDTH}x{self._HEIGHT}+{x}+{y}")
-        self._top.configure(bg=self._BG,
-                            highlightbackground=self._BORDER,
-                            highlightthickness=1)
+        self._top.configure(bg=self._BG, highlightthickness=0)
 
-        # ── Logo (ICO → PIL image, 100×100) ────────────────────────────────
+        # ── Neon gradient border canvas (behind everything, always visible) ─
+        # A plain Canvas covering the full window is placed FIRST (behind).
+        # A content frame placed on top of it with T-px inset on all sides
+        # exposes the border canvas edges — no z-order fighting needed.
+        T = self._BORDER_THICK
+        self._border_canvas = tk.Canvas(
+            self._top, bg=self._BG, bd=0, highlightthickness=0,
+            width=self._WIDTH, height=self._HEIGHT)
+        self._border_canvas.place(x=0, y=0)
+        _draw_neon_rounded_border(
+            self._border_canvas, self._WIDTH, self._HEIGHT,
+            thickness=T, radius=14, bg=self._BG)
+
+        # ── Inner content frame (inset by T px on all sides) ───────────────
+        _cw = self._WIDTH  - 2 * T
+        _ch = self._HEIGHT - 2 * T
+        self._content = tk.Frame(self._top, bg=self._BG, bd=0, highlightthickness=0)
+        self._content.place(x=T, y=T, width=_cw, height=_ch)
+
+        # ── Logo (ICO → PIL image, _LOGO_SIZE×_LOGO_SIZE) ──────────────────
         logo_loaded = False
         try:
             from PIL import Image as _PImage, ImageTk as _PImageTk
@@ -705,42 +861,42 @@ class SplashScreen:
                 best = best.convert("RGBA").resize(
                     (self._LOGO_SIZE, self._LOGO_SIZE), _PImage.LANCZOS)
                 self._photo = _PImageTk.PhotoImage(best)
-                tk.Label(self._top, image=self._photo,
+                tk.Label(self._content, image=self._photo,
                          bg=self._BG, bd=0).pack(pady=(28, 0))
                 logo_loaded = True
         except Exception:
             pass
 
         if not logo_loaded:
-            tk.Label(self._top, text="\U0001f3ac", font=("Segoe UI Emoji", 160),
+            tk.Label(self._content, text="\U0001f3ac", font=("Segoe UI Emoji", 160),
                      bg=self._BG, fg=self._ACCENT).pack(pady=(28, 0))
 
         # ── App name ───────────────────────────────────────────────────────
-        tk.Label(self._top,
+        tk.Label(self._content,
                  text=APP_NAME,
                  font=("Segoe UI Semibold", 36),
                  bg=self._BG, fg=self._ACCENT).pack(pady=(20, 0))
 
         # ── Version ────────────────────────────────────────────────────────
-        tk.Label(self._top,
+        tk.Label(self._content,
                  text=f"v{APP_VERSION}",
                  font=("Segoe UI", 13),
                  bg=self._BG, fg=self._ACCENT).pack(pady=(2, 0))
 
         # ── Tagline ────────────────────────────────────────────────────────
-        tk.Label(self._top,
+        tk.Label(self._content,
                  text=APP_TAGLINE,
                  font=("Segoe UI", 16),
                  bg=self._BG, fg=self._MUTED).pack(pady=(8, 0))
 
         # ── Author ─────────────────────────────────────────────────────────
-        tk.Label(self._top,
+        tk.Label(self._content,
                  text="By Rorri Maesu",
                  font=("Segoe UI", 13),
                  bg=self._BG, fg=self._MUTED).pack(pady=(4, 0))
 
-        # ── Buy Me a Coffee link ──────────────────────────────────────
-        _coffee_lbl = tk.Label(self._top,
+        # ── Buy Me a Coffee link ───────────────────────────────────────────
+        _coffee_lbl = tk.Label(self._content,
                                text="☕  buymeacoffee.com/rorrimaesu",
                                font=("Segoe UI", 11),
                                bg=self._BG, fg=self._MUTED,
@@ -751,27 +907,42 @@ class SplashScreen:
         _coffee_lbl.bind("<Leave>",   lambda _e: _coffee_lbl.config(fg=self._MUTED))
 
         # ── Progress bar canvas ────────────────────────────────────────────
-        bar_frame = tk.Frame(self._top, bg=self._BG)
+        bar_frame = tk.Frame(self._content, bg=self._BG)
         bar_frame.pack(fill=tk.X, padx=self._BAR_PADX, pady=(20, 0))
 
-        self._bar_w = self._WIDTH - self._BAR_PADX * 2
+        self._bar_w = _cw - self._BAR_PADX * 2
         self._bar_h = 12
         self._bar_canvas = tk.Canvas(bar_frame,
                                      width=self._bar_w, height=self._bar_h,
                                      bg=self._BG, bd=0, highlightthickness=0)
         self._bar_canvas.pack()
 
-        # Track rectangle
+        # Track rectangle (background)
         self._bar_canvas.create_rectangle(0, 0, self._bar_w, self._bar_h,
                                           fill=self._BAR_TRACK, outline="",
                                           tags="track")
-        # Fill rectangle (starts at 0 width)
-        self._fill_id = self._bar_canvas.create_rectangle(0, 0, 0, self._bar_h,
-                                                          fill=self._BAR_FILL,
-                                                          outline="", tags="fill")
+        # Gradient fill — N vertical strips from turquoise (#00e5ff) → purple (#c800ff)
+        _N = 80
+        _lr, _lg, _lb = 0x00, 0xe5, 0xff   # turquoise
+        _rr, _rg, _rb = 0xc8, 0x00, 0xff   # purple
+        for _i in range(_N):
+            _t  = _i / (_N - 1)
+            _cr = int(_lr + (_rr - _lr) * _t)
+            _cg = int(_lg + (_rg - _lg) * _t)
+            _cb = int(_lb + (_rb - _lb) * _t)
+            _x0 = int(self._bar_w * _i / _N)
+            _x1 = int(self._bar_w * (_i + 1) / _N)
+            self._bar_canvas.create_rectangle(
+                _x0, 0, _x1, self._bar_h,
+                fill=f"#{_cr:02x}{_cg:02x}{_cb:02x}", outline="",
+                tags="grad_fill")
+        # Mask rectangle: covers gradient from fill_w rightward (shrinks left as bar fills)
+        self._mask_id = self._bar_canvas.create_rectangle(
+            0, 0, self._bar_w, self._bar_h,
+            fill=self._BAR_TRACK, outline="", tags="mask")
 
         # ── Status label (fixed-height zone so text never clips) ──────────
-        status_zone = tk.Frame(self._top, bg=self._BG, height=54)
+        status_zone = tk.Frame(self._content, bg=self._BG, height=54)
         status_zone.pack(fill=tk.X, pady=(16, 4))
         status_zone.pack_propagate(False)
         self._status_var = tk.StringVar(value="Starting up\u2026")
@@ -779,12 +950,12 @@ class SplashScreen:
                                     textvariable=self._status_var,
                                     font=("Segoe UI", 13),
                                     bg=self._BG, fg=self._MUTED,
-                                    wraplength=self._WIDTH - 40,
+                                    wraplength=_cw - 40,
                                     justify=tk.CENTER)
         self._status_lbl.pack(expand=True)
 
         # ── ETA label (fixed-height; blank until run 2+) ──────────────────
-        eta_zone = tk.Frame(self._top, bg=self._BG, height=24)
+        eta_zone = tk.Frame(self._content, bg=self._BG, height=24)
         eta_zone.pack(fill=tk.X, pady=(0, 14))
         eta_zone.pack_propagate(False)
         self._eta_var = tk.StringVar(value="")
@@ -798,12 +969,16 @@ class SplashScreen:
         # Force an immediate paint so the window renders before __init__ blocks
         self._top.update()
 
+    def _set_bar_value(self, value: float):
+        """Reveal the gradient bar up to `value` (0.0–1.0) by moving the mask."""
+        fill_w = max(0, min(int(self._bar_w * value), self._bar_w))
+        self._bar_canvas.coords(self._mask_id, fill_w, 0, self._bar_w, self._bar_h)
+
     def set_progress(self, value: float, status: str = ""):
         """Update the progress bar (0.0–1.0), status text, and ETA."""
         if not self._top.winfo_exists():
             return
-        fill_w = max(0, min(int(self._bar_w * value), self._bar_w))
-        self._bar_canvas.coords(self._fill_id, 0, 0, fill_w, self._bar_h)
+        self._set_bar_value(value)
         if status:
             self._status_var.set(status)
 
@@ -821,7 +996,11 @@ class SplashScreen:
                 if expected_so_far > 0 and pending_keys:
                     speed_ratio      = max(0.3, min(3.0, (now - self._t_start) / expected_so_far))
                     eta_secs         = speed_ratio * sum(self._ema.get(k, 0.0) for k in pending_keys)
-                    self._eta_deadline = now + eta_secs
+                    self._eta_deadline    = now + eta_secs
+                    # Seed smooth interpolation from current milestone forward to 1.0
+                    self._interp_from      = value
+                    self._interp_eta_start = now
+                    self._interp_eta_total = eta_secs
                     self._update_eta_label(eta_secs)
                     if self._eta_ticker_id is not None:
                         try:
@@ -831,6 +1010,7 @@ class SplashScreen:
                     self._eta_ticker_id = self._top.after(200, self._tick_eta)
                 elif not pending_keys:
                     # Final checkpoint — show "Almost ready…" instead of going blank
+                    self._interp_eta_total = 0.0
                     self._update_eta_label(0.0)
                 else:
                     self._eta_var.set("")
@@ -852,14 +1032,20 @@ class SplashScreen:
             self._eta_var.set(f"~{mins}m {rem}s remaining")
 
     def _tick_eta(self):
-        """Live countdown — fires every 200 ms, uses absolute deadline so drift is impossible."""
+        """Live countdown — fires every 200 ms, updates ETA label and animates bar."""
         try:
             if not self._top.winfo_exists():
                 return
         except Exception:
             return
-        remaining = max(0.0, self._eta_deadline - time.perf_counter())
+        now = time.perf_counter()
+        remaining = max(0.0, self._eta_deadline - now)
         self._update_eta_label(remaining)
+        # Smooth bar: interpolate from last milestone value → 1.0 over the ETA duration
+        if self._interp_eta_total > 0:
+            frac = min(1.0, (now - self._interp_eta_start) / self._interp_eta_total)
+            smooth_val = self._interp_from + (1.0 - self._interp_from) * frac
+            self._set_bar_value(smooth_val)
         self._eta_ticker_id = self._top.after(200, self._tick_eta)
 
     def tick(self):
@@ -914,6 +1100,122 @@ class SplashScreen:
             pass
 
 
+# ---------------------------------------------------------------------------
+# Timeline transition effects catalogue
+# Each entry: (group, display_name, xfade_name, description)
+# xfade_name must be a valid FFmpeg xfade transition name.
+# ---------------------------------------------------------------------------
+TIMELINE_XFADE_TRANSITIONS = [
+    # ── Dissolve ──────────────────────────────────────────────────────────
+    ("Dissolve", "Cross Dissolve",       "dissolve",   "Classic opacity blend between clips"),
+    ("Dissolve", "Fade Through Black",   "fadeblack",  "Fade out to black, then fade in"),
+    ("Dissolve", "Fade Through White",   "fadewhite",  "Fade out to white, then fade in"),
+    ("Dissolve", "Pixelize",             "pixelize",   "Pixelate outgoing, then sharpen incoming"),
+    ("Dissolve", "Radial",               "radial",     "Clockwise radial/pie wipe reveal"),
+    ("Dissolve", "Distance",             "distance",   "Colour-distance-based dissolve"),
+    ("Dissolve", "Blur",                 "hblur",      "Horizontal blur wipe transition"),
+    # ── Wipe ──────────────────────────────────────────────────────────────
+    ("Wipe",     "Wipe Left",            "wipeleft",   "Hard edge wipes from right to left"),
+    ("Wipe",     "Wipe Right",           "wiperight",  "Hard edge wipes from left to right"),
+    ("Wipe",     "Wipe Up",              "wipeup",     "Hard edge wipes from bottom to top"),
+    ("Wipe",     "Wipe Down",            "wipedown",   "Hard edge wipes from top to bottom"),
+    ("Wipe",     "Diagonal Top-Left",    "diagtl",     "Diagonal wipe toward top-left corner"),
+    ("Wipe",     "Diagonal Top-Right",   "diagtr",     "Diagonal wipe toward top-right corner"),
+    ("Wipe",     "Diagonal Bot-Left",    "diagbl",     "Diagonal wipe toward bottom-left corner"),
+    ("Wipe",     "Diagonal Bot-Right",   "diagbr",     "Diagonal wipe toward bottom-right corner"),
+    # ── Slide ─────────────────────────────────────────────────────────────
+    ("Slide",    "Slide Left",           "slideleft",  "Incoming clip slides in from the right"),
+    ("Slide",    "Slide Right",          "slideright", "Incoming clip slides in from the left"),
+    ("Slide",    "Slide Up",             "slideup",    "Incoming clip slides in from the bottom"),
+    ("Slide",    "Slide Down",           "slidedown",  "Incoming clip slides in from the top"),
+    # ── Smooth Slide ──────────────────────────────────────────────────────
+    ("Smooth Slide", "Smooth Left",      "smoothleft",  "Soft-eased slide to the left"),
+    ("Smooth Slide", "Smooth Right",     "smoothright", "Soft-eased slide to the right"),
+    ("Smooth Slide", "Smooth Up",        "smoothup",    "Soft-eased slide upward"),
+    ("Smooth Slide", "Smooth Down",      "smoothdown",  "Soft-eased slide downward"),
+    # ── Cover ─────────────────────────────────────────────────────────────
+    ("Cover/Reveal", "Cover Left",       "coverleft",   "Incoming covers outgoing from right to left"),
+    ("Cover/Reveal", "Cover Right",      "coverright",  "Incoming covers outgoing from left to right"),
+    ("Cover/Reveal", "Cover Up",         "coverup",     "Incoming covers outgoing from bottom to top"),
+    ("Cover/Reveal", "Cover Down",       "coverdown",   "Incoming covers outgoing from top to bottom"),
+    ("Cover/Reveal", "Reveal Left",      "revealleft",  "Outgoing reveals incoming from right to left"),
+    ("Cover/Reveal", "Reveal Right",     "revealright", "Outgoing reveals incoming from left to right"),
+    ("Cover/Reveal", "Reveal Up",        "revealup",    "Outgoing reveals incoming from bottom to top"),
+    ("Cover/Reveal", "Reveal Down",      "revealdown",  "Outgoing reveals incoming from top to bottom"),
+    # ── Open / Close ──────────────────────────────────────────────────────
+    ("Open/Close", "Horizontal Open",    "horzopen",   "Two halves open outward horizontally"),
+    ("Open/Close", "Horizontal Close",   "horzclose",  "Two halves close inward horizontally"),
+    ("Open/Close", "Vertical Open",      "vertopen",   "Two halves open outward vertically"),
+    ("Open/Close", "Vertical Close",     "vertclose",  "Two halves close inward vertically"),
+    # ── Slice ─────────────────────────────────────────────────────────────
+    ("Slice",    "H-Slice Left",         "hlslice",    "Horizontal slices slide out to the left"),
+    ("Slice",    "H-Slice Right",        "hrslice",    "Horizontal slices slide out to the right"),
+    ("Slice",    "V-Slice Up",           "vuslice",    "Vertical slices slide out upward"),
+    ("Slice",    "V-Slice Down",         "vdslice",    "Vertical slices slide out downward"),
+    # ── Shape ─────────────────────────────────────────────────────────────
+    ("Shape",    "Circle Crop",          "circlecrop", "Circular iris reveal from centre"),
+    ("Shape",    "Rect Crop",            "rectcrop",   "Rectangular iris reveal from centre"),
+    ("Shape",    "Zoom In",              "zoomin",     "Incoming clip zooms in from centre"),
+    # ── Stylized ──────────────────────────────────────────────────────────
+    ("Stylized", "Squeeze Horizontal",   "squeezeh",   "Outgoing squeezes horizontally, incoming expands"),
+    ("Stylized", "Squeeze Vertical",     "squeezev",   "Outgoing squeezes vertically, incoming expands"),
+]
+
+# Short badge abbreviations for each xfade (max ~4 chars shown in diamond badge)
+XFADE_BADGE_ABBR = {
+    "dissolve":   "Diss",
+    "fadeblack":  "FdBk",
+    "fadewhite":  "FdWh",
+    "pixelize":   "Pixl",
+    "radial":     "Radl",
+    "distance":   "Dist",
+    "hblur":      "Blur",
+    "wipeleft":   "WpL",
+    "wiperight":  "WpR",
+    "wipeup":     "WpU",
+    "wipedown":   "WpD",
+    "diagtl":     "DgTL",
+    "diagtr":     "DgTR",
+    "diagbl":     "DgBL",
+    "diagbr":     "DgBR",
+    "slideleft":  "SdL",
+    "slideright": "SdR",
+    "slideup":    "SdU",
+    "slidedown":  "SdD",
+    "smoothleft":  "SmL",
+    "smoothright": "SmR",
+    "smoothup":    "SmU",
+    "smoothdown":  "SmD",
+    "coverleft":   "CvL",
+    "coverright":  "CvR",
+    "coverup":     "CvU",
+    "coverdown":   "CvD",
+    "revealleft":  "RvL",
+    "revealright": "RvR",
+    "revealup":    "RvU",
+    "revealdown":  "RvD",
+    "horzopen":   "HzOp",
+    "horzclose":  "HzCl",
+    "vertopen":   "VtOp",
+    "vertclose":  "VtCl",
+    "hlslice":    "SlHL",
+    "hrslice":    "SlHR",
+    "vuslice":    "SlVU",
+    "vdslice":    "SlVD",
+    "circlecrop": "Circ",
+    "rectcrop":   "Rect",
+    "zoomin":     "Zoom",
+    "squeezeh":   "SqzH",
+    "squeezev":   "SqzV",
+}
+
+# Build a fast lookup: xfade_name -> (group, display_name, description)
+_XFADE_INFO = {
+    xn: (grp, dn, desc)
+    for grp, dn, xn, desc in TIMELINE_XFADE_TRANSITIONS
+}
+
+
 class LTXQueueManager:
     def __init__(self, root, splash=None):
         self.splash = splash
@@ -962,6 +1264,8 @@ class LTXQueueManager:
         self.current_generated_audio = None
         self.current_audio_source = None
         self.timeline_arrangement = []
+        self.timeline_excluded_scene_ids = []
+        self.timeline_imported_clips = []
         self.timeline_px_per_second = 80
         self._timeline_clip_durations = {}
         self._timeline_drag_state = None
@@ -981,6 +1285,18 @@ class LTXQueueManager:
         self._timeline_current_clip_idx = 0
         self._timeline_clip_list = []
         self._timeline_stop_reader = False
+        # ── Phase-1 extended timeline state ─────────────────────────────────
+        self.timeline_clip_trims = {}        # {scene_id: {"trim_in": float, "trim_out": float}}
+        self.timeline_transitions = {}       # {"{id_a}___{id_b}": {"type": str, "duration": float}}
+        self.timeline_markers = []           # [{"marker_id": str, "pos_sec": float, "label": str, "color": str}]
+        self.timeline_audio_offset = 0.0
+        self.timeline_audio_fade_in = 0.0
+        self.timeline_audio_fade_out = 0.0
+        self._timeline_undo_stack = []
+        self._timeline_redo_stack = []
+        self._timeline_selected_scene_id = None
+        self.timeline_snap_enabled = True
+        self.timeline_export_options = {"codec": "copy", "crf": 20, "resolution": "original", "merge_audio": True}
         self.current_project_dir = None
         self.comfyui_console_hwnd = None
         self.comfyui_console_visible = False
@@ -9236,6 +9552,43 @@ class LTXQueueManager:
 
     def _apply_static_theme(self):
         self.root.configure(bg=self.colors["bg"])
+        # ── Neon gradient border — single background canvas + debounced redraw ──
+        # A full-size Canvas is placed BELOW all content (Misc.lower).  The
+        # notebook already has padx/pady=10 so the border shows around all 4
+        # edges.  A 60 ms debounce prevents flickering during startup when
+        # <Configure> fires many times in rapid succession.
+        if not hasattr(self, "_border_canvas"):
+            self._border_canvas = tk.Canvas(
+                self.root, bd=0, highlightthickness=0,
+                bg=self.colors["bg"])
+            self._border_canvas.place(x=0, y=0, relwidth=1, relheight=1)
+            tk.Misc.lower(self._border_canvas)
+            self._border_redraw_job = None
+
+            def _do_border_redraw():
+                self._border_redraw_job = None
+                w = self.root.winfo_width()
+                h = self.root.winfo_height()
+                if w < 40 or h < 40:
+                    self._border_redraw_job = self.root.after(60, _do_border_redraw)
+                    return
+                self._border_canvas.configure(
+                    width=w, height=h, bg=self.colors["bg"])
+                _draw_neon_rounded_border(
+                    self._border_canvas, w, h,
+                    thickness=8, radius=14, bg=self.colors["bg"])
+
+            def _schedule_border_redraw(event=None):
+                if self._border_redraw_job:
+                    self.root.after_cancel(self._border_redraw_job)
+                self._border_redraw_job = self.root.after(60, _do_border_redraw)
+
+            self.root.bind("<Configure>", _schedule_border_redraw, add=True)
+            self.root.after_idle(_schedule_border_redraw)
+        else:
+            # Theme reapply — keep bg in sync and ensure canvas stays behind
+            self._border_canvas.configure(bg=self.colors["bg"])
+            tk.Misc.lower(self._border_canvas)
         self.menubar.configure(bg=self.colors["surface"], fg=self.colors["text"], activebackground=self.colors["surface_soft"], activeforeground=self.colors["text"], bd=0)
         self.project_menu.configure(bg=self.colors["surface"], fg=self.colors["text"], activebackground=self.colors["surface_soft"], activeforeground=self.colors["text"], bd=0)
         self.help_menu.configure(bg=self.colors["surface"], fg=self.colors["text"], activebackground=self.colors["surface_soft"], activeforeground=self.colors["text"], bd=0)
@@ -9357,6 +9710,14 @@ class LTXQueueManager:
             self._style_label(self.timeline_preview_time_label, "muted", self.colors["bg"])
             self._style_label(self.timeline_status_label, "muted", self.colors["bg"])
             self._style_button(self.timeline_refresh_btn, "ghost", compact=True)
+            if hasattr(self, "timeline_add_scene_btn"):
+                self._style_button(self.timeline_add_scene_btn, "ghost", compact=True)
+            if hasattr(self, "timeline_import_video_btn"):
+                self._style_button(self.timeline_import_video_btn, "ghost", compact=True)
+            if hasattr(self, "timeline_undo_btn"):
+                self._style_button(self.timeline_undo_btn, "ghost", compact=True)
+            if hasattr(self, "timeline_redo_btn"):
+                self._style_button(self.timeline_redo_btn, "ghost", compact=True)
             self._style_button(self.timeline_zoom_in_btn, "ghost", compact=True)
             self._style_button(self.timeline_zoom_out_btn, "ghost", compact=True)
             self._style_button(self.timeline_play_btn, "primary", compact=True)
@@ -10043,7 +10404,7 @@ class LTXQueueManager:
 
         # Project Status Bar
         self.status_frame = tk.Frame(self.root, pady=8)
-        self.status_frame.pack(fill=tk.X)
+        self.status_frame.pack(fill=tk.X, padx=8, pady=(8, 0))
         self.status_frame.grid_columnconfigure(0, weight=1)
         self.project_label = tk.Label(self.status_frame, text="Current Project: None")
         self.project_label.pack(side=tk.LEFT, padx=10, fill=tk.X, expand=True)
@@ -10825,10 +11186,11 @@ class LTXQueueManager:
 
     def _get_timeline_ordered_scenes(self):
         """Return ordered list of scene dicts for the timeline canvas."""
+        excluded = set(self.timeline_excluded_scene_ids or [])
         scene_infos = {}
         for scene in (self.scene_timeline or []):
             sid = scene.get("scene_id", "")
-            if not sid:
+            if not sid or sid in excluded:
                 continue
             output_path = scene.get("output_path", "") or ""
             if not output_path:
@@ -10842,14 +11204,49 @@ class LTXQueueManager:
                 continue
             thumb_path = os.path.join(self.thumbs_dir, f"{os.path.basename(output_path)}.jpg")
             norm_path = os.path.normcase(os.path.abspath(output_path))
+            raw_dur = self._timeline_clip_durations.get(norm_path, 5.0)
+            _trims = self.timeline_clip_trims.get(sid, {})
+            _ti = max(0.0, float(_trims.get("trim_in", 0.0)))
+            _to = max(0.0, float(_trims.get("trim_out", 0.0)))
             scene_infos[sid] = {
                 "scene_id": sid,
                 "scene_order": int(scene.get("order_index") or 0),
                 "clip_path": output_path,
                 "thumb_path": thumb_path if os.path.exists(thumb_path) else "",
-                "duration": self._timeline_clip_durations.get(norm_path, 5.0),
+                "duration": max(0.1, raw_dur - _ti - _to),
+                "raw_duration": raw_dur,
+                "trim_in": _ti,
+                "trim_out": _to,
                 "prompt_excerpt": (scene.get("prompt_text") or "")[:80],
                 "is_active": True,
+                "is_imported": False,
+            }
+        # Merge imported clips
+        for clip in (self.timeline_imported_clips or []):
+            cid = clip.get("clip_id", "")
+            if not cid or cid in excluded:
+                continue
+            clip_path = clip.get("clip_path", "")
+            if not clip_path or not os.path.exists(clip_path):
+                continue
+            norm_path = os.path.normcase(os.path.abspath(clip_path))
+            thumb_path = os.path.join(self.thumbs_dir, f"{os.path.basename(clip_path)}.jpg")
+            raw_dur_i = self._timeline_clip_durations.get(norm_path, 5.0)
+            _trims_i = self.timeline_clip_trims.get(cid, {})
+            _ti_i = max(0.0, float(_trims_i.get("trim_in", 0.0)))
+            _to_i = max(0.0, float(_trims_i.get("trim_out", 0.0)))
+            scene_infos[cid] = {
+                "scene_id": cid,
+                "scene_order": 999999,
+                "clip_path": clip_path,
+                "thumb_path": thumb_path if os.path.exists(thumb_path) else "",
+                "duration": max(0.1, raw_dur_i - _ti_i - _to_i),
+                "raw_duration": raw_dur_i,
+                "trim_in": _ti_i,
+                "trim_out": _to_i,
+                "prompt_excerpt": clip.get("label", os.path.basename(clip_path)),
+                "is_active": True,
+                "is_imported": True,
             }
         if not scene_infos:
             return []
@@ -11057,8 +11454,10 @@ class LTXQueueManager:
 
     # ── Video frame reader thread ─────────────────────────────────────────
 
-    def _timeline_frame_reader(self, clip_path, skip_seconds, clip_idx):
-        """Background thread: pipe raw video frames into _timeline_frame_queue."""
+    def _timeline_frame_reader(self, clip_path, skip_seconds, clip_idx, max_frames=None):
+        """Background thread: pipe raw video frames into _timeline_frame_queue.
+        max_frames: stop after this many frames (used to honour trim_out).
+        """
         W, H, FPS = self._TL_PREVIEW_W, self._TL_PREVIEW_H, self._TL_PREVIEW_FPS
         frame_bytes = W * H * 3
         vf = (f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
@@ -11078,7 +11477,10 @@ class LTXQueueManager:
             )
             with self._timeline_proc_lock:
                 self._timeline_ffmpeg_proc = proc
+            frames_read = 0
             while not self._timeline_stop_reader:
+                if max_frames is not None and frames_read >= max_frames:
+                    break
                 raw = proc.stdout.read(frame_bytes)
                 if len(raw) < frame_bytes:
                     break
@@ -11091,6 +11493,7 @@ class LTXQueueManager:
                 except queue.Full:
                     if self._timeline_stop_reader:
                         break
+                frames_read += 1
             proc.stdout.close()
             try:
                 proc.terminate()
@@ -11127,37 +11530,77 @@ class LTXQueueManager:
             except Exception:
                 pass
         self._timeline_frame_queue = None
+        self._timeline_xfade_state = None
+        self._timeline_last_frame  = None
+
+    def _get_clip_trims(self, clip_idx):
+        """Return (trim_in, trim_out, eff_dur, raw_dur) for clip at clip_idx."""
+        scenes = self._get_timeline_ordered_scenes()
+        if clip_idx < 0 or clip_idx >= len(scenes):
+            return (0.0, 0.0, 5.0, 5.0)
+        sc = scenes[clip_idx]
+        raw_dur = max(0.1, sc.get("raw_duration") or sc.get("duration") or 5.0)
+        trim_in  = max(0.0, float(sc.get("trim_in",  0.0)))
+        trim_out = max(0.0, float(sc.get("trim_out", 0.0)))
+        eff_dur  = max(0.1, raw_dur - trim_in - trim_out)
+        return (trim_in, trim_out, eff_dur, raw_dur)
 
     def _timeline_play(self):
         """Start or resume playback from _timeline_playback_pos."""
         scenes = self._get_timeline_ordered_scenes()
         if not scenes:
             return
-        # Build clip list
+        # Build clip list with RAW durations so positions match canvas card widths.
         self._timeline_clip_list = []
         t = 0.0
         for sc in scenes:
-            dur = sc.get("duration") or 5.0
-            self._timeline_clip_list.append((sc.get("clip_path", ""), t, dur))
-            t += dur
+            raw_dur = max(0.1, sc.get("raw_duration") or sc.get("duration") or 5.0)
+            self._timeline_clip_list.append((sc.get("clip_path", ""), t, raw_dur))
+            t += raw_dur
         self._timeline_total_duration = t
         if not self._timeline_clip_list:
             return
 
-        # Find which clip we're in
         pos = self._timeline_playback_pos
-        clip_idx = 0
-        skip_sec = pos
-        for i, (cp, start, dur) in enumerate(self._timeline_clip_list):
-            if start <= pos < start + dur:
-                clip_idx = i
-                skip_sec = pos - start
-                break
-        else:
-            # Past end
+        clip_idx = None
+        skip_sec = 0.0
+
+        # Find the first clip whose active region contains or follows pos.
+        for i, (cp, raw_start, raw_dur) in enumerate(self._timeline_clip_list):
+            trim_in, trim_out, eff_dur, _ = self._get_clip_trims(i)
+            raw_end = raw_start + raw_dur
+            if pos >= raw_end:
+                continue  # pos is entirely past this card
+            raw_offset = pos - raw_start
+            if raw_offset < trim_in:
+                # Inside the left curtain — snap to active_start
+                pos = raw_start + trim_in
+                skip_sec = trim_in
+            elif raw_offset >= trim_in + eff_dur:
+                # Inside the right curtain — move to next clip
+                continue
+            else:
+                # Inside the active region
+                skip_sec = raw_offset
+            clip_idx = i
+            break
+
+        if clip_idx is None:
+            # Past all active regions — restart from beginning
             self._timeline_playback_pos = 0.0
+            pos = 0.0
             clip_idx = 0
-            skip_sec = 0.0
+            trim_in, _, eff_dur, _ = self._get_clip_trims(0)
+            skip_sec = trim_in
+            if trim_in > 0:
+                pos = trim_in
+
+        self._timeline_playback_pos = pos
+
+        # Compute max_frames so the reader stops at the trim_out boundary.
+        trim_in_c, _, eff_dur_c, _ = self._get_clip_trims(clip_idx)
+        remaining_active = max(0.1, eff_dur_c - (skip_sec - trim_in_c))
+        start_max_frames = max(1, int(remaining_active * self._TL_PREVIEW_FPS) + 1)
 
         # Open audio
         if self.timeline_selected_audio and os.path.exists(self.timeline_selected_audio):
@@ -11180,14 +11623,13 @@ class LTXQueueManager:
         self._timeline_frame_queue = queue.Queue(maxsize=6)
         self._timeline_current_clip_idx = clip_idx
         cp, _, _ = self._timeline_clip_list[clip_idx]
-        # Wall-clock sync: track where in the timeline this reader started and
-        # how many frames have been consumed so we can gate display to real-time.
+        # Wall-clock sync anchor: the canvas position where this reader starts.
         self._timeline_reader_start_pos = pos
         self._timeline_reader_frames_consumed = 0
         if cp and os.path.exists(cp):
             threading.Thread(
                 target=self._timeline_frame_reader,
-                args=(cp, skip_sec, clip_idx),
+                args=(cp, skip_sec, clip_idx, start_max_frames),
                 daemon=True
             ).start()
 
@@ -11234,6 +11676,309 @@ class LTXQueueManager:
             self.timeline_follow_btn.config(text="↦ Follow: ON" if on else "↦ Follow: OFF")
             self._style_button(self.timeline_follow_btn, "primary" if on else "ghost", compact=True)
 
+    # ── Xfade preview compositor ──────────────────────────────────────────
+
+    def _apply_xfade_preview(self, out_frame, in_frame, alpha, xfade_name):
+        """Return a PIL Image compositing out_frame -> in_frame at progress alpha [0..1].
+
+        Implements lightweight approximations of each FFmpeg xfade effect for live
+        preview.  Anything without a dedicated path falls back to a simple cross-dissolve.
+        Both input frames are assumed to be the same size (RGBA or RGB).
+        """
+        try:
+            from PIL import Image, ImageDraw, ImageFilter
+        except ImportError:
+            return Image.blend(out_frame, in_frame, alpha)
+
+        W, H = out_frame.size
+        # Ensure RGBA for compositing operations that need transparency
+        def _rgba(im):
+            return im.convert("RGBA") if im.mode != "RGBA" else im.copy()
+
+        # ── Dissolve group ────────────────────────────────────────────────
+        if xfade_name == "dissolve":
+            return Image.blend(out_frame, in_frame, alpha)
+
+        if xfade_name == "fadeblack":
+            # Two-phase: out→black (0..0.5), black→in (0.5..1)
+            if alpha < 0.5:
+                a2 = alpha * 2.0
+                black = Image.new(out_frame.mode, (W, H), 0)
+                return Image.blend(out_frame, black, a2)
+            else:
+                a2 = (alpha - 0.5) * 2.0
+                black = Image.new(in_frame.mode, (W, H), 0)
+                return Image.blend(black, in_frame, a2)
+
+        if xfade_name == "fadewhite":
+            if alpha < 0.5:
+                a2 = alpha * 2.0
+                white = Image.new(out_frame.mode, (W, H), (255, 255, 255))
+                return Image.blend(out_frame, white, a2)
+            else:
+                a2 = (alpha - 0.5) * 2.0
+                white = Image.new(in_frame.mode, (W, H), (255, 255, 255))
+                return Image.blend(white, in_frame, a2)
+
+        if xfade_name == "pixelize":
+            # Scale down then back up for pixelate effect on outgoing
+            max_bsz = max(4, int(W * 0.1))
+            bsz = max(2, int(max_bsz * (1.0 - abs(alpha - 0.5) * 2.0)))
+            pixelated = out_frame.resize((max(1, W // bsz), max(1, H // bsz)),
+                                        Image.NEAREST).resize((W, H), Image.NEAREST)
+            return Image.blend(pixelated, in_frame, alpha)
+
+        if xfade_name == "hblur":
+            radius = int((1.0 - abs(alpha - 0.5) * 2.0) * 12)
+            if radius > 0:
+                blurred = out_frame.filter(ImageFilter.GaussianBlur(radius))
+            else:
+                blurred = out_frame
+            return Image.blend(blurred, in_frame, alpha)
+
+        # distance / fadegrays / radial / everything else in dissolve group
+        if xfade_name in ("distance", "fadegrays"):
+            return Image.blend(out_frame, in_frame, alpha)
+
+        # ── Wipe group ────────────────────────────────────────────────────
+        wipe_directions = {
+            "wipeleft":  ("h", 1),   # x boundary moves right→left (alpha=0 means all out)
+            "wiperight": ("h", -1),
+            "wipeup":    ("v", 1),
+            "wipedown":  ("v", -1),
+        }
+        if xfade_name in wipe_directions:
+            axis, direction = wipe_directions[xfade_name]
+            result = _rgba(out_frame)
+            src    = _rgba(in_frame)
+            if axis == "h":
+                boundary = int(W * alpha)
+                if direction > 0:  # wipeleft: in comes from right
+                    region = src.crop((W - boundary, 0, W, H))
+                    result.paste(region, (W - boundary, 0))
+                else:              # wiperight: in comes from left
+                    region = src.crop((0, 0, boundary, H))
+                    result.paste(region, (0, 0))
+            else:
+                boundary = int(H * alpha)
+                if direction > 0:  # wipeup: in comes from bottom
+                    region = src.crop((0, H - boundary, W, H))
+                    result.paste(region, (0, H - boundary))
+                else:              # wipedown: in comes from top
+                    region = src.crop((0, 0, W, boundary))
+                    result.paste(region, (0, 0))
+            return result.convert(out_frame.mode)
+
+        if xfade_name in ("diagtl", "diagtr", "diagbl", "diagbr"):
+            # Approximate with a diagonal mask
+            result = _rgba(out_frame)
+            src    = _rgba(in_frame)
+            mask   = Image.new("L", (W, H), 0)
+            draw   = ImageDraw.Draw(mask)
+            p = alpha  # 0=all out, 1=all in
+            if xfade_name == "diagtl":
+                pts = [(0, 0), (int(W * p * 2), 0), (0, int(H * p * 2))]
+            elif xfade_name == "diagtr":
+                pts = [(W, 0), (int(W * (1 - p * 2)), 0), (W, int(H * p * 2))]
+            elif xfade_name == "diagbl":
+                pts = [(0, H), (int(W * p * 2), H), (0, int(H * (1 - p * 2)))]
+            else:
+                pts = [(W, H), (int(W * (1 - p * 2)), H), (W, int(H * (1 - p * 2)))]
+            # Clamp polygon points
+            pts = [(min(W, max(0, x)), min(H, max(0, y))) for x, y in pts]
+            if len(pts) >= 3:
+                draw.polygon(pts, fill=255)
+            result.paste(src, mask=mask)
+            return result.convert(out_frame.mode)
+
+        # ── Slide group ───────────────────────────────────────────────────
+        slide_map = {
+            "slideleft":  ( 1,  0),
+            "slideright": (-1,  0),
+            "slideup":    ( 0,  1),
+            "slidedown":  ( 0, -1),
+        }
+        if xfade_name in slide_map:
+            dx_sign, dy_sign = slide_map[xfade_name]
+            canvas = Image.new(out_frame.mode, (W, H))
+            ox = int(dx_sign * W * alpha)
+            oy = int(dy_sign * H * alpha)
+            # out_frame slides out, in_frame slides in from opposite side
+            canvas.paste(out_frame, (ox, oy))
+            canvas.paste(in_frame,  (ox - dx_sign * W, oy - dy_sign * H))
+            return canvas
+
+        smooth_map = {
+            "smoothleft":  ( 1,  0),
+            "smoothright": (-1,  0),
+            "smoothup":    ( 0,  1),
+            "smoothdown":  ( 0, -1),
+        }
+        if xfade_name in smooth_map:
+            # Ease in-out cubic: t = 3a^2 - 2a^3
+            t = 3 * alpha * alpha - 2 * alpha * alpha * alpha
+            dx_sign, dy_sign = smooth_map[xfade_name]
+            canvas = Image.new(out_frame.mode, (W, H))
+            ox = int(dx_sign * W * t)
+            oy = int(dy_sign * H * t)
+            canvas.paste(out_frame, (ox, oy))
+            canvas.paste(in_frame,  (ox - dx_sign * W, oy - dy_sign * H))
+            return canvas
+
+        # ── Cover / Reveal ────────────────────────────────────────────────
+        cover_map = {
+            "coverleft":   ( 1,  0, True),
+            "coverright":  (-1,  0, True),
+            "coverup":     ( 0,  1, True),
+            "coverdown":   ( 0, -1, True),
+            "revealleft":  ( 1,  0, False),
+            "revealright": (-1,  0, False),
+            "revealup":    ( 0,  1, False),
+            "revealdown":  ( 0, -1, False),
+        }
+        if xfade_name in cover_map:
+            dx_sign, dy_sign, is_cover = cover_map[xfade_name]
+            canvas = Image.new(out_frame.mode, (W, H))
+            if is_cover:
+                # out_frame stays; in_frame slides over it
+                canvas.paste(out_frame, (0, 0))
+                ix = int(-dx_sign * W * (1.0 - alpha))
+                iy = int(-dy_sign * H * (1.0 - alpha))
+                canvas.paste(in_frame, (ix, iy))
+            else:
+                # in_frame stays; out_frame slides away
+                canvas.paste(in_frame, (0, 0))
+                ox = int(dx_sign * W * alpha)
+                oy = int(dy_sign * H * alpha)
+                canvas.paste(out_frame, (ox, oy))
+            return canvas
+
+        # ── Open / Close ──────────────────────────────────────────────────
+        if xfade_name in ("horzopen", "horzclose", "vertopen", "vertclose"):
+            canvas = _rgba(out_frame)
+            src    = _rgba(in_frame)
+            mask   = Image.new("L", (W, H), 0)
+            draw   = ImageDraw.Draw(mask)
+            if xfade_name == "horzopen":
+                hw = int(W * alpha * 0.5)
+                draw.rectangle([0, 0, hw, H], fill=255)
+                draw.rectangle([W - hw, 0, W, H], fill=255)
+            elif xfade_name == "horzclose":
+                hw = int(W * (1 - alpha) * 0.5)
+                draw.rectangle([hw, 0, W - hw, H], fill=255)
+            elif xfade_name == "vertopen":
+                hh = int(H * alpha * 0.5)
+                draw.rectangle([0, 0, W, hh], fill=255)
+                draw.rectangle([0, H - hh, W, H], fill=255)
+            else:  # vertclose
+                hh = int(H * (1 - alpha) * 0.5)
+                draw.rectangle([0, hh, W, H - hh], fill=255)
+            canvas.paste(src, mask=mask)
+            return canvas.convert(out_frame.mode)
+
+        # ── Slice group ───────────────────────────────────────────────────
+        if xfade_name in ("hlslice", "hrslice", "vuslice", "vdslice"):
+            # Approximate: reveal in_frame through interleaved horizontal/vertical stripes
+            num_slices = 8
+            canvas = out_frame.copy()
+            src = in_frame
+            if xfade_name in ("hlslice", "hrslice"):
+                slice_h = max(1, H // num_slices)
+                for s in range(num_slices):
+                    reveal_alpha = min(1.0, max(0.0, alpha * num_slices - s))
+                    if reveal_alpha <= 0:
+                        continue
+                    y0 = s * slice_h
+                    y1 = min(H, y0 + slice_h)
+                    sw = int(W * reveal_alpha)
+                    if sw <= 0:
+                        continue
+                    if xfade_name == "hlslice":
+                        region = src.crop((0, y0, sw, y1))
+                        canvas.paste(region, (0, y0))
+                    else:
+                        region = src.crop((W - sw, y0, W, y1))
+                        canvas.paste(region, (W - sw, y0))
+            else:
+                slice_w = max(1, W // num_slices)
+                for s in range(num_slices):
+                    reveal_alpha = min(1.0, max(0.0, alpha * num_slices - s))
+                    if reveal_alpha <= 0:
+                        continue
+                    x0 = s * slice_w
+                    x1 = min(W, x0 + slice_w)
+                    sh = int(H * reveal_alpha)
+                    if sh <= 0:
+                        continue
+                    if xfade_name == "vuslice":
+                        region = src.crop((x0, 0, x1, sh))
+                        canvas.paste(region, (x0, 0))
+                    else:
+                        region = src.crop((x0, H - sh, x1, H))
+                        canvas.paste(region, (x0, H - sh))
+            return canvas
+
+        # ── Shape group ───────────────────────────────────────────────────
+        if xfade_name in ("circlecrop", "rectcrop"):
+            canvas = _rgba(out_frame)
+            src    = _rgba(in_frame)
+            mask   = Image.new("L", (W, H), 0)
+            draw   = ImageDraw.Draw(mask)
+            cx, cy = W // 2, H // 2
+            max_r  = int(((W ** 2 + H ** 2) ** 0.5) * 0.5)
+            r = int(max_r * alpha)
+            if xfade_name == "circlecrop":
+                draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=255)
+            else:
+                hw, hh = int(W * 0.5 * alpha), int(H * 0.5 * alpha)
+                draw.rectangle([cx - hw, cy - hh, cx + hw, cy + hh], fill=255)
+            canvas.paste(src, mask=mask)
+            return canvas.convert(out_frame.mode)
+
+        if xfade_name == "radial":
+            import math
+            canvas = _rgba(out_frame)
+            src    = _rgba(in_frame)
+            mask   = Image.new("L", (W, H), 0)
+            draw   = ImageDraw.Draw(mask)
+            cx, cy = W // 2, H // 2
+            end_angle = -90 + alpha * 360.0
+            r = int(((W ** 2 + H ** 2) ** 0.5))
+            draw.pieslice([cx - r, cy - r, cx + r, cy + r],
+                          start=-90, end=end_angle, fill=255)
+            canvas.paste(src, mask=mask)
+            return canvas.convert(out_frame.mode)
+
+        if xfade_name == "zoomin":
+            # Outgoing clip grows (zoom in) while incoming cross-fades
+            scale = 1.0 + alpha * 0.3
+            new_w = int(W * scale)
+            new_h = int(H * scale)
+            zoomed = out_frame.resize((new_w, new_h), Image.BILINEAR)
+            ox = (new_w - W) // 2
+            oy = (new_h - H) // 2
+            out_cropped = zoomed.crop((ox, oy, ox + W, oy + H))
+            return Image.blend(out_cropped, in_frame, alpha)
+
+        # ── Stylized group ────────────────────────────────────────────────
+        if xfade_name in ("squeezeh", "squeezev"):
+            canvas = Image.new(out_frame.mode, (W, H))
+            if xfade_name == "squeezeh":
+                # outgoing squeezes to centre horizontally
+                new_w = max(1, int(W * (1.0 - alpha)))
+                resized_out = out_frame.resize((new_w, H), Image.BILINEAR)
+                canvas.paste(in_frame, (0, 0))
+                canvas.paste(resized_out, ((W - new_w) // 2, 0))
+            else:
+                new_h = max(1, int(H * (1.0 - alpha)))
+                resized_out = out_frame.resize((W, new_h), Image.BILINEAR)
+                canvas.paste(in_frame, (0, 0))
+                canvas.paste(resized_out, (0, (H - new_h) // 2))
+            return canvas
+
+        # ── Fallback ──────────────────────────────────────────────────────
+        return Image.blend(out_frame, in_frame, alpha)
+
     # ── Display tick (main-thread loop) ──────────────────────────────────
 
     def _timeline_display_tick(self):
@@ -11258,22 +12003,51 @@ class LTXQueueManager:
                 try:
                     ci, img = q.get_nowait()
                     if img is None:
-                        # Clip finished — start next reader
+                        # Clip finished — apply trim warps then start the next reader.
                         next_idx = ci + 1
                         if next_idx < len(self._timeline_clip_list):
+                            # Look up xfade transition between clip ci and next_idx.
+                            _tl_scenes = self._get_timeline_ordered_scenes()
+                            _id_a = _tl_scenes[ci]["scene_id"]       if ci       < len(_tl_scenes) else None
+                            _id_b = _tl_scenes[next_idx]["scene_id"] if next_idx < len(_tl_scenes) else None
+                            _tkey   = f"{_id_a}___{_id_b}" if _id_a and _id_b else None
+                            _ttrans = self.timeline_transitions.get(_tkey, {}) if _tkey else {}
+                            _ttype  = _ttrans.get("type", "cut")
+                            _tdur   = max(0.1, float(_ttrans.get("duration", 1.0)))
+
+                            # Warp 1: skip the trim_out tail of the finished clip.
+                            _, trim_out_done, _, _ = self._get_clip_trims(ci)
+                            self._timeline_play_wall_start -= trim_out_done
+                            # Warp 2: skip the trim_in head of the next clip.
+                            trim_in_next, _, eff_dur_next, _ = self._get_clip_trims(next_idx)
+                            self._timeline_play_wall_start -= trim_in_next
+
                             self._timeline_current_clip_idx = next_idx
-                            cp, start, dur = self._timeline_clip_list[next_idx]
+                            cp, _, _ = self._timeline_clip_list[next_idx]
                             if cp and os.path.exists(cp):
                                 self._timeline_frame_queue = queue.Queue(maxsize=6)
                                 self._timeline_stop_reader = False
-                                # Reset counters so next clip syncs from its own start
-                                self._timeline_reader_start_pos = start
+                                # Anchor reader to the warped canvas position.
+                                new_pos = time.monotonic() - self._timeline_play_wall_start
+                                self._timeline_reader_start_pos = new_pos
                                 self._timeline_reader_frames_consumed = 0
+                                next_max_frames = max(1, int(eff_dur_next * self._TL_PREVIEW_FPS) + 1)
                                 threading.Thread(
                                     target=self._timeline_frame_reader,
-                                    args=(cp, 0.0, next_idx),
+                                    args=(cp, trim_in_next, next_idx, next_max_frames),
                                     daemon=True
                                 ).start()
+                                # Set up freeze-blend xfade if transition is xfade.
+                                if _ttype == "xfade":
+                                    self._timeline_xfade_state = {
+                                        "start_pos":  new_pos,
+                                        "dur":        _tdur,
+                                        "start_frame": getattr(self, "_timeline_last_frame", None),
+                                        "xfade_name": _ttrans.get("xfade_name", "dissolve"),
+                                    }
+                        else:
+                            # Last clip finished — stop playback.
+                            self.root.after(0, self._timeline_stop)
                         break
                     clip_idx_got = ci
                     frame_img = img
@@ -11281,10 +12055,31 @@ class LTXQueueManager:
                 except queue.Empty:
                     break
 
+        # Apply freeze-blend xfade over the incoming clip for the first xfade_dur seconds.
+        display_frame = frame_img
+        xfade_state = getattr(self, "_timeline_xfade_state", None)
+        if xfade_state and frame_img is not None:
+            start_frame = xfade_state.get("start_frame")
+            if start_frame is not None:
+                elapsed = pos - xfade_state["start_pos"]
+                alpha = min(1.0, max(0.0, elapsed / max(0.01, xfade_state["dur"])))
+                try:
+                    xfade_name = xfade_state.get("xfade_name", "dissolve")
+                    display_frame = self._apply_xfade_preview(
+                        start_frame, frame_img, alpha, xfade_name)
+                except Exception:
+                    display_frame = frame_img
+                if alpha >= 1.0:
+                    self._timeline_xfade_state = None
+
         # Update preview
-        if frame_img is not None:
+        if display_frame is not None:
+            # Save last frame for subsequent xfade (only outside active xfade window
+            # so the frozen outgoing frame is preserved as the blend base).
+            if not xfade_state:
+                self._timeline_last_frame = display_frame
             try:
-                photo = ImageTk.PhotoImage(frame_img)
+                photo = ImageTk.PhotoImage(display_frame)
                 self._timeline_preview_photo = photo
                 self.timeline_preview_canvas.create_image(0, 0, anchor="nw", image=photo)
             except Exception:
@@ -11376,6 +12171,21 @@ class LTXQueueManager:
             if abs(cx - ph_x) <= 7:
                 c.configure(cursor="sb_h_double_arrow")
                 return
+        # Trim-handle cursor: detect curtain boundary handles (not raw card edges)
+        TRIM_W = 18
+        CARD_Y = self._TL_RULER_H + self._TL_AUDIO_H + 6
+        if cy > CARD_Y:
+            for _sc, _sx, _sw in getattr(self, "_timeline_current_scenes", []):
+                _pps    = self.timeline_px_per_second
+                # Always read live trim values so cursor tracks after a drag
+                _live   = self.timeline_clip_trims.get(_sc["scene_id"], {})
+                _ti     = max(0.0, float(_live.get("trim_in",  0.0)))
+                _to     = max(0.0, float(_live.get("trim_out", 0.0)))
+                _hx_in  = _sx + int(_ti * _pps)
+                _hx_out = _sx + _sw - int(_to * _pps)
+                if abs(cx - _hx_in) <= TRIM_W or abs(cx - _hx_out) <= TRIM_W:
+                    c.configure(cursor="sb_h_double_arrow")
+                    return
         c.configure(cursor="")
 
     def _timeline_draw_playhead(self, pos_sec):
@@ -11430,7 +12240,15 @@ class LTXQueueManager:
             for sc in scenes:
                 cp = sc.get("clip_path", "")
                 if cp and os.path.exists(cp):
-                    sc["duration"] = self._probe_clip_duration(cp)
+                    raw_dur = self._probe_clip_duration(cp)
+                    sid = sc.get("scene_id", "")
+                    _trims = self.timeline_clip_trims.get(sid, {})
+                    _ti = max(0.0, float(_trims.get("trim_in", 0.0)))
+                    _to = max(0.0, float(_trims.get("trim_out", 0.0)))
+                    sc["raw_duration"] = raw_dur
+                    sc["trim_in"] = _ti
+                    sc["trim_out"] = _to
+                    sc["duration"] = max(0.1, raw_dur - _ti - _to)
             self.root.after(0, lambda: self._draw_timeline_canvas(scenes))
 
         threading.Thread(target=_probe, daemon=True).start()
@@ -11461,26 +12279,32 @@ class LTXQueueManager:
             self.timeline_status_label.config(text="No scenes found.")
             return
 
-        # Compute positions
+        # Compute positions — card width uses the RAW clip length so the thumbnail
+        # never resizes when trim is applied.  The trimmed (active) duration is
+        # tracked separately for the export / status-bar duration display.
         positions = []
         x = PAD
-        total_dur = 0.0
+        total_dur  = 0.0   # raw total  — drives canvas width and playhead mapping
+        active_dur = 0.0   # trimmed total — what the export will actually produce
         for sc in scenes:
-            dur = sc.get("duration") or 5.0
-            w = max(MIN_W, int(dur * pps))
+            raw_dur = sc.get("raw_duration") or sc.get("duration") or 5.0
+            trimmed = sc.get("duration") or raw_dur
+            w = max(MIN_W, int(raw_dur * pps))
             positions.append((sc, x, w))
             x += w + GAP
-            total_dur += dur
+            total_dur  += raw_dur
+            active_dur += trimmed
         total_w = x + PAD
         total_h = CARD_Y + CARD_H + 30
 
-        # Rebuild clip list for playback engine
+        # Rebuild clip list for playback engine (uses raw durations so the
+        # playhead maps 1-to-1 with canvas x — no mid-card position jumps)
         self._timeline_clip_list = []
         t = 0.0
         for sc, _, _ in positions:
-            dur = sc.get("duration") or 5.0
-            self._timeline_clip_list.append((sc.get("clip_path", ""), t, dur))
-            t += dur
+            raw_dur = sc.get("raw_duration") or sc.get("duration") or 5.0
+            self._timeline_clip_list.append((sc.get("clip_path", ""), t, raw_dur))
+            t += raw_dur
         self._timeline_total_duration = total_dur
 
         # ── Time ruler ──
@@ -11570,7 +12394,8 @@ class LTXQueueManager:
             strip_y = CARD_Y + 3 + th
             c.create_rectangle(sc_x + 3, strip_y, sc_x + sc_w - 3, strip_y + 18,
                                 fill=colors["surface"], outline="", tags=(tag,))
-            c.create_text(sc_x + 6, strip_y + 2, text=f"Scene {display_num:02d}", anchor="nw",
+            card_label = f"Import {display_num:02d}" if sc.get("is_imported") else f"Scene {display_num:02d}"
+            c.create_text(sc_x + 6, strip_y + 2, text=card_label, anchor="nw",
                           fill=colors["text"], font=self.fonts["body_strong"], tags=(tag,))
             c.create_text(sc_x + sc_w - 5, strip_y + 2, text=f"{dur:.1f}s", anchor="ne",
                           fill=colors["text_muted"], font=self.fonts["small"], tags=(tag,))
@@ -11582,6 +12407,124 @@ class LTXQueueManager:
                           text=short, anchor="nw",
                           fill=colors["text_muted"], font=self.fonts["small"], tags=(tag,))
 
+            # ── Trim curtain overlays ────────────────────────────────────
+            CURTAIN_COL  = "#00b8b8"
+            CURTAIN_STIP = "gray50"
+            HANDLE_W     = 16
+            TAB_W        = 20
+            TAB_BODY     = "#0d3040"
+            TAB_ACCENT   = "#00e5ff"
+
+            trim_in_v  = sc.get("trim_in",  0.0)
+            trim_out_v = sc.get("trim_out", 0.0)
+            OVL_TAG = f"trim_overlay_{scene_id}"
+            _cmy = CARD_Y + CARD_H // 2
+            _ty0 = CARD_Y
+            _ty1 = CARD_Y + CARD_H
+
+            # Always-visible trim tabs at raw card edges
+            # Left tab
+            c.create_rectangle(sc_x, _ty0, sc_x + TAB_W, _ty1,
+                                fill=TAB_BODY, outline=TAB_ACCENT, width=1,
+                                tags=(tag, OVL_TAG))
+            c.create_line(sc_x + TAB_W - 1, _ty0, sc_x + TAB_W - 1, _ty1,
+                          fill=TAB_ACCENT, width=2, tags=(tag, OVL_TAG))
+            for _gx in (sc_x + 4, sc_x + 8, sc_x + 12, sc_x + 16):
+                c.create_line(_gx, _cmy - 8, _gx, _cmy + 8,
+                               fill=TAB_ACCENT, width=1, tags=(tag, OVL_TAG))
+            # Right tab
+            c.create_rectangle(sc_x + sc_w - TAB_W, _ty0, sc_x + sc_w, _ty1,
+                                fill=TAB_BODY, outline=TAB_ACCENT, width=1,
+                                tags=(tag, OVL_TAG))
+            c.create_line(sc_x + sc_w - TAB_W + 1, _ty0, sc_x + sc_w - TAB_W + 1, _ty1,
+                          fill=TAB_ACCENT, width=2, tags=(tag, OVL_TAG))
+            for _gx in (sc_x + sc_w - 16, sc_x + sc_w - 12, sc_x + sc_w - 8, sc_x + sc_w - 4):
+                c.create_line(_gx, _cmy - 8, _gx, _cmy + 8,
+                               fill=TAB_ACCENT, width=1, tags=(tag, OVL_TAG))
+
+            # Left curtain — covers trimmed-off beginning
+            if trim_in_v > 0.001:
+                cx_in = sc_x + int(trim_in_v * pps)
+                cx_in = min(cx_in, sc_x + sc_w - HANDLE_W)
+                c.create_rectangle(sc_x, CARD_Y, cx_in, CARD_Y + CARD_H,
+                                   fill=CURTAIN_COL, stipple=CURTAIN_STIP, outline="",
+                                   tags=(tag, OVL_TAG))
+                c.create_rectangle(cx_in - HANDLE_W // 2, _ty0,
+                                   cx_in + HANDLE_W // 2, _ty1,
+                                   fill=TAB_BODY, outline=TAB_ACCENT, width=1,
+                                   tags=(tag, OVL_TAG))
+                for _gx in (cx_in - 5, cx_in - 1, cx_in + 3, cx_in + 7):
+                    c.create_line(_gx, _cmy - 8, _gx, _cmy + 8,
+                                  fill=TAB_ACCENT, width=1, tags=(tag, OVL_TAG))
+                if cx_in - sc_x > 36:
+                    c.create_text(sc_x + 4, CARD_Y + CARD_H // 2,
+                                  text=f"◀{trim_in_v:.2f}s", anchor="w",
+                                  fill="#003030", font=self.fonts["micro"],
+                                  tags=(tag, OVL_TAG))
+
+            # Right curtain — covers trimmed-off end
+            if trim_out_v > 0.001:
+                cx_out = sc_x + sc_w - int(trim_out_v * pps)
+                cx_out = max(cx_out, sc_x + HANDLE_W)
+                c.create_rectangle(cx_out, CARD_Y, sc_x + sc_w, CARD_Y + CARD_H,
+                                   fill=CURTAIN_COL, stipple=CURTAIN_STIP, outline="",
+                                   tags=(tag, OVL_TAG))
+                c.create_rectangle(cx_out - HANDLE_W // 2, _ty0,
+                                   cx_out + HANDLE_W // 2, _ty1,
+                                   fill=TAB_BODY, outline=TAB_ACCENT, width=1,
+                                   tags=(tag, OVL_TAG))
+                for _gx in (cx_out - 7, cx_out - 3, cx_out + 1, cx_out + 5):
+                    c.create_line(_gx, _cmy - 8, _gx, _cmy + 8,
+                                  fill=TAB_ACCENT, width=1, tags=(tag, OVL_TAG))
+                if sc_x + sc_w - cx_out > 36:
+                    c.create_text(sc_x + sc_w - 4, CARD_Y + CARD_H // 2,
+                                  text=f"{trim_out_v:.2f}s▶", anchor="e",
+                                  fill="#003030", font=self.fonts["micro"],
+                                  tags=(tag, OVL_TAG))
+
+        # ── Transition badges ────────────────────────────────────────────
+        # Draw a small diamond badge in the gap between each adjacent pair
+        # of scene cards.  Left-click opens the transition dialog.
+        BADGE_RX = 11   # half-width of diamond (pixels)
+        BADGE_RY = 9    # half-height of diamond
+        for i in range(len(positions) - 1):
+            sc_a, sx_a, sw_a = positions[i]
+            sc_b, sx_b, _    = positions[i + 1]
+            id_a = sc_a["scene_id"]
+            id_b = sc_b["scene_id"]
+            key  = f"{id_a}___{id_b}"
+            bx   = sx_a + sw_a + GAP // 2   # horizontal centre of gap
+            by   = CARD_Y + CARD_H // 2      # vertical centre of card
+            trans  = self.timeline_transitions.get(key, {})
+            t_type = trans.get("type", "cut")
+            t_dur  = float(trans.get("duration", 1.0))
+            badge_tag = f"transition_{key}"
+            if t_type == "xfade":
+                xfade_name = trans.get("xfade_name", "dissolve")
+                b_fill   = colors["accent"]
+                b_out    = "#ffffff"
+                abbr     = XFADE_BADGE_ABBR.get(xfade_name, xfade_name[:4].title())
+                b_text   = f"{abbr}\n{t_dur:.1f}s"
+                b_tcolor = "#ffffff"
+            else:
+                b_fill   = colors.get("surface_soft", "#2a2a2a")
+                b_out    = colors["border"]
+                b_text   = "\u2702"   # ✂
+                b_tcolor = colors["text_muted"]
+            c.create_polygon(
+                bx,            by - BADGE_RY,
+                bx + BADGE_RX, by,
+                bx,            by + BADGE_RY,
+                bx - BADGE_RX, by,
+                fill=b_fill, outline=b_out, width=1,
+                tags=("transition_badge", badge_tag)
+            )
+            c.create_text(bx, by, text=b_text,
+                          fill=b_tcolor, font=self.fonts["micro"],
+                          justify="center",
+                          tags=("transition_badge", badge_tag))
+        c.tag_raise("transition_badge")
+
         c.configure(scrollregion=(0, 0, total_w, total_h))
 
         # Redraw playhead on top
@@ -11590,9 +12533,11 @@ class LTXQueueManager:
         has_clips = any(sc.get("clip_path") and os.path.exists(sc.get("clip_path", "")) for sc in scenes)
         self.timeline_export_btn.config(state=tk.NORMAL if has_clips else tk.DISABLED)
         n = len(scenes)
-        total_str = f"{int(total_dur//60)}:{int(total_dur)%60:02d}"
+        active_str = f"{int(active_dur//60)}:{int(active_dur)%60:02d}"
+        total_str  = f"{int(total_dur//60)}:{int(total_dur)%60:02d}"
+        dur_info   = f"{active_str} export" if abs(active_dur - total_dur) > 0.05 else active_str
         self.timeline_status_label.config(
-            text=f"{n} scene{'s' if n!=1 else ''}  ·  {total_str} total  ·  Drag cards to reorder"
+            text=f"{n} scene{'s' if n!=1 else ''}  \u00b7  {dur_info}  \u00b7  Drag cards to reorder  \u00b7  Drag curtain edges to trim"
         )
         self._timeline_current_scenes = list(positions)
 
@@ -11600,6 +12545,101 @@ class LTXQueueManager:
         self.timeline_px_per_second = max(20, min(300, self.timeline_px_per_second + direction * 20))
         scenes = [sc for sc, _, _ in getattr(self, "_timeline_current_scenes", [])]
         self._draw_timeline_canvas(scenes)
+
+    def _timeline_redraw_trim_overlay(self, scene_id):
+        """Fast-path: delete and redraw only the trim curtain items for one card.
+        Called every mouse-move during a trim drag so the curtain updates in real time
+        without touching thumbnails or any other canvas items."""
+        c = self.timeline_canvas
+        OVL_TAG = f"trim_overlay_{scene_id}"
+        c.delete(OVL_TAG)
+
+        # Find this card's canvas position from the cached scene list
+        sc_data = None
+        for _sc, _sx, _sw in getattr(self, "_timeline_current_scenes", []):
+            if _sc["scene_id"] == scene_id:
+                sc_data = (_sc, _sx, _sw)
+                break
+        if sc_data is None:
+            return
+        _, sc_x, sc_w = sc_data
+
+        trims      = self.timeline_clip_trims.get(scene_id, {})
+        trim_in_v  = max(0.0, float(trims.get("trim_in",  0.0)))
+        trim_out_v = max(0.0, float(trims.get("trim_out", 0.0)))
+        pps        = self.timeline_px_per_second
+        CARD_Y     = self._TL_RULER_H + self._TL_AUDIO_H + 6
+        CARD_H     = self._TL_CARD_H
+        CURTAIN_COL  = "#00b8b8"
+        CURTAIN_STIP = "gray50"
+        HANDLE_W     = 16
+        TAB_W        = 20
+        TAB_BODY     = "#0d3040"
+        TAB_ACCENT   = "#00e5ff"
+        _cmy = CARD_Y + CARD_H // 2
+        _ty0 = CARD_Y
+        _ty1 = CARD_Y + CARD_H
+
+        # Always-visible trim tabs at raw card edges
+        # Left tab
+        c.create_rectangle(sc_x, _ty0, sc_x + TAB_W, _ty1,
+                            fill=TAB_BODY, outline=TAB_ACCENT, width=1, tags=(OVL_TAG,))
+        c.create_line(sc_x + TAB_W - 1, _ty0, sc_x + TAB_W - 1, _ty1,
+                      fill=TAB_ACCENT, width=2, tags=(OVL_TAG,))
+        for _gx in (sc_x + 4, sc_x + 8, sc_x + 12, sc_x + 16):
+            c.create_line(_gx, _cmy - 8, _gx, _cmy + 8,
+                           fill=TAB_ACCENT, width=1, tags=(OVL_TAG,))
+        # Right tab
+        c.create_rectangle(sc_x + sc_w - TAB_W, _ty0, sc_x + sc_w, _ty1,
+                            fill=TAB_BODY, outline=TAB_ACCENT, width=1, tags=(OVL_TAG,))
+        c.create_line(sc_x + sc_w - TAB_W + 1, _ty0, sc_x + sc_w - TAB_W + 1, _ty1,
+                      fill=TAB_ACCENT, width=2, tags=(OVL_TAG,))
+        for _gx in (sc_x + sc_w - 16, sc_x + sc_w - 12, sc_x + sc_w - 8, sc_x + sc_w - 4):
+            c.create_line(_gx, _cmy - 8, _gx, _cmy + 8,
+                           fill=TAB_ACCENT, width=1, tags=(OVL_TAG,))
+
+        # Left curtain
+        if trim_in_v > 0.001:
+            cx_in = min(sc_x + int(trim_in_v * pps), sc_x + sc_w - HANDLE_W)
+            c.create_rectangle(sc_x, CARD_Y, cx_in, CARD_Y + CARD_H,
+                               fill=CURTAIN_COL, stipple=CURTAIN_STIP, outline="",
+                               tags=(OVL_TAG,))
+            c.create_rectangle(cx_in - HANDLE_W // 2, _ty0,
+                               cx_in + HANDLE_W // 2, _ty1,
+                               fill=TAB_BODY, outline=TAB_ACCENT, width=1,
+                               tags=(OVL_TAG,))
+            for _gx in (cx_in - 5, cx_in - 1, cx_in + 3, cx_in + 7):
+                c.create_line(_gx, _cmy - 8, _gx, _cmy + 8,
+                              fill=TAB_ACCENT, width=1, tags=(OVL_TAG,))
+            if cx_in - sc_x > 36:
+                c.create_text(sc_x + 4, CARD_Y + CARD_H // 2,
+                              text=f"◀{trim_in_v:.2f}s", anchor="w",
+                              fill="#003030", font=self.fonts["micro"], tags=(OVL_TAG,))
+
+        # Right curtain
+        if trim_out_v > 0.001:
+            cx_out = max(sc_x + sc_w - int(trim_out_v * pps), sc_x + HANDLE_W)
+            c.create_rectangle(cx_out, CARD_Y, sc_x + sc_w, CARD_Y + CARD_H,
+                               fill=CURTAIN_COL, stipple=CURTAIN_STIP, outline="",
+                               tags=(OVL_TAG,))
+            c.create_rectangle(cx_out - HANDLE_W // 2, _ty0,
+                               cx_out + HANDLE_W // 2, _ty1,
+                               fill=TAB_BODY, outline=TAB_ACCENT, width=1,
+                               tags=(OVL_TAG,))
+            for _gx in (cx_out - 7, cx_out - 3, cx_out + 1, cx_out + 5):
+                c.create_line(_gx, _cmy - 8, _gx, _cmy + 8,
+                              fill=TAB_ACCENT, width=1, tags=(OVL_TAG,))
+            if sc_x + sc_w - cx_out > 36:
+                c.create_text(sc_x + sc_w - 4, CARD_Y + CARD_H // 2,
+                              text=f"{trim_out_v:.2f}s▶", anchor="e",
+                              fill="#003030", font=self.fonts["micro"], tags=(OVL_TAG,))
+
+        # Keep curtains above card content, below playhead
+        c.tag_raise(OVL_TAG)
+        try:
+            c.tag_raise("playhead")
+        except tk.TclError:
+            pass
 
     # ── Drag & drop ───────────────────────────────────────────────────────
 
@@ -11639,11 +12679,13 @@ class LTXQueueManager:
                 break
         if not scene_id:
             return
-        # Find clip path for Play action
+        # Find clip path and imported status
         clip_path = ""
+        is_imported = False
         for sc, _, _ in getattr(self, "_timeline_current_scenes", []):
             if sc["scene_id"] == scene_id:
                 clip_path = sc.get("clip_path", "")
+                is_imported = sc.get("is_imported", False)
                 break
         menu = tk.Menu(self.root, tearoff=0)
         if clip_path and os.path.exists(clip_path):
@@ -11653,9 +12695,24 @@ class LTXQueueManager:
             )
             menu.add_separator()
         menu.add_command(
+            label="\u2702  Trim Clip\u2026",
+            command=lambda sid=scene_id: self._timeline_trim_clip_dialog(sid)
+        )
+        menu.add_separator()
+        menu.add_command(
             label="\u2195  Move to Position\u2026",
             command=lambda sid=scene_id: self._timeline_move_scene_to_position(sid)
         )
+        menu.add_separator()
+        menu.add_command(
+            label="\u2715  Remove from Timeline",
+            command=lambda sid=scene_id: self._timeline_remove_scene(sid)
+        )
+        if is_imported:
+            menu.add_command(
+                label="\U0001f5d1  Delete Import",
+                command=lambda sid=scene_id: self._timeline_delete_import(sid)
+            )
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -11697,6 +12754,607 @@ class LTXQueueManager:
         self._save_timeline_arrangement()
         self.refresh_timeline_editor()
 
+    def _timeline_trim_clip_dialog(self, scene_id):
+        """Dialog to set trim_in / trim_out for a clip numerically."""
+        # Find raw_duration from current scenes
+        raw_dur = 0.0
+        for _sc, _, _ in getattr(self, "_timeline_current_scenes", []):
+            if _sc["scene_id"] == scene_id:
+                raw_dur = _sc.get("raw_duration",
+                    _sc.get("duration", 5.0) + _sc.get("trim_in", 0.0) + _sc.get("trim_out", 0.0))
+                break
+        if raw_dur <= 0:
+            raw_dur = 5.0  # fallback
+
+        existing  = self.timeline_clip_trims.get(scene_id, {})
+        cur_ti    = float(existing.get("trim_in",  0.0))
+        cur_to    = float(existing.get("trim_out", 0.0))
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Trim Clip")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+        bg = self.colors["surface"]
+        dlg.configure(bg=bg)
+
+        # Info row
+        info_lbl = tk.Label(dlg, text=f"Raw clip duration: {raw_dur:.3f}s",
+                            bg=bg, fg=self.colors["text"], font=self.fonts["body"])
+        info_lbl.grid(row=0, column=0, columnspan=2, padx=16, pady=(14, 6), sticky="w")
+
+        # Trim In
+        tk.Label(dlg, text="Trim In (sec):", bg=bg, fg=self.colors["text"],
+                 font=self.fonts["body"]).grid(row=1, column=0, padx=(16, 8), pady=4, sticky="e")
+        ti_var = tk.StringVar(value=f"{cur_ti:.3f}")
+        ti_entry = tk.Entry(dlg, textvariable=ti_var, width=12,
+                            bg=self.colors.get("input_bg", bg), fg=self.colors["text"],
+                            insertbackground=self.colors["text"])
+        ti_entry.grid(row=1, column=1, padx=(0, 16), pady=4, sticky="w")
+
+        # Trim Out
+        tk.Label(dlg, text="Trim Out (sec):", bg=bg, fg=self.colors["text"],
+                 font=self.fonts["body"]).grid(row=2, column=0, padx=(16, 8), pady=4, sticky="e")
+        to_var = tk.StringVar(value=f"{cur_to:.3f}")
+        to_entry = tk.Entry(dlg, textvariable=to_var, width=12,
+                            bg=self.colors.get("input_bg", bg), fg=self.colors["text"],
+                            insertbackground=self.colors["text"])
+        to_entry.grid(row=2, column=1, padx=(0, 16), pady=4, sticky="w")
+
+        # Effective duration preview
+        eff_var = tk.StringVar()
+        eff_lbl = tk.Label(dlg, textvariable=eff_var, bg=bg,
+                           fg=self.colors.get("text_muted", self.colors["text"]),
+                           font=self.fonts["small"])
+        eff_lbl.grid(row=3, column=0, columnspan=2, padx=16, pady=(0, 4), sticky="w")
+
+        def _update_preview(*_):
+            try:
+                ti = max(0.0, float(ti_var.get()))
+                to = max(0.0, float(to_var.get()))
+                eff = max(0.1, raw_dur - ti - to)
+                eff_var.set(f"Effective duration: {eff:.3f}s")
+            except ValueError:
+                eff_var.set("Enter valid numbers")
+
+        ti_var.trace_add("write", _update_preview)
+        to_var.trace_add("write", _update_preview)
+        _update_preview()
+
+        btn_row = tk.Frame(dlg, bg=bg)
+        btn_row.grid(row=4, column=0, columnspan=2, padx=16, pady=(4, 14), sticky="ew")
+
+        def _reset():
+            ti_var.set("0.000")
+            to_var.set("0.000")
+
+        def _confirm():
+            try:
+                ti = max(0.0, float(ti_var.get()))
+                to = max(0.0, float(to_var.get()))
+            except ValueError:
+                messagebox.showerror("Invalid Input", "Please enter valid numbers.", parent=dlg)
+                return
+            if raw_dur > 0 and ti + to >= raw_dur:
+                messagebox.showerror(
+                    "Invalid Input",
+                    f"Trim In + Trim Out must be less than the raw duration ({raw_dur:.3f}s).",
+                    parent=dlg)
+                return
+            self._push_timeline_undo()
+            if ti == 0.0 and to == 0.0:
+                self.timeline_clip_trims.pop(scene_id, None)
+            else:
+                self.timeline_clip_trims[scene_id] = {"trim_in": ti, "trim_out": to}
+            dlg.destroy()
+            self._save_timeline_arrangement()
+            self.refresh_timeline_editor()
+
+        reset_btn = tk.Button(btn_row, text="Reset", command=_reset)
+        reset_btn.pack(side=tk.LEFT)
+        self._style_button(reset_btn, "ghost", compact=True)
+
+        cancel_btn = tk.Button(btn_row, text="Cancel", command=dlg.destroy)
+        cancel_btn.pack(side=tk.RIGHT, padx=(6, 0))
+        self._style_button(cancel_btn, "ghost", compact=True)
+
+        confirm_btn = tk.Button(btn_row, text="Apply Trim", command=_confirm)
+        confirm_btn.pack(side=tk.RIGHT)
+        self._style_button(confirm_btn, "primary", compact=True)
+
+        ti_entry.focus_set()
+
+    def _timeline_transition_dialog(self, id_a, id_b):
+        """Dialog to set the transition type and duration between two clips."""
+        key       = f"{id_a}___{id_b}"
+        trans     = self.timeline_transitions.get(key, {})
+        cur_type  = trans.get("type", "cut")
+        cur_xname = trans.get("xfade_name", "dissolve")
+        cur_dur   = float(trans.get("duration", 1.0))
+
+        # Resolve display names
+        name_a = name_b = ""
+        for sc, _, _ in getattr(self, "_timeline_current_scenes", []):
+            sid   = sc["scene_id"]
+            label = f"{'Import' if sc.get('is_imported') else 'Scene'} {sc.get('scene_order', 0):02d}"
+            if sid == id_a:
+                name_a = label
+            if sid == id_b:
+                name_b = label
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Scene Transition")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+        bg       = self.colors["surface"]
+        bg_soft  = self.colors.get("surface_soft", bg)
+        fg       = self.colors["text"]
+        fg_muted = self.colors.get("text_muted", fg)
+        accent   = self.colors["accent"]
+        border   = self.colors["border"]
+        dlg.configure(bg=bg)
+
+        # ── Header ───────────────────────────────────────────────────────
+        tk.Label(dlg, text=f"{name_a}  \u2192  {name_b}",
+                 bg=bg, fg=fg, font=self.fonts["body_strong"]).grid(
+            row=0, column=0, columnspan=3, padx=16, pady=(14, 8), sticky="w")
+
+        # ── Two-pane layout ──────────────────────────────────────────────
+        left_frame  = tk.Frame(dlg, bg=bg)
+        right_frame = tk.Frame(dlg, bg=bg)
+        left_frame.grid( row=1, column=0, padx=(16, 6), pady=4, sticky="nsew")
+        right_frame.grid(row=1, column=1, padx=(6, 16), pady=4, sticky="nsew")
+        dlg.columnconfigure(0, weight=0)
+        dlg.columnconfigure(1, weight=1)
+
+        # Left: scrollable listbox with category headers
+        lb_frame = tk.Frame(left_frame, bg=border, bd=1)
+        lb_frame.pack(fill=tk.BOTH, expand=True)
+
+        scrollbar = tk.Scrollbar(lb_frame, orient=tk.VERTICAL)
+        listbox = tk.Listbox(
+            lb_frame,
+            yscrollcommand=scrollbar.set,
+            width=28, height=18,
+            bg=bg_soft, fg=fg,
+            selectbackground=accent, selectforeground="#ffffff",
+            activestyle="none",
+            font=self.fonts["body"],
+            bd=0, highlightthickness=0,
+            exportselection=False,
+        )
+        scrollbar.config(command=listbox.yview)
+        listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Build listbox entries; parallel list maps row index -> (type, xfade_name|None)
+        row_map = []   # [(selectable:bool, type:str, xfade_name:str|None)]
+
+        # First row: Cut
+        listbox.insert(tk.END, "  \u2702  Cut")
+        row_map.append((True, "cut", None))
+
+        # Then group headers + effects
+        current_group = None
+        for grp, dn, xn, _desc in TIMELINE_XFADE_TRANSITIONS:
+            if grp != current_group:
+                current_group = grp
+                header = f"\u2500\u2500 {grp} "
+                listbox.insert(tk.END, header)
+                row_map.append((False, "", None))
+                # Style header row differently
+                listbox.itemconfig(tk.END, fg=fg_muted, selectbackground=bg_soft,
+                                   selectforeground=fg_muted)
+            listbox.insert(tk.END, f"    {dn}")
+            row_map.append((True, "xfade", xn))
+
+        # Pre-select current transition
+        pre_sel = 0  # default to Cut
+        for idx, (sel, t, xn) in enumerate(row_map):
+            if sel and t == cur_type and (t == "cut" or xn == cur_xname):
+                pre_sel = idx
+                break
+        listbox.selection_set(pre_sel)
+        listbox.see(pre_sel)
+
+        # Right: description + duration controls
+        tk.Label(right_frame, text="Effect", bg=bg, fg=fg_muted,
+                 font=self.fonts["small"]).pack(anchor="w")
+        effect_label = tk.Label(right_frame, text="", bg=bg, fg=fg,
+                                font=self.fonts["body_strong"], wraplength=200, justify="left")
+        effect_label.pack(anchor="w", pady=(0, 4))
+
+        tk.Label(right_frame, text="Description", bg=bg, fg=fg_muted,
+                 font=self.fonts["small"]).pack(anchor="w")
+        desc_label = tk.Label(right_frame, text="", bg=bg, fg=fg,
+                              font=self.fonts["body"], wraplength=200, justify="left",
+                              height=3)
+        desc_label.pack(anchor="w", pady=(0, 10))
+
+        sep = tk.Frame(right_frame, bg=border, height=1)
+        sep.pack(fill=tk.X, pady=(0, 10))
+
+        dur_outer = tk.Frame(right_frame, bg=bg)
+        dur_outer.pack(anchor="w")
+        tk.Label(dur_outer, text="Duration (sec):", bg=bg, fg=fg,
+                 font=self.fonts["body"]).pack(side=tk.LEFT, padx=(0, 6))
+        dur_var  = tk.DoubleVar(value=cur_dur)
+        dur_spin = tk.Spinbox(dur_outer, from_=0.1, to=8.0, increment=0.1,
+                              textvariable=dur_var, width=6, format="%.1f",
+                              bg=self.colors.get("input_bg", bg_soft), fg=fg,
+                              insertbackground=fg)
+        dur_spin.pack(side=tk.LEFT)
+        tk.Label(right_frame, text="(xfade transitions only)", bg=bg, fg=fg_muted,
+                 font=self.fonts["small"]).pack(anchor="w", pady=(2, 0))
+
+        def _update_right(*_):
+            """Refresh description panel when selection changes."""
+            sel_idx = listbox.curselection()
+            if not sel_idx:
+                return
+            idx = sel_idx[0]
+            selectable, t, xn = row_map[idx]
+            if not selectable:
+                # Clicked a header — move selection down one
+                nxt = idx + 1
+                while nxt < len(row_map) and not row_map[nxt][0]:
+                    nxt += 1
+                if nxt < len(row_map):
+                    listbox.selection_clear(0, tk.END)
+                    listbox.selection_set(nxt)
+                    _update_right()
+                return
+            if t == "cut":
+                effect_label.config(text="Cut")
+                desc_label.config(text="Hard cut — no transition effect.")
+                dur_spin.config(state=tk.DISABLED)
+            else:
+                info = _XFADE_INFO.get(xn, ("", xn.replace("_", " ").title(), ""))
+                effect_label.config(text=info[1])
+                desc_label.config(text=info[2])
+                dur_spin.config(state=tk.NORMAL)
+
+        listbox.bind("<<ListboxSelect>>", _update_right)
+        _update_right()  # initialise right pane
+
+        # ── Buttons ──────────────────────────────────────────────────────
+        btn_row = tk.Frame(dlg, bg=bg)
+        btn_row.grid(row=2, column=0, columnspan=2, padx=16, pady=(4, 14), sticky="ew")
+
+        def _confirm():
+            sel_idx = listbox.curselection()
+            if not sel_idx:
+                dlg.destroy()
+                return
+            _, t, xn = row_map[sel_idx[0]]
+            if not row_map[sel_idx[0]][0]:  # header selected — treat as cancel
+                dlg.destroy()
+                return
+            try:
+                d = max(0.1, float(dur_var.get()))
+            except (ValueError, tk.TclError):
+                d = 1.0
+            self._push_timeline_undo()
+            if t == "cut":
+                self.timeline_transitions.pop(key, None)
+            else:
+                self.timeline_transitions[key] = {
+                    "type": "xfade",
+                    "xfade_name": xn,
+                    "duration": round(d, 2),
+                }
+            dlg.destroy()
+            self._save_timeline_arrangement()
+            self.refresh_timeline_editor()
+
+        cancel_btn = tk.Button(btn_row, text="Cancel", command=dlg.destroy)
+        cancel_btn.pack(side=tk.RIGHT, padx=(6, 0))
+        self._style_button(cancel_btn, "ghost", compact=True)
+        confirm_btn = tk.Button(btn_row, text="Apply", command=_confirm)
+        confirm_btn.pack(side=tk.RIGHT)
+        self._style_button(confirm_btn, "primary", compact=True)
+
+        dlg.bind("<Return>", lambda e: _confirm())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+
+    def _timeline_remove_scene(self, scene_id):
+        """Non-destructively hide a scene from the timeline."""
+        if not scene_id:
+            return
+        self._push_timeline_undo()
+        if scene_id not in (self.timeline_excluded_scene_ids or []):
+            self.timeline_excluded_scene_ids = list(self.timeline_excluded_scene_ids or [])
+            self.timeline_excluded_scene_ids.append(scene_id)
+        # Also remove from explicit arrangement so it doesn't drift back
+        self.timeline_arrangement = [
+            sid for sid in (self.timeline_arrangement or []) if sid != scene_id
+        ]
+        self._save_timeline_arrangement()
+        self.refresh_timeline_editor()
+
+    def _timeline_delete_import(self, clip_id):
+        """Permanently remove an imported clip from the timeline."""
+        if not clip_id:
+            return
+        self._push_timeline_undo()
+        self.timeline_imported_clips = [
+            c for c in (self.timeline_imported_clips or []) if c.get("clip_id") != clip_id
+        ]
+        self.timeline_arrangement = [
+            sid for sid in (self.timeline_arrangement or []) if sid != clip_id
+        ]
+        self.timeline_excluded_scene_ids = [
+            sid for sid in (self.timeline_excluded_scene_ids or []) if sid != clip_id
+        ]
+        self._save_timeline_arrangement()
+        self.refresh_timeline_editor()
+
+    # ── Undo / Redo ──────────────────────────────────────────────────────
+
+    def _push_timeline_undo(self):
+        """Snapshot the mutable timeline state onto the undo stack (max 50)."""
+        import copy
+        snapshot = {
+            "timeline_arrangement": list(self.timeline_arrangement or []),
+            "timeline_excluded_scene_ids": list(self.timeline_excluded_scene_ids or []),
+            "timeline_imported_clips": copy.deepcopy(self.timeline_imported_clips or []),
+            "timeline_clip_trims": copy.deepcopy(self.timeline_clip_trims or {}),
+            "timeline_transitions": copy.deepcopy(self.timeline_transitions or {}),
+            "timeline_markers": copy.deepcopy(self.timeline_markers or []),
+        }
+        stack = self._timeline_undo_stack
+        stack.append(snapshot)
+        if len(stack) > 50:
+            del stack[0]
+        # New action clears the redo stack
+        self._timeline_redo_stack.clear()
+
+    def _timeline_undo(self):
+        """Pop the last undo snapshot and restore it, pushing current state to redo."""
+        import copy
+        if not self._timeline_undo_stack:
+            return
+        # Save current state to redo stack
+        current = {
+            "timeline_arrangement": list(self.timeline_arrangement or []),
+            "timeline_excluded_scene_ids": list(self.timeline_excluded_scene_ids or []),
+            "timeline_imported_clips": copy.deepcopy(self.timeline_imported_clips or []),
+            "timeline_clip_trims": copy.deepcopy(self.timeline_clip_trims or {}),
+            "timeline_transitions": copy.deepcopy(self.timeline_transitions or {}),
+            "timeline_markers": copy.deepcopy(self.timeline_markers or []),
+        }
+        self._timeline_redo_stack.append(current)
+        snapshot = self._timeline_undo_stack.pop()
+        self._timeline_apply_snapshot(snapshot)
+
+    def _timeline_redo(self):
+        """Pop the last redo snapshot and restore it, pushing current state to undo."""
+        import copy
+        if not self._timeline_redo_stack:
+            return
+        current = {
+            "timeline_arrangement": list(self.timeline_arrangement or []),
+            "timeline_excluded_scene_ids": list(self.timeline_excluded_scene_ids or []),
+            "timeline_imported_clips": copy.deepcopy(self.timeline_imported_clips or []),
+            "timeline_clip_trims": copy.deepcopy(self.timeline_clip_trims or {}),
+            "timeline_transitions": copy.deepcopy(self.timeline_transitions or {}),
+            "timeline_markers": copy.deepcopy(self.timeline_markers or []),
+        }
+        self._timeline_undo_stack.append(current)
+        snapshot = self._timeline_redo_stack.pop()
+        self._timeline_apply_snapshot(snapshot)
+
+    def _timeline_apply_snapshot(self, snapshot):
+        """Restore a previously saved timeline snapshot and refresh the view."""
+        self.timeline_arrangement = list(snapshot.get("timeline_arrangement", []))
+        self.timeline_excluded_scene_ids = list(snapshot.get("timeline_excluded_scene_ids", []))
+        self.timeline_imported_clips = list(snapshot.get("timeline_imported_clips", []))
+        self.timeline_clip_trims = dict(snapshot.get("timeline_clip_trims", {}))
+        self.timeline_transitions = dict(snapshot.get("timeline_transitions", {}))
+        self.timeline_markers = list(snapshot.get("timeline_markers", []))
+        self._save_timeline_arrangement()
+        self.refresh_timeline_editor()
+
+    def _timeline_insert_index_from_playhead(self):
+        """Return the arrangement index at which a new clip should be inserted,
+        based on the current playhead position.  The new clip is placed *after*
+        the clip the playhead is currently inside (or at the very start if the
+        playhead is before the first clip, or at the end if past all clips)."""
+        clip_list = getattr(self, "_timeline_clip_list", [])
+        current_scenes = getattr(self, "_timeline_current_scenes", [])
+        if not clip_list or not current_scenes:
+            return len(self.timeline_arrangement or [])
+
+        pos = self._timeline_playback_pos
+        # Find which clip index (0-based in the ordered list) the playhead is at
+        playhead_clip_idx = len(clip_list) - 1  # default: after last clip
+        for i, (cp, start, dur) in enumerate(clip_list):
+            if pos <= start + dur:
+                playhead_clip_idx = i
+                break
+
+        # Map that to a position in self.timeline_arrangement
+        # current_scenes is a list of (sc_dict, x, w) in display order
+        ordered_ids = [sc["scene_id"] for sc, _, _ in current_scenes]
+        arrangement = list(self.timeline_arrangement or [])
+
+        if playhead_clip_idx >= len(ordered_ids):
+            return len(arrangement)
+
+        target_id = ordered_ids[playhead_clip_idx]
+        try:
+            arr_idx = arrangement.index(target_id)
+            return arr_idx + 1  # insert after the clip the playhead is in
+        except ValueError:
+            # target_id not explicitly in arrangement (it's a remainder scene)
+            # Insert after all explicitly arranged items
+            return len(arrangement)
+
+    def _timeline_import_video(self):
+        """Open a file dialog to import external video(s) into the timeline,
+        inserting each clip at the current playhead position."""
+        ext_pattern = " ".join(f"*{e}" for e in SUPPORTED_VIDEO_EXTENSIONS)
+        paths = filedialog.askopenfilenames(
+            title="Import Video(s) into Timeline",
+            filetypes=[
+                ("Video files", ext_pattern),
+                ("All files", "*.*"),
+            ],
+            parent=self.root
+        )
+        if not paths:
+            return
+
+        self._push_timeline_undo()
+        # Snapshot the insertion index once (before we start adding clips).
+        # Each successive clip in a multi-select is inserted right after the
+        # previous one, preserving the chosen order.
+        insert_idx = self._timeline_insert_index_from_playhead()
+
+        imported_count = 0
+        self.timeline_imported_clips = list(self.timeline_imported_clips or [])
+        self.timeline_arrangement = list(self.timeline_arrangement or [])
+        for path in paths:
+            norm_path = self._normalize_path(path)
+            if not norm_path or not os.path.isfile(norm_path):
+                continue
+            # Skip duplicates
+            if any(
+                os.path.normcase(c.get("clip_path", "")) == os.path.normcase(norm_path)
+                for c in self.timeline_imported_clips
+            ):
+                continue
+            clip_id = self._generate_entity_id("import")
+            label = os.path.splitext(os.path.basename(norm_path))[0]
+            # Generate thumbnail so the card shows a preview
+            thumb_path = os.path.join(self.thumbs_dir, f"{os.path.basename(norm_path)}.jpg")
+            if not os.path.exists(thumb_path):
+                os.makedirs(self.thumbs_dir, exist_ok=True)
+                self.generate_thumbnail(norm_path, thumb_path)
+            self.timeline_imported_clips.append({
+                "clip_id": clip_id,
+                "clip_path": norm_path,
+                "label": label,
+            })
+            self.timeline_arrangement.insert(insert_idx, clip_id)
+            insert_idx += 1  # next clip goes right after this one
+            imported_count += 1
+        if imported_count:
+            self._save_timeline_arrangement()
+            self.refresh_timeline_editor()
+
+    def _timeline_add_scene_dialog(self):
+        """Open a dialog letting the user restore previously removed scenes."""
+        excluded = list(self.timeline_excluded_scene_ids or [])
+        if not excluded:
+            messagebox.showinfo("Add Scene", "No removed scenes to restore.")
+            return
+
+        # Build lookup of excluded scenes that have rendered output
+        restorable = []
+        for scene in (self.scene_timeline or []):
+            sid = scene.get("scene_id", "")
+            if sid not in excluded:
+                continue
+            output_path = scene.get("output_path", "") or ""
+            if not output_path:
+                for v in (scene.get("output_versions") or []):
+                    if v.get("is_active"):
+                        output_path = v.get("path", "")
+                        break
+                if not output_path and scene.get("output_versions"):
+                    output_path = scene["output_versions"][0].get("path", "")
+            if not output_path or not os.path.exists(output_path):
+                continue
+            excerpt = (scene.get("prompt_text") or "")[:60]
+            order = int(scene.get("order_index") or 0)
+            restorable.append((sid, order, excerpt))
+
+        if not restorable:
+            messagebox.showinfo("Add Scene", "No removed scenes with video output to restore.")
+            return
+
+        restorable.sort(key=lambda t: t[1])
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Add Scene to Timeline")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+        bg = self.colors["surface"]
+        dlg.configure(bg=bg)
+
+        tk.Label(
+            dlg, text="Select scenes to restore:",
+            bg=bg, fg=self.colors["text"],
+            font=self.fonts["body_strong"]
+        ).pack(padx=16, pady=(14, 6), anchor="w")
+
+        list_frame = tk.Frame(dlg, bg=bg)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 8))
+
+        scrollbar = tk.Scrollbar(list_frame, orient="vertical")
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        listbox = tk.Listbox(
+            list_frame,
+            selectmode=tk.MULTIPLE,
+            bg=self.colors.get("input_bg", self.colors["surface"]),
+            fg=self.colors["text"],
+            selectbackground=self.colors["accent"],
+            selectforeground=self.colors["text"],
+            font=self.fonts["body"],
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=self.colors["border"],
+            yscrollcommand=scrollbar.set,
+            width=52,
+            height=min(12, len(restorable))
+        )
+        listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.config(command=listbox.yview)
+
+        scene_ids_ordered = []
+        for sid, order, excerpt in restorable:
+            label = f"Scene {order:02d}  —  {excerpt}{'…' if len(excerpt) == 60 else ''}"
+            listbox.insert(tk.END, label)
+            scene_ids_ordered.append(sid)
+
+        # Pre-select all
+        listbox.select_set(0, tk.END)
+
+        btn_row = tk.Frame(dlg, bg=bg)
+        btn_row.pack(fill=tk.X, padx=16, pady=(0, 14))
+
+        def _confirm():
+            selected_indices = listbox.curselection()
+            if not selected_indices:
+                dlg.destroy()
+                return
+            to_restore = {scene_ids_ordered[i] for i in selected_indices}
+            self._push_timeline_undo()
+            self.timeline_excluded_scene_ids = [
+                sid for sid in (self.timeline_excluded_scene_ids or [])
+                if sid not in to_restore
+            ]
+            dlg.destroy()
+            self._save_timeline_arrangement()
+            self.refresh_timeline_editor()
+
+        confirm_btn = tk.Button(btn_row, text="Restore Selected", command=_confirm)
+        confirm_btn.pack(side=tk.RIGHT, padx=(6, 0))
+        self._style_button(confirm_btn, "primary")
+
+        cancel_btn = tk.Button(btn_row, text="Cancel", command=dlg.destroy)
+        cancel_btn.pack(side=tk.RIGHT)
+        self._style_button(cancel_btn, "ghost")
+
+        dlg.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - dlg.winfo_width()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - dlg.winfo_height()) // 2
+        dlg.geometry(f"+{x}+{y}")
+
     def _timeline_card_edge_scroll_tick(self):
         """Timer callback: scroll the timeline canvas while a card is held at the edge."""
         state = self._timeline_drag_state
@@ -11734,6 +13392,17 @@ class LTXQueueManager:
         cx = c.canvasx(event.x)
         cy = c.canvasy(event.y)
 
+        # ── Transition badge click (checked first to take priority) ──────
+        for item in c.find_overlapping(cx - 5, cy - 5, cx + 5, cy + 5):
+            for t in c.gettags(item):
+                if t.startswith("transition_") and t != "transition_badge":
+                    parts = t[len("transition_"):]
+                    if "___" in parts:
+                        id_a, id_b = parts.split("___", 1)
+                        self.root.after(0, lambda a=id_a, b=id_b:
+                                        self._timeline_transition_dialog(a, b))
+                        return
+
         # ── Scrub mode: click in ruler/audio zone OR anywhere near playhead ──
         SCRUB_ZONE = self._TL_RULER_H + self._TL_AUDIO_H
         near_playhead = (
@@ -11750,6 +13419,52 @@ class LTXQueueManager:
             self._timeline_update_time_label(pos)
             self._timeline_drag_state = {"mode": "scrub", "was_playing": was_playing}
             return
+
+        # ── Trim handle drag: click within 18px of a curtain boundary handle ──
+        TRIM_W = 18
+        CARD_Y_TL = self._TL_RULER_H + self._TL_AUDIO_H + 6
+        if cy > CARD_Y_TL:
+            for _sc, _sx, _sw in getattr(self, "_timeline_current_scenes", []):
+                _sid    = _sc["scene_id"]
+                _pps    = self.timeline_px_per_second
+                # Read live trim values — not the stale _sc snapshot — so
+                # re-grabbing after a drag uses the correct current position.
+                _live   = self.timeline_clip_trims.get(_sid, {})
+                _ti     = max(0.0, float(_live.get("trim_in",  0.0)))
+                _to     = max(0.0, float(_live.get("trim_out", 0.0)))
+                _raw    = _sc.get("raw_duration", _sc.get("duration", 5.0))
+                _hx_in  = _sx + int(_ti * _pps)           # left curtain boundary
+                _hx_out = _sx + _sw - int(_to * _pps)     # right curtain boundary
+                if abs(cx - _hx_in) <= TRIM_W:
+                    self._push_timeline_undo()
+                    if self._timeline_playback_active:
+                        self._timeline_pause()
+                    self._timeline_drag_state = {
+                        "mode": "trim",
+                        "scene_id": _sid,
+                        "edge": "trim_in",
+                        "start_x": cx,
+                        "pps": _pps,
+                        "initial_trim_in": _ti,
+                        "initial_trim_out": _to,
+                        "raw_duration": _raw,
+                    }
+                    return
+                if abs(cx - _hx_out) <= TRIM_W:
+                    self._push_timeline_undo()
+                    if self._timeline_playback_active:
+                        self._timeline_pause()
+                    self._timeline_drag_state = {
+                        "mode": "trim",
+                        "scene_id": _sid,
+                        "edge": "trim_out",
+                        "start_x": cx,
+                        "pps": _pps,
+                        "initial_trim_in": _ti,
+                        "initial_trim_out": _to,
+                        "raw_duration": _raw,
+                    }
+                    return
 
         # ── Card drag mode: click on a scene clip ─────────────────────────
         items = c.find_overlapping(cx - 2, cy - 2, cx + 2, cy + 2)
@@ -11810,6 +13525,26 @@ class LTXQueueManager:
                     c.xview_moveto(min(1.0, lo + speed))
             return
 
+        # ── Trim handle drag move ────────────────────────────────────────
+        if self._timeline_drag_state.get("mode") == "trim":
+            state = self._timeline_drag_state
+            pps      = state["pps"]
+            raw_dur  = state["raw_duration"]
+            init_ti  = state["initial_trim_in"]
+            init_to  = state["initial_trim_out"]
+            dx       = cx - state["start_x"]
+            sid      = state["scene_id"]
+            if state["edge"] == "trim_in":
+                new_ti = max(0.0, min(raw_dur - init_to - 0.1, init_ti + dx / pps))
+                self.timeline_clip_trims.setdefault(sid, {})["trim_in"] = new_ti
+            else:
+                new_to = max(0.0, min(raw_dur - init_ti - 0.1, init_to - dx / pps))
+                self.timeline_clip_trims.setdefault(sid, {})["trim_out"] = new_to
+            # Fast live curtain update — only redraws the overlay items for this
+            # card (~6 canvas ops).  No thumbnails touched, no throttle needed.
+            self._timeline_redraw_trim_overlay(sid)
+            return
+
         # Card drag
         dx = cx - self._timeline_drag_state["last_x"]
         scene_id = self._timeline_drag_state["scene_id"]
@@ -11855,6 +13590,17 @@ class LTXQueueManager:
                 self._timeline_play()
             return
 
+        # ── Trim release ─────────────────────────────────────────────────
+        if state.get("mode") == "trim":
+            # Clean up zero-value entries
+            sid = state["scene_id"]
+            trims = self.timeline_clip_trims.get(sid, {})
+            if trims.get("trim_in", 0.0) == 0.0 and trims.get("trim_out", 0.0) == 0.0:
+                self.timeline_clip_trims.pop(sid, None)
+            self._save_timeline_arrangement()
+            self.refresh_timeline_editor()
+            return
+
         # ── Card drag release ─────────────────────────────────────────────
         scene_id    = state["scene_id"]
         was_playing = state["was_playing"]
@@ -11893,6 +13639,7 @@ class LTXQueueManager:
                 cx_card = orig_x + sc_w / 2
             card_centers.append((cx_card, sc))
         card_centers.sort(key=lambda t: t[0])
+        self._push_timeline_undo()
         self.timeline_arrangement = [sc["scene_id"] for _, sc in card_centers]
         self._save_timeline_arrangement()
 
@@ -11928,6 +13675,34 @@ class LTXQueueManager:
         )
         self.timeline_refresh_btn.pack(side=tk.LEFT, padx=(0, 4))
         self._style_button(self.timeline_refresh_btn, "ghost", compact=True)
+
+        self.timeline_add_scene_btn = tk.Button(
+            self.timeline_toolbar_frame, text="\u002b  Add Scene",
+            command=self._timeline_add_scene_dialog
+        )
+        self.timeline_add_scene_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self._style_button(self.timeline_add_scene_btn, "ghost", compact=True)
+
+        self.timeline_import_video_btn = tk.Button(
+            self.timeline_toolbar_frame, text="\u2b06  Import Video",
+            command=self._timeline_import_video
+        )
+        self.timeline_import_video_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self._style_button(self.timeline_import_video_btn, "ghost", compact=True)
+
+        self.timeline_undo_btn = tk.Button(
+            self.timeline_toolbar_frame, text="\u21a9  Undo",
+            command=self._timeline_undo
+        )
+        self.timeline_undo_btn.pack(side=tk.LEFT, padx=(0, 2))
+        self._style_button(self.timeline_undo_btn, "ghost", compact=True)
+
+        self.timeline_redo_btn = tk.Button(
+            self.timeline_toolbar_frame, text="\u21aa  Redo",
+            command=self._timeline_redo
+        )
+        self.timeline_redo_btn.pack(side=tk.LEFT, padx=(0, 8))
+        self._style_button(self.timeline_redo_btn, "ghost", compact=True)
 
         self.timeline_zoom_in_btn = tk.Button(
             self.timeline_toolbar_frame, text="+ Zoom",
@@ -12077,6 +13852,24 @@ class LTXQueueManager:
         self.timeline_canvas.bind("<Button-4>", self._timeline_canvas_mousewheel)
         self.timeline_canvas.bind("<Button-5>", self._timeline_canvas_mousewheel)
 
+        # ── Keyboard shortcuts (active when timeline tab is current) ────────
+        def _tl_guard(fn):
+            """Only invoke fn when the Timeline tab is selected."""
+            def _wrapped(event=None):
+                try:
+                    if self.notebook.select() != str(self.timeline_tab):
+                        return
+                except Exception:
+                    pass
+                fn()
+            return _wrapped
+
+        self.root.bind("<Control-z>", lambda e: _tl_guard(self._timeline_undo)())
+        self.root.bind("<Control-Z>", lambda e: _tl_guard(self._timeline_undo)())
+        self.root.bind("<Control-y>", lambda e: _tl_guard(self._timeline_redo)())
+        self.root.bind("<Control-Shift-Z>", lambda e: _tl_guard(self._timeline_redo)())
+        self.root.bind("<Control-Shift-z>", lambda e: _tl_guard(self._timeline_redo)())
+
         # Status bar
         self.timeline_status_row = tk.Frame(self.timeline_tab, padx=14, pady=3)
         self.timeline_status_row.pack(fill=tk.X)
@@ -12102,11 +13895,11 @@ class LTXQueueManager:
 
     def _export_timeline_video(self):
         scenes = self._get_timeline_ordered_scenes()
-        filepaths = [
-            sc["clip_path"] for sc in scenes
+        valid_scenes = [
+            sc for sc in scenes
             if sc.get("clip_path") and os.path.exists(sc.get("clip_path", ""))
         ]
-        if not filepaths:
+        if not valid_scenes:
             messagebox.showwarning("No Clips", "No video clips found in the timeline.")
             return
 
@@ -12121,28 +13914,131 @@ class LTXQueueManager:
         self.timeline_export_btn.config(state=tk.DISABLED)
         self.timeline_status_label.config(text="Exporting timeline video…")
 
+        # Snapshot mutable state for the background thread.
+        trims_snap       = dict(self.timeline_clip_trims)
+        transitions_snap = dict(self.timeline_transitions)
+
         def _do_export():
             stitch_out = None
             try:
                 timestamp = int(time.time())
-                list_file = f"timeline_concat_{timestamp}.txt"
-                try:
-                    with open(list_file, "w", encoding="utf-8") as f:
-                        for p in filepaths:
-                            f.write(f"file '{p.replace(chr(92), '/')}'\n")
-                    stitch_out = os.path.join(self.stitched_dir, f"timeline_export_{timestamp}.mp4")
-                    cmd = [
-                        FFMPEG_PATH, "-y", "-f", "concat", "-safe", "0",
-                        "-i", list_file, "-c:v", "copy", "-an", stitch_out
-                    ]
-                    subprocess.run(cmd, creationflags=subprocess.CREATE_NO_WINDOW,
-                                   capture_output=True, text=True, check=True)
-                finally:
-                    if os.path.exists(list_file):
-                        try:
-                            os.remove(list_file)
-                        except Exception:
-                            pass
+
+                # Decide fast-path vs. re-encode.
+                # Only treat as "has trims" when at least one clip has a non-zero trim
+                # value — a {trim_in:0.0, trim_out:0.0} entry is truthy but meaningless.
+                has_trims = any(
+                    float(trims_snap.get(sc["scene_id"], {}).get("trim_in",  0)) > 0 or
+                    float(trims_snap.get(sc["scene_id"], {}).get("trim_out", 0)) > 0
+                    for sc in valid_scenes
+                )
+                has_xfade = any(t.get("type") == "xfade" for t in transitions_snap.values())
+
+                stitch_out = os.path.join(self.stitched_dir, f"timeline_export_{timestamp}.mp4")
+
+                if not has_trims and not has_xfade:
+                    # ── Fast path: stream-copy concat ──────────────────────
+                    list_file = f"timeline_concat_{timestamp}.txt"
+                    try:
+                        with open(list_file, "w", encoding="utf-8") as f:
+                            for sc in valid_scenes:
+                                p = sc["clip_path"].replace("\\", "/")
+                                f.write(f"file '{p}'\n")
+                        cmd = [
+                            FFMPEG_PATH, "-y", "-f", "concat", "-safe", "0",
+                            "-i", list_file, "-c:v", "copy", "-an", stitch_out,
+                        ]
+                        subprocess.run(cmd, creationflags=subprocess.CREATE_NO_WINDOW,
+                                       capture_output=True, text=True, check=True)
+                    finally:
+                        if os.path.exists(list_file):
+                            try:
+                                os.remove(list_file)
+                            except Exception:
+                                pass
+
+                else:
+                    # ── Complex filtergraph: trims + optional xfade ─────────
+                    N            = len(valid_scenes)
+                    inputs_cmd   = []
+                    filter_parts = []
+                    eff_durs     = []
+
+                    for i, sc in enumerate(valid_scenes):
+                        raw_dur = max(0.1, sc.get("raw_duration") or sc.get("duration") or 5.0)
+                        trims   = trims_snap.get(sc["scene_id"], {})
+                        ti      = max(0.0, float(trims.get("trim_in",  0.0)))
+                        to_     = max(0.0, float(trims.get("trim_out", 0.0)))
+                        eff     = max(0.1, raw_dur - ti - to_)
+                        eff_durs.append(eff)
+                        end_sec = min(raw_dur, ti + eff)
+                        # No input-level -ss/-to: use the filtergraph trim filter instead.
+                        # Input seeking + xfade causes timestamp mismatches; trim filter
+                        # is designed to work with downstream filters like xfade/concat.
+                        # fps=fps=24 is required after setpts: xfade demands CFR input;
+                        # without it the declared frame rate becomes 1/0 (unknown) and
+                        # xfade rejects the stream. All LTX2 clips are 24 fps.
+                        inputs_cmd += ["-i", sc["clip_path"]]
+                        filter_parts.append(
+                            f"[{i}:v]trim=start={ti:.6f}:end={end_sec:.6f},"
+                            f"setpts=PTS-STARTPTS,fps=fps=24[v{i}]"
+                        )
+
+                    if N == 1:
+                        filter_parts.append("[v0]null[vout]")
+                    else:
+                        current    = "[v0]"
+                        out_offset = 0.0
+                        for i in range(1, N):
+                            id_a   = valid_scenes[i - 1]["scene_id"]
+                            id_b   = valid_scenes[i]["scene_id"]
+                            key    = f"{id_a}___{id_b}"
+                            trans  = transitions_snap.get(key, {})
+                            t_type = trans.get("type", "cut")
+                            t_dur  = max(0.1, float(trans.get("duration", 1.0)))
+                            is_last  = (i == N - 1)
+                            raw_label = "[vout]" if is_last else f"[x{i}]"
+                            if t_type == "xfade":
+                                xfade_name = trans.get("xfade_name", "dissolve")
+                                offset = max(0.0, out_offset + eff_durs[i - 1] - t_dur)
+                                filter_parts.append(
+                                    f"{current}[v{i}]xfade=transition={xfade_name}"
+                                    f":duration={t_dur:.3f}:offset={offset:.3f}{raw_label}"
+                                )
+                                out_offset += eff_durs[i - 1] - t_dur
+                            else:
+                                filter_parts.append(
+                                    f"{current}[v{i}]concat=n=2:v=1:a=0{raw_label}"
+                                )
+                                out_offset += eff_durs[i - 1]
+                            # Normalize timebase of intermediate outputs to 1/24 so
+                            # subsequent xfade filters don't get a 1/1000000 vs 1/24 mismatch.
+                            if is_last:
+                                current = raw_label
+                            else:
+                                norm_label = f"[n{i}]"
+                                filter_parts.append(f"{raw_label}fps=fps=24{norm_label}")
+                                current = norm_label
+
+                    filter_complex = "; ".join(filter_parts)
+                    cmd = (
+                        [FFMPEG_PATH, "-y"]
+                        + inputs_cmd
+                        + ["-filter_complex", filter_complex,
+                           "-map", "[vout]",
+                           "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                           "-pix_fmt", "yuv420p",
+                           "-movflags", "+faststart",
+                           "-an", stitch_out]
+                    )
+                    print(f"[EXPORT] filter_complex: {filter_complex}")
+                    print(f"[EXPORT] cmd: {' '.join(cmd)}")
+                    result = subprocess.run(cmd, creationflags=subprocess.CREATE_NO_WINDOW,
+                                           capture_output=True, text=True, check=False)
+                    if result.returncode != 0:
+                        print(f"[EXPORT] FFmpeg stderr:\n{result.stderr}")
+                        raise subprocess.CalledProcessError(
+                            result.returncode, cmd, result.stdout, result.stderr
+                        )
 
                 final_out = stitch_out
                 if merge_audio and stitch_out and os.path.exists(stitch_out):
@@ -12168,16 +14064,31 @@ class LTXQueueManager:
                     if messagebox.askyesno("Open File?",
                                            f"Open the exported video?\n\n{os.path.basename(out)}"):
                         self.play_video(out)
-
                 self.root.after(0, _done)
 
             except subprocess.CalledProcessError as e:
-                def _err():
+                if stitch_out and os.path.exists(stitch_out):
+                    try:
+                        os.remove(stitch_out)
+                    except OSError:
+                        pass
+                _stderr = e.stderr or ""
+                # Show only the last 50 lines so the actual error is visible
+                # (FFmpeg probe output fills the beginning of stderr).
+                _lines = _stderr.strip().splitlines()
+                _tail  = "\n".join(_lines[-50:]) if len(_lines) > 50 else _stderr
+                print(f"[EXPORT] CalledProcessError rc={e.returncode}\n{_stderr}")
+                def _err(msg=_tail):
                     self.timeline_export_btn.config(state=tk.NORMAL)
                     self.timeline_status_label.config(text="Export failed.")
-                    messagebox.showerror("Export Error", f"FFmpeg error:\n{e.stderr}")
+                    messagebox.showerror("Export Error", f"FFmpeg error:\n{msg}")
                 self.root.after(0, _err)
             except Exception as ex:
+                if stitch_out and os.path.exists(stitch_out):
+                    try:
+                        os.remove(stitch_out)
+                    except OSError:
+                        pass
                 def _err2(exc=ex):
                     self.timeline_export_btn.config(state=tk.NORMAL)
                     self.timeline_status_label.config(text=f"Export error: {exc}")
@@ -17395,6 +19306,15 @@ class LTXQueueManager:
             "current_final_video": getattr(self, 'current_final_video', None),
             "autonomous_target_duration": self.autonomous_target_duration,
             "timeline_arrangement": self.timeline_arrangement,
+            "timeline_excluded_scene_ids": list(self.timeline_excluded_scene_ids or []),
+            "timeline_imported_clips": list(self.timeline_imported_clips or []),
+            "timeline_clip_trims": dict(self.timeline_clip_trims or {}),
+            "timeline_transitions": dict(self.timeline_transitions or {}),
+            "timeline_markers": list(self.timeline_markers or []),
+            "timeline_audio_offset": self.timeline_audio_offset,
+            "timeline_audio_fade_in": self.timeline_audio_fade_in,
+            "timeline_audio_fade_out": self.timeline_audio_fade_out,
+            "timeline_export_options": dict(self.timeline_export_options or {}),
         }
         try:
             with open(project_data_file, 'w', encoding='utf-8') as f:
@@ -17463,6 +19383,17 @@ class LTXQueueManager:
                 self.selected_video_for_music = state.get("selected_video_for_music")
                 self.current_final_video = state.get("current_final_video")
                 self.timeline_arrangement = state.get("timeline_arrangement", [])
+                self.timeline_excluded_scene_ids = state.get("timeline_excluded_scene_ids", [])
+                self.timeline_imported_clips = state.get("timeline_imported_clips", [])
+                self.timeline_clip_trims = state.get("timeline_clip_trims", {})
+                self.timeline_transitions = state.get("timeline_transitions", {})
+                self.timeline_markers = state.get("timeline_markers", [])
+                self.timeline_audio_offset = float(state.get("timeline_audio_offset", 0.0))
+                self.timeline_audio_fade_in = float(state.get("timeline_audio_fade_in", 0.0))
+                self.timeline_audio_fade_out = float(state.get("timeline_audio_fade_out", 0.0))
+                saved_export_opts = state.get("timeline_export_options", {})
+                if saved_export_opts:
+                    self.timeline_export_options.update(saved_export_opts)
 
                 # Load Autonomous Mode State
                 saved_auto_dur = state.get("autonomous_target_duration")
