@@ -24,20 +24,21 @@
 
 # Prompt2MTV
 
-[![Version](https://img.shields.io/badge/version-3.3.0-blue)](https://github.com/RorriMaesu/Prompt2MTV/releases/tag/v3.3.0)
+[![Version](https://img.shields.io/badge/version-4.0.0-blue)](https://github.com/RorriMaesu/Prompt2MTV/releases/tag/v4.0.0)
 [![Platform](https://img.shields.io/badge/platform-Windows-lightgrey?logo=windows)](https://github.com/RorriMaesu/Prompt2MTV/releases/latest)
 
-**Local AI Music Video Studio** — Generate video scenes, compose music, and merge them into finished music videos, all from one desktop app powered by ComfyUI.
+**Local AI Video & Music Studio** — Generate video scenes, clone voices, synthesize narration, compose music, and merge them into finished YouTube videos or music videos, all from one desktop app powered by local models and ComfyUI.
 
 ## What It Does
 
 - **AI Video** — Generate scenes with LTX 2.3 (text-to-video and image-to-video)
+- **AI Narration & Voice Cloning** — Sample, clone, and synthesize narration using VibeVoice with custom voices or your own cloned voice
 - **AI Music** — Compose original tracks with ACE-Step 1.5-XL (Turbo or SFT variants)
-- **AI Chatbot** — Plan and refine scene prompts, brainstorm song concepts, and generate structured lyrics with a local Qwen 3 or Gemma 4 assistant
-- **Autonomous Mode** — One-click pipeline that takes a creative brief and automatically generates all scenes, composes music, and merges the final video
+- **AI Chatbot** — Plan and refine scene prompts, brainstorm script/song concepts, and generate structured scripts or lyrics with a local Qwen 3 or Gemma 4 assistant
+- **Autonomous Mode** — One-click pipeline that takes a creative brief and automatically generates all scenes, narrations, backing tracks, and merge them (supports both **YouTube Video** and **Music Video** project modes)
 - **Agentic Quality Control** — Selective thinking mode, per-scene confidence scoring with auto-retry, and batch continuity review with targeted regeneration
-- **One-click merge** — Stitch clips **with custom transition effects**, sync audio, and export final music videos
-- **Timeline Editor NLE** — Drag-and-drop non-linear editor: reorder clips, **trim video lengths**, preview video with transport controls, overlay audio, zoom in/out, and export directly from the editor
+- **One-click merge** — Stitch clips **with custom transition effects**, sync audio, and export final videos
+- **Timeline Editor NLE** — Drag-and-drop non-linear editor: reorder clips, **trim video lengths**, preview video with transport controls, overlay narration and backing audio, zoom in/out, and export directly from the editor
 - **Project management** — Batch prompt queue, media gallery, drag-and-drop import, per-project settings
 
 ## Screenshots
@@ -115,22 +116,35 @@ If ComfyUI is in a non-default location, use **Project → Configure Runtime Pat
 ## Workflow
 
 1. Create or open a project
-2. *(Optional)* Use the AI chatbot to brainstorm and structure scene prompts or song lyrics
-3. **Autonomous mode** — Enter a creative brief, set the target duration, and click Start. The app handles everything from scene generation through final merge.
-4. **Or go manual** — Add prompts to the batch queue, generate scenes, review in the gallery, stitch clips, generate music, and merge manually.
+2. Select your **Project Mode** in the settings tab: **YouTube Video Creator** (for narrated content) or **Music Video Studio (MTV)** (for music-centric videos).
+3. *(Optional)* Use the AI chatbot to brainstorm script ideas, scene outlines, visual pacing, or song lyrics.
+4. **Autonomous Mode** — Enter a creative brief, set target duration, and click Start. The pipeline handles all generation and compilation.
+5. **Or Go Manual** — Queue custom prompts, generate video clips, record narration, compose backing tracks, and arrange them on the Timeline Editor.
 
-### Autonomous Mode
+### Autonomous Workflows
 
-Autonomous mode lives in the Chatbot tab under the collapsible **Autonomous Mode** section. Write a short creative brief describing the music video you want, set the target duration in seconds, choose an **AI Quality** preset, and click **Start**. The app will:
+Autonomous mode lives in the Chatbot tab under the collapsible **Autonomous Mode** section. Write a creative brief, set the target duration in seconds, choose an **AI Quality** preset, and click **Start**.
 
-1. Expand your brief into a full creative concept (visual style, color palette, motifs, narrative arc)
-2. Generate image and video prompts for each scene — enriched with concept context, song lyrics, and continuity from previous scenes
-3. Self-assess each prompt with a confidence score and auto-retry weak results
-4. *(Quality preset)* Run a batch continuity review across all prompts and regenerate up to 3 weak scenes
-5. Generate images and videos through ComfyUI
-6. Stitch clips together
-7. Compose a matching soundtrack with ACE-Step
-8. Merge audio and video into the final music video
+#### 📺 YouTube Video Automation (Step-by-Step)
+If your project is set to **YouTube Video Creator** mode, the pipeline executes the following steps:
+1. **Expand Concept** — Enriches your brief into a full visual direction (narrative arc, tone, styling cues).
+2. **Write Script** — The chatbot writes a paragraph-by-paragraph voiceover script tailored to fit your target duration.
+3. **Brainstorm Scenes** — Brainstorms visual prompts (composition, lighting, motion descriptors) matching each script segment.
+4. **Generate Voiceovers** — Synthesizes narrator speech using the selected or cloned voice.
+5. **Generate Video Scenes** — Renders all visual assets sequentially via ComfyUI (LTX 2.3).
+6. **Stitch Video** — Stitches all rendered scenes into a continuous video.
+7. **Compose backing music** — Generates a subtle background instrumental track using ACE-Step.
+8. **Final Mix & Merge** — Blends the voiceover narration, background music (ducked automatically to not overpower the voice), and the video scenes.
+
+#### 🎵 Music Video (MTV) Automation (Step-by-Step)
+If your project is set to **Music Video Studio (MTV)** mode, the pipeline executes the following steps:
+1. **Expand Concept** — Refines the video concept and themes.
+2. **Write Lyrics** — Brainstorms song structure, genres, and lyrics matching your brief.
+3. **Outlines Scenes** — Creates storyboard scene descriptions based on the lyric segments.
+4. **Generate Video Scenes** — Renders still images and LTX 2.3 motion clips via ComfyUI.
+5. **Stitch Video** — Combines all rendered scenes.
+6. **Compose Music** — Generates a full-volume, original vocal/instrumental track with ACE-Step.
+7. **Final Merge** — Combines the stitched video and the soundtrack.
 
 #### AI Quality Presets
 
@@ -140,11 +154,22 @@ Autonomous mode lives in the Chatbot tab under the collapsible **Autonomous Mode
 | **Balanced** | Planning tasks only | ≥ 6 (auto-retry once) | Off |
 | **Quality** | Planning tasks only | ≥ 7 (auto-retry once) | Full review + targeted regen |
 
-- **Thinking mode** uses Gemma 4's native thinking capability on concept expansion, scene outlining, and song brainstorming — giving the model time to reason before committing to an answer.
+- **Thinking mode** uses Gemma 4's native thinking capability on concept expansion, scene outlining, and song/script brainstorming.
 - **Confidence scoring** asks the model to rate each generated prompt (1–10). Prompts below the threshold are automatically regenerated once.
-- **Batch review** examines all prompts together for visual coherence, narrative flow, and style consistency, then regenerates the weakest scenes.
+- **Batch review** examines all prompts together for visual coherence and narrative consistency, then regenerates the weakest scenes.
 
-A readiness indicator shows when ComfyUI is online. If you click Start before it's ready, the status label flashes to let you know. Once ComfyUI history is available, an ETA countdown appears during startup based on previous launch times.
+### 🎙️ 15-Second Voice Cloning Setup (VibeVoice)
+
+You can clone your own voice (or sample any voice) to use as the narrator for YouTube automation in about 15 seconds:
+
+1. In the Project menu or the YouTube settings frame, click **Voice Cloning Setup Wizard**.
+2. Select **Create New Profile...** and type a speaker name.
+3. Select your recording microphone from the dropdown list.
+4. Click **🔴 Start Recording** and read the short passage on the screen clearly:
+   > *"Antigravity is a powerful AI coding assistant designed by Google DeepMind. We are pair programming to create amazing tools, generating videos, music, and voiceovers. This cloned voice sounds clear and natural, perfect for video production!"*
+5. Click **Stop Recording** when finished. You can click **Play Sample** to listen to the recording.
+6. Type a short test sentence and click **⚙️ Run Verification**. The local VibeVoice engine will synthesize your cloned voice speaking that sentence. Click **Listen to Cloned Test Voice** to verify.
+7. Click **Save and Complete**. The profile is saved and automatically selected as your active narrator!
 
 #### VRAM Management
 
@@ -233,10 +258,10 @@ PyInstaller is installed automatically by the build script; you don't need to in
 
 ```powershell
 .\build_installer.bat
-# Output: dist_installer\Prompt2MTV-Setup-3.3.0.exe
+# Output: dist_installer\Prompt2MTV-Setup-4.0.0.exe
 ```
 
-Run the resulting `Prompt2MTV-Setup-3.3.0.exe` to install the app — it adds a desktop shortcut and Start Menu entry.
+Run the resulting `Prompt2MTV-Setup-4.0.0.exe` to install the app — it adds a desktop shortcut and Start Menu entry.
 
 ### Upgrade helper
 

@@ -29,6 +29,7 @@ except ImportError:
     _ws_mod = None
     WS_AVAILABLE = False
 from model_downloader import DownloadCancelledError, calculate_sha256, download_file, probe_download_size
+from voice_recorder import AudioRecorder, VoiceCloningSetupWizard
 
 try:
     from tkinterdnd2 import COPY, DND_FILES, TkinterDnD
@@ -208,7 +209,7 @@ WINDOWS_HIDE = 0
 WINDOWS_SHOW = 5
 WINDOWS_RESTORE = 9
 APP_NAME = "Prompt2MTV"
-APP_VERSION = "3.3.0"
+APP_VERSION = "4.0.0"
 APP_PUBLISHER = "Prompt2MTV"
 APP_TAGLINE = "Local AI Music Video Studio"
 BUYMEACOFFEE_URL = "https://buymeacoffee.com/rorrimaesu"
@@ -282,6 +283,8 @@ CHATBOT_TASK_JIT_VIDEO_PROMPT = "Generate Video Prompt (JIT)"
 CHATBOT_TASK_SONG_BRAINSTORM = "Brainstorm Song (Lyrics & Style)"
 CHATBOT_TASK_CONCEPT_EXPAND = "Expand Creative Concept"
 CHATBOT_TASK_BATCH_REVIEW = "Review Prompt Batch"
+CHATBOT_TASK_YOUTUBE_SCRIPT = "Write YouTube Voiceover Script"
+CHATBOT_TASK_YOUTUBE_SCENES = "Brainstorm YouTube Visual Scenes"
 BUNDLED_MODEL_DIR = "bundled_models"
 MODEL_SUBDIRECTORIES = {
     "checkpoint_name": "checkpoints",
@@ -370,8 +373,8 @@ VIDEO_MODEL_PRESETS = {
         "workflow_type": "safetensors",
         "checkpoint_name": "ltx-2.3-22b-dev-fp8.safetensors",
         "text_encoder_name": "gemma_3_12B_it_fp4_mixed.safetensors",
-        "lora_name": "ltx-2.3-22b-distilled-lora-384.safetensors",
-        "upscaler_name": "ltx-2.3-spatial-upscaler-x2-1.0.safetensors",
+        "lora_name": "ltx_2.3_22b_distilled_1.1_lora_dynamic_fro09_avg_rank_111_bf16.safetensors",
+        "upscaler_name": "ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
     },
     "custom": {
         "label": "Custom",
@@ -525,30 +528,24 @@ IMAGE_WORKFLOW_PROFILE = {
 
 I2V_WORKFLOW_PROFILES = {
     "safetensors": {
-        "label": "LTX 2.3 Image to Video",
-        "workflow_path": "video_ltx2_3_i2v.json",
+        "label": "LTX 2.3 Image/Audio to Video",
+        "workflow_path": "video_ltx2_3_ia2v.json",
         "roles": {
-            "prompt": {"node_id": "267:266", "input": "value"},
-            "negative_prompt": {"node_id": "267:247", "input": "text"},
-            "width": {"node_id": "267:257", "input": "value"},
-            "height": {"node_id": "267:258", "input": "value"},
-            "fps": {"node_id": "267:260", "input": "value"},
-            "length": {"node_id": "267:225", "input": "value"},
-            "t2v_enabled": {"node_id": "267:201", "input": "value"},
-            "filename_prefix": {"node_id": "273", "input": "filename_prefix"},
-            "noise_seed": [
-                {"node_id": "267:216", "input": "noise_seed"},
-                {"node_id": "267:237", "input": "noise_seed"}
-            ],
-            "checkpoint_name": [
-                {"node_id": "267:221", "input": "ckpt_name"},
-                {"node_id": "267:243", "input": "ckpt_name"},
-                {"node_id": "267:236", "input": "ckpt_name"}
-            ],
-            "text_encoder_name": {"node_id": "267:243", "input": "text_encoder"},
-            "lora_name": {"node_id": "267:232", "input": "lora_name"},
-            "upscaler_name": {"node_id": "267:233", "input": "model_name"},
-            "image_path": {"node_id": "269", "input": "image"}
+            "prompt": {"node_id": "340:319", "input": "string"},
+            "prompt_enhance": {"node_id": "340:349", "input": "value"},
+            "width": {"node_id": "340:330", "input": "value"},
+            "height": {"node_id": "340:324", "input": "value"},
+            "audio_start": {"node_id": "340:332", "input": "start_index"},
+            "duration": {"node_id": "340:331", "input": "value"},
+            "fps": {"node_id": "340:323", "input": "value"},
+            "noise_seed": {"node_id": "340:286", "input": "noise_seed"},
+            "checkpoint_name": {"node_id": "340:317", "input": "ckpt_name"},
+            "distilled_lora": {"node_id": "340:293", "input": "lora_name"},
+            "text_encoder_name": {"node_id": "340:318", "input": "clip_name"},
+            "upscaler_name": {"node_id": "340:313", "input": "upscale_model"},
+            "lora_name": {"node_id": "340:345", "input": "lora_name"},
+            "image_path": {"node_id": "269", "input": "image"},
+            "audio_path": {"node_id": "276", "input": "audio"}
         }
     },
     "gguf": {
@@ -1354,6 +1351,9 @@ class LTXQueueManager:
         self.chatbot_repeat_penalty = DEFAULT_CHATBOT_REPEAT_PENALTY
         self.chatbot_default_to_non_thinking = DEFAULT_CHATBOT_DEFAULT_TO_NON_THINKING
         self.chatbot_auto_launch_server = False
+        self.chatbot_speculative_decoding_enabled = False
+        self.chatbot_draft_model_path = ""
+        self.chatbot_spec_draft_n_max = 4
         self.scene_render_in_progress = False
         self.chatbot_backend_health_text = "Backend check: Not tested yet."
         self.chatbot_discovered_model_ids = []
@@ -1621,6 +1621,18 @@ class LTXQueueManager:
             "--ctx-size",
             str(max(1024, int(self.chatbot_context_size or DEFAULT_CHATBOT_CONTEXT_SIZE))),
         ]
+        if self.chatbot_speculative_decoding_enabled:
+            draft_path = self.chatbot_draft_model_path
+            if draft_path:
+                if not os.path.exists(draft_path):
+                    raise ValueError(f"Speculative decoding is enabled but the draft GGUF model path does not exist: {draft_path}")
+                command.extend(["--draft", draft_path])
+                try:
+                    draft_n = int(self.chatbot_spec_draft_n_max)
+                    if draft_n > 0:
+                        command.extend(["--draft-n", str(draft_n)])
+                except (TypeError, ValueError):
+                    pass
         return command
 
     def _ensure_ollama_model_registered(self, timeout_seconds=180):
@@ -1822,6 +1834,12 @@ class LTXQueueManager:
         }
 
     def _ensure_chatbot_backend_ready_for_use(self, action_label="chatbot request"):
+        if getattr(self, "chatbot_model_warm", False):
+            probe = self._probe_chatbot_backend(timeout_seconds=2)
+            if probe.get("ok"):
+                return probe
+        if self._is_comfyui_running():
+            self._free_comfyui_vram()
         initial_probe = self._probe_chatbot_backend(timeout_seconds=3)
         if initial_probe.get("ok"):
             if self.chatbot_backend_mode == CHATBOT_BACKEND_MODE_OLLAMA:
@@ -1917,6 +1935,9 @@ class LTXQueueManager:
             if model_id and model_id not in model_ids:
                 model_ids.append(model_id)
         if not model_ids:
+            if self.chatbot_backend_mode == CHATBOT_BACKEND_MODE_OLLAMA:
+                self.chatbot_discovered_model_ids = []
+                return []
             raise ValueError("The chatbot backend did not return any model ids from /v1/models.")
         self.chatbot_discovered_model_ids = model_ids
         return model_ids
@@ -2006,6 +2027,8 @@ class LTXQueueManager:
             CHATBOT_TASK_SCENE_PLAN,
             CHATBOT_TASK_T2I_OPTIMIZE,
             CHATBOT_TASK_SONG_BRAINSTORM,
+            CHATBOT_TASK_YOUTUBE_SCRIPT,
+            CHATBOT_TASK_YOUTUBE_SCENES,
         ]
 
     def _get_selected_chatbot_task(self):
@@ -2024,6 +2047,10 @@ class LTXQueueManager:
             return "Use this mode when the creative direction is clear enough to turn into a tighter production-ready image prompt for the image queue."
         if task_label == CHATBOT_TASK_SONG_BRAINSTORM:
             return "Brainstorm song lyrics, hooks, and style tags with the assistant. Chat back and forth to refine ideas, then Finalize to send lyrics and style to the Music tab."
+        if task_label == CHATBOT_TASK_YOUTUBE_SCRIPT:
+            return "Write a paragraph-by-paragraph YouTube voiceover narration script based on your creative idea."
+        if task_label == CHATBOT_TASK_YOUTUBE_SCENES:
+            return "Brainstorm matching visual scenes (T2I & I2V prompts) for each segment of your YouTube voiceover script."
         return "Select a task to see its generation workflow."
 
     def _get_chatbot_task_briefing_hint(self, task_name=None):
@@ -2048,6 +2075,10 @@ class LTXQueueManager:
                 "Describe the mood, genre, theme, or concept for your song. "
                 "Chat naturally to brainstorm lyrics, hooks, and style ideas, then click Finalize Song when ready."
             )
+        if task_label == CHATBOT_TASK_YOUTUBE_SCRIPT:
+            return "Describe your video topic, key talking points, tone, and pacing. The assistant will write a structured narration script."
+        if task_label == CHATBOT_TASK_YOUTUBE_SCENES:
+            return "Provide or reference the voiceover script. The assistant will outline visual scenes (Image & Video prompts) to match each segment."
         return "Describe what you want the chatbot to generate."
 
     def _get_chatbot_task_output_hint(self, task_name=None):
@@ -2060,6 +2091,10 @@ class LTXQueueManager:
             return "Prompt drafts appear here as reusable assistant artifacts. Review the wording, copy it, or send it straight to the Image Phase queue when it is ready."
         if task_label == CHATBOT_TASK_SONG_BRAINSTORM:
             return "Chat to brainstorm lyrics and style ideas. When happy, click Finalize Song to produce sendable lyrics and style tags, then Send to Music Tab."
+        if task_label == CHATBOT_TASK_YOUTUBE_SCRIPT:
+            return "The generated narration script appears here. Review the paragraphs, tweak them, then apply them to write the voiceover tracks."
+        if task_label == CHATBOT_TASK_YOUTUBE_SCENES:
+            return "Matching scene prompts appear here. Review the T2I/I2V prompts, then apply them to the timeline."
         return "Assistant replies and generated results appear here."
 
     def _get_chatbot_task_primary_action_copy(self, task_name=None):
@@ -2070,6 +2105,10 @@ class LTXQueueManager:
             return "Primary action: Generate Prompt Draft"
         if task_label == CHATBOT_TASK_SONG_BRAINSTORM:
             return "Primary action: Send  |  Finalize Song when ready"
+        if task_label == CHATBOT_TASK_YOUTUBE_SCRIPT:
+            return "Primary action: Write Script"
+        if task_label == CHATBOT_TASK_YOUTUBE_SCENES:
+            return "Primary action: Generate Scenes"
         return "Primary action: Send"
 
     def _get_chatbot_empty_state_heading(self, task_name=None):
@@ -2080,6 +2119,10 @@ class LTXQueueManager:
             return "Prompt drafting starts here"
         if task_label == CHATBOT_TASK_SONG_BRAINSTORM:
             return "Song brainstorming starts here"
+        if task_label == CHATBOT_TASK_YOUTUBE_SCRIPT:
+            return "YouTube scriptwriting starts here"
+        if task_label == CHATBOT_TASK_YOUTUBE_SCENES:
+            return "YouTube scene outline starts here"
         return "Conversation starts here"
 
     def _get_chatbot_empty_state_text(self, task_name=None):
@@ -2090,6 +2133,10 @@ class LTXQueueManager:
             return "Summarize the strongest visual direction here, then use Generate Prompt Draft when you want a tighter image prompt."
         if task_label == CHATBOT_TASK_SONG_BRAINSTORM:
             return "Describe your song concept, mood, or genre and start chatting. The assistant will help brainstorm lyrics and style ideas. Click Finalize Song when you are happy."
+        if task_label == CHATBOT_TASK_YOUTUBE_SCRIPT:
+            return "Enter your video idea and outline points, then click Write Script to generate the paragraph narration script."
+        if task_label == CHATBOT_TASK_YOUTUBE_SCENES:
+            return "Reference or paste your script, then click Generate Scenes to brainstorm visual prompts matching each paragraph."
         return "Start a conversation here. Explore the idea naturally before you ask for a structured plan or prompt draft."
 
     def _get_chatbot_idle_status_text(self, task_name=None):
@@ -3378,6 +3425,10 @@ class LTXQueueManager:
             self.chatbot_apply_btn.config(
                 text="Apply Plan to Scene Timeline"
                 if task_label == CHATBOT_TASK_SCENE_PLAN or task_label == "scene_plan"
+                else "Apply Scenes to Timeline"
+                if task_label == CHATBOT_TASK_YOUTUBE_SCENES or task_label == "youtube_scenes"
+                else "Apply Script to Timeline"
+                if task_label == CHATBOT_TASK_YOUTUBE_SCRIPT or task_label == "youtube_script"
                 else "Add Prompt to Image Queue"
             )
         if hasattr(self, "chatbot_apply_scene_btn"):
@@ -3481,12 +3532,56 @@ class LTXQueueManager:
         repaired = text[:last_good + 1]
         if in_string:
             repaired += '"'
+        # Strip trailing commas that would invalidate the JSON after we close brackets/braces.
+        repaired = re.sub(r',\s*$', '', repaired)
         while bracket_depth > 0:
             repaired += ']'
             bracket_depth -= 1
         while brace_depth > 0:
             repaired += '}'
             brace_depth -= 1
+        # Strip any trailing commas that ended up just before a closing bracket/brace.
+        repaired = re.sub(r',(\s*[}\]])', r'\1', repaired)
+
+        # First attempt: try parsing the repaired text directly.
+        try:
+            json.loads(repaired)
+            return repaired
+        except json.JSONDecodeError:
+            pass
+
+        # Progressive truncation: peel off the last incomplete element up to 5 times.
+        candidate = repaired
+        for _ in range(5):
+            # Remove the last partial object or value — look for the last "},", "],"
+            # or trailing key-value after the last complete element.
+            cut = max(
+                candidate.rfind('},'),
+                candidate.rfind('],'),
+            )
+            if cut <= 0:
+                break
+            candidate = candidate[:cut + 1]  # keep the } or ]
+            # Strip trailing commas and re-close
+            candidate = re.sub(r',\s*$', '', candidate)
+            # Count remaining open brackets/braces
+            remaining_braces = candidate.count('{') - candidate.count('}')
+            remaining_brackets = candidate.count('[') - candidate.count(']')
+            closed = candidate
+            while remaining_brackets > 0:
+                closed += ']'
+                remaining_brackets -= 1
+            while remaining_braces > 0:
+                closed += '}'
+                remaining_braces -= 1
+            closed = re.sub(r',(\s*[}\]])', r'\1', closed)
+            try:
+                json.loads(closed)
+                return closed
+            except json.JSONDecodeError:
+                candidate = closed
+                continue
+        # Return best effort — caller will get the JSONDecodeError with details.
         return repaired
 
     def _get_chatbot_task_config(self, task_name):
@@ -3979,6 +4074,151 @@ class LTXQueueManager:
                 "user_prompt_template": user_prompt_template,
             }
 
+        if task_label == CHATBOT_TASK_YOUTUBE_SCRIPT:
+            schema_hint = {
+                "task": "youtube_script",
+                "title": "Short title for the YouTube video",
+                "intro": "Hook / opening narration segment",
+                "segments": [
+                    {
+                        "segment_number": 1,
+                        "voiceover_text": "Narration text for this paragraph of the video.",
+                        "topic": "Main idea of this segment",
+                        "visual_theme_hint": "Brief mood/setting hint for visual matching"
+                    }
+                ]
+            }
+            json_schema = {
+                "name": "prompt2mtv_youtube_script",
+                "schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "task": {"type": "string", "const": "youtube_script"},
+                        "title": {"type": "string"},
+                        "intro": {"type": "string"},
+                        "segments": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "segment_number": {"type": "integer"},
+                                    "voiceover_text": {"type": "string"},
+                                    "topic": {"type": "string"},
+                                    "visual_theme_hint": {"type": "string"}
+                                },
+                                "required": ["segment_number", "voiceover_text", "topic", "visual_theme_hint"]
+                            }
+                        }
+                    },
+                    "required": ["task", "title", "intro", "segments"]
+                }
+            }
+            user_prompt_template = (
+                "Task: write a complete voiceover script for a YouTube video.\n\n"
+                "Video idea:\n__BRIEFING_TEXT__\n\n"
+                "Produce exactly this JSON schema:\n"
+                f"{json.dumps(schema_hint, indent=2)}\n\n"
+                "SCRIPT GUIDELINES:\n"
+                "- Write engaging, conversational voiceover narration.\n"
+                "- Structure the script paragraph by paragraph. Each paragraph is a segment.\n"
+                "- For each segment, provide the exact voiceover text, the core topic, and a brief visual theme hint (e.g. 'moody workshop', 'futuristic space deck').\n"
+                "- Keep the segments logically ordered to build a compelling narrative.\n"
+                "- Avoid markdown and avoid prose outside JSON.\n"
+            )
+            return {
+                "label": CHATBOT_TASK_YOUTUBE_SCRIPT,
+                "output_task": "youtube_script",
+                "required_fields": ["task", "title", "intro", "segments"],
+                "non_empty_fields": ["task", "title", "intro"],
+                "max_tokens": 8192,
+                "timeout": 300,
+                "json_schema": json_schema,
+                "allow_thinking": False,
+                "system_prompt": (
+                    "You are a professional YouTube video scriptwriter. "
+                    "You write engaging, conversational, and informative voiceover scripts structured paragraph-by-paragraph. "
+                    "Return only a JSON object with no markdown fences, no prose outside JSON, and no extra keys."
+                ),
+                "user_prompt_template": user_prompt_template,
+            }
+
+        if task_label == CHATBOT_TASK_YOUTUBE_SCENES:
+            schema_hint = {
+                "task": "youtube_scenes",
+                "scenes": [
+                    {
+                        "segment_number": 1,
+                        "title": "Scene title",
+                        "image_prompt": "Detailed text-to-image prompt matching the segment's narration",
+                        "video_prompt": "Motion description for animating the still image into video",
+                        "avatar_enabled": False,
+                        "notes": "Optional transition or visual pace note"
+                    }
+                ]
+            }
+            json_schema = {
+                "name": "prompt2mtv_youtube_scenes",
+                "schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "task": {"type": "string", "const": "youtube_scenes"},
+                        "scenes": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "segment_number": {"type": "integer"},
+                                    "title": {"type": "string"},
+                                    "image_prompt": {"type": "string"},
+                                    "video_prompt": {"type": "string"},
+                                    "avatar_enabled": {"type": "boolean"},
+                                    "notes": {"type": "string"}
+                                },
+                                "required": ["segment_number", "title", "image_prompt", "video_prompt", "avatar_enabled", "notes"]
+                            }
+                        }
+                    },
+                    "required": ["task", "scenes"]
+                }
+            }
+            user_prompt_template = (
+                "Task: brainstorm visual scenes for each paragraph segment of a YouTube video script.\n\n"
+                "YouTube script and context:\n__BRIEFING_TEXT__\n\n"
+                "Produce exactly this JSON schema:\n"
+                f"{json.dumps(schema_hint, indent=2)}\n\n"
+                "SCENE PLANNING GUIDELINES:\n"
+                "- For each paragraph segment in the script, generate one matching visual scene.\n"
+                "- Determine if the segment features on-screen spoken narration where a spokesperson/avatar should talk directly to the viewer. "
+                "Set 'avatar_enabled' to true if the segment introduces the host, introduces a website/calculator, calls to action, or directly explains a key feature. "
+                "Otherwise, set 'avatar_enabled' to false for general background visuals.\n"
+                "- Image prompts should describe striking still frames (composition, subject, style, lighting).\n"
+                "- Video prompts should describe camera and subject motion (e.g. speaking gestures, head tilt, subtle breathing, lip sync/facial expressions for avatars; or panning/zoom/lighting changes for general visuals).\n"
+                "- Keep the visual styles cohesive throughout all scenes.\n"
+                "- Avoid markdown and avoid prose outside JSON.\n"
+            )
+            return {
+                "label": CHATBOT_TASK_YOUTUBE_SCENES,
+                "output_task": "youtube_scenes",
+                "required_fields": ["task", "scenes"],
+                "non_empty_fields": ["task"],
+                "max_tokens": 8192,
+                "timeout": 300,
+                "json_schema": json_schema,
+                "allow_thinking": False,
+                "system_prompt": (
+                    "You are a professional visual storyboarder and director. "
+                    "For each script segment, you brainstorm an image still concept, whether to use an avatar, and I2V motion instructions. "
+                    "Return only a JSON object with no markdown fences, no prose outside JSON, and no extra keys."
+                ),
+                "user_prompt_template": user_prompt_template,
+            }
+
         if task_label != CHATBOT_TASK_T2I_OPTIMIZE:
             raise ValueError(f"Unsupported chatbot task: {task_label}")
 
@@ -4034,44 +4274,57 @@ class LTXQueueManager:
         if not isinstance(parsed_output, dict):
             raise ValueError("The chatbot response JSON must be an object.")
 
-        if str(task_config.get("output_task") or "").strip() in ("scene_plan", "scene_outline"):
-            is_outline = str(task_config.get("output_task") or "").strip() == "scene_outline"
+        expected_task = str(task_config.get("output_task") or "").strip()
+        if expected_task:
+            if "task" not in parsed_output or not parsed_output.get("task"):
+                parsed_output["task"] = expected_task
+
+        # Helper function to get value with synonym keys
+        def get_field_any(obj, keys, default=""):
+            for k in keys:
+                if k in obj and obj[k] is not None:
+                    val = str(obj[k]).strip()
+                    if val:
+                        return val
+            return default
+
+        output_task = str(task_config.get("output_task") or "").strip()
+
+        if output_task in ("scene_plan", "scene_outline"):
+            is_outline = output_task == "scene_outline"
             expected_task_name = "scene_outline" if is_outline else "scene_plan"
             validated_output = {}
-            for field_name in task_config.get("required_fields", []):
-                if field_name not in parsed_output:
-                    raise ValueError(f"The chatbot response is missing required field '{field_name}'.")
-            validated_output["task"] = str(parsed_output.get("task") or "").strip()
-            validated_output["title"] = str(parsed_output.get("title") or "").strip()
-            validated_output["planning_rationale"] = str(parsed_output.get("planning_rationale") or "").strip()
-            if validated_output["task"] != expected_task_name:
-                validated_output["task"] = expected_task_name
-            if not validated_output["title"] or not validated_output["planning_rationale"]:
-                raise ValueError("Scene plan title and planning rationale must not be empty.")
+            
+            # Auto-heal top-level fields
+            validated_output["task"] = expected_task_name
+            validated_output["title"] = get_field_any(parsed_output, ["title", "name", "project_title"], "Untitled Project")
+            validated_output["planning_rationale"] = get_field_any(parsed_output, ["planning_rationale", "rationale", "reasoning", "logic", "explanation"], "Storyboard planning rationale.")
 
             scenes = parsed_output.get("scenes")
             if not isinstance(scenes, list) or not scenes:
-                raise ValueError("The chatbot response must include at least one planned scene.")
+                # Try fallback names for the scenes list
+                scenes = parsed_output.get("segments") or parsed_output.get("list") or parsed_output.get("steps")
+                if not isinstance(scenes, list) or not scenes:
+                    raise ValueError("The chatbot response must include at least one planned scene.")
 
             validated_scenes = []
             for index, scene in enumerate(scenes, start=1):
                 if not isinstance(scene, dict):
-                    raise ValueError("Each planned scene must be an object.")
+                    continue
                 try:
-                    scene_number = int(scene.get("scene_number") or index)
+                    scene_number = int(scene.get("scene_number") or scene.get("segment_number") or index)
                 except (TypeError, ValueError):
-                    raise ValueError("Each planned scene needs a numeric scene_number.")
-                scene_title = str(scene.get("title") or "").strip()
-                if not scene_title:
-                    raise ValueError("Each planned scene needs a non-empty title.")
+                    scene_number = index
+                
+                scene_title = get_field_any(scene, ["title", "name", "scene_title", "scene_name"], f"Scene {scene_number}")
 
                 if is_outline:
-                    shot_type = str(scene.get("shot_type") or "").strip()
-                    mood = str(scene.get("mood") or "").strip()
-                    visual_hook = str(scene.get("visual_hook") or "").strip()
-                    scene_notes = str(scene.get("notes") or "").strip()
+                    shot_type = get_field_any(scene, ["shot_type", "shot", "type"], "medium shot")
+                    mood = get_field_any(scene, ["mood", "atmosphere", "tone", "style"], "cinematic")
+                    visual_hook = get_field_any(scene, ["visual_hook", "hook", "visual", "description", "visual_theme", "theme", "setting"])
                     if not visual_hook:
-                        raise ValueError("Each outlined scene needs a non-empty visual_hook.")
+                        visual_hook = f"A {shot_type} cinematic scene with a {mood} mood."
+                    scene_notes = get_field_any(scene, ["notes", "note", "scene_notes", "comment"], "")
                     validated_scenes.append(
                         {
                             "scene_number": scene_number,
@@ -4083,11 +4336,19 @@ class LTXQueueManager:
                         }
                     )
                 else:
-                    scene_image_prompt = str(scene.get("image_prompt") or "").strip()
-                    scene_video_prompt = str(scene.get("video_prompt") or "").strip()
-                    scene_notes = str(scene.get("notes") or "").strip()
-                    if not scene_image_prompt or not scene_video_prompt:
-                        raise ValueError("Each planned scene needs a non-empty image_prompt and video_prompt.")
+                    scene_image_prompt = get_field_any(scene, ["image_prompt", "scene_image_prompt", "img_prompt", "prompt", "t2i_prompt", "visual_prompt", "visual_hook", "visual", "description"])
+                    scene_video_prompt = get_field_any(scene, ["video_prompt", "scene_video_prompt", "vid_prompt", "prompt", "i2v_prompt", "motion_prompt", "movement", "motion"])
+                    
+                    # Heal prompts
+                    if not scene_image_prompt and scene_video_prompt:
+                        scene_image_prompt = scene_video_prompt
+                    elif not scene_video_prompt and scene_image_prompt:
+                        scene_video_prompt = scene_image_prompt
+                    elif not scene_image_prompt and not scene_video_prompt:
+                        scene_image_prompt = f"Cinematic shot of {scene_title}"
+                        scene_video_prompt = f"Cinematic movement in {scene_title}"
+
+                    scene_notes = get_field_any(scene, ["notes", "note", "scene_notes", "comment"], "")
                     validated_scenes.append(
                         {
                             "scene_number": scene_number,
@@ -4098,35 +4359,139 @@ class LTXQueueManager:
                         }
                     )
 
+            if not validated_scenes:
+                raise ValueError("No valid scene objects could be validated.")
             validated_output["scenes"] = validated_scenes
             return validated_output
 
         # ── Batch review has an array field (weak_scenes) — handle specially ──
-        if str(task_config.get("output_task") or "").strip() == "batch_review":
+        if output_task == "batch_review":
             validated_output = {}
-            for field_name in task_config.get("required_fields", []):
-                if field_name not in parsed_output:
-                    raise ValueError(f"The chatbot response is missing required field '{field_name}'.")
             validated_output["task"] = "batch_review"
-            validated_output["overall_coherence"] = int(parsed_output.get("overall_coherence") or 5)
-            validated_output["summary"] = str(parsed_output.get("summary") or "").strip()
-            weak_scenes = parsed_output.get("weak_scenes")
+            validated_output["overall_coherence"] = int(parsed_output.get("overall_coherence") or parsed_output.get("coherence") or 5)
+            validated_output["summary"] = get_field_any(parsed_output, ["summary", "overall_summary", "review_summary", "notes"], "Batch review complete.")
+            weak_scenes = parsed_output.get("weak_scenes") or parsed_output.get("weak_segments") or parsed_output.get("issues")
             if not isinstance(weak_scenes, list):
                 weak_scenes = []
             validated_output["weak_scenes"] = [
                 ws for ws in weak_scenes
-                if isinstance(ws, dict) and ws.get("scene_number")
+                if isinstance(ws, dict) and (ws.get("scene_number") or ws.get("segment_number"))
             ]
             return validated_output
 
+        # ── YouTube Script has array field (segments) — handle specially ──
+        if output_task == "youtube_script":
+            validated_output = {}
+            validated_output["task"] = "youtube_script"
+            validated_output["title"] = get_field_any(parsed_output, ["title", "name", "script_title"], "Untitled YouTube Script")
+            validated_output["intro"] = get_field_any(parsed_output, ["intro", "hook", "opening", "introduction"], "Welcome to the video.")
+            
+            raw_segments = parsed_output.get("segments") or parsed_output.get("scenes") or parsed_output.get("list") or parsed_output.get("steps")
+            if not isinstance(raw_segments, list) or not raw_segments:
+                raise ValueError("The chatbot response must include at least one script segment.")
+            
+            validated_segments = []
+            for index, seg in enumerate(raw_segments, start=1):
+                if not isinstance(seg, dict):
+                    continue
+                try:
+                    seg_num = int(seg.get("segment_number") or seg.get("scene_number") or index)
+                except (TypeError, ValueError):
+                    seg_num = index
+                
+                voiceover_text = get_field_any(seg, ["voiceover_text", "voiceover", "text", "narration", "narration_text", "segment_text", "script", "content"])
+                topic = get_field_any(seg, ["topic", "theme", "title", "idea", "subject"])
+                visual_hint = get_field_any(seg, ["visual_theme_hint", "visual_hint", "visual", "theme_hint", "image_prompt", "mood", "setting", "scene_description", "description", "visual_theme"])
+                
+                # Heal empty fields
+                if not voiceover_text:
+                    if topic:
+                        voiceover_text = f"Discussing {topic}."
+                    elif visual_hint:
+                        voiceover_text = f"As we view the scene: {visual_hint}."
+                    else:
+                        voiceover_text = f"Here we cover segment {seg_num}."
+                if not topic:
+                    topic = voiceover_text[:30] if voiceover_text else f"Segment {seg_num}"
+                if not visual_hint:
+                    visual_hint = f"cinematic scene for {topic}"
+
+                validated_segments.append({
+                    "segment_number": seg_num,
+                    "voiceover_text": voiceover_text,
+                    "topic": topic,
+                    "visual_theme_hint": visual_hint
+                })
+            
+            if not validated_segments:
+                raise ValueError("No valid script segment objects could be validated.")
+            validated_output["segments"] = validated_segments
+            return validated_output
+
+        # ── YouTube Scenes has array field (scenes) — handle specially ──
+        if output_task == "youtube_scenes":
+            validated_output = {}
+            validated_output["task"] = "youtube_scenes"
+            
+            raw_scenes = parsed_output.get("scenes") or parsed_output.get("segments") or parsed_output.get("list") or parsed_output.get("steps")
+            if not isinstance(raw_scenes, list) or not raw_scenes:
+                raise ValueError("The chatbot response must include at least one planned scene.")
+            
+            validated_scenes = []
+            for index, scene in enumerate(raw_scenes, start=1):
+                if not isinstance(scene, dict):
+                    continue
+                try:
+                    scene_num = int(scene.get("segment_number") or scene.get("scene_number") or index)
+                except (TypeError, ValueError):
+                    scene_num = index
+                
+                title = get_field_any(scene, ["title", "name", "scene_title"], f"Scene {scene_num}")
+                image_prompt = get_field_any(scene, ["image_prompt", "scene_image_prompt", "img_prompt", "prompt", "t2i_prompt", "visual_prompt", "visual_hook", "visual", "description"])
+                video_prompt = get_field_any(scene, ["video_prompt", "scene_video_prompt", "vid_prompt", "prompt", "i2v_prompt", "motion_prompt", "movement", "motion"])
+                notes = get_field_any(scene, ["notes", "note", "scene_notes", "comment"], "")
+                
+                # Heal prompts
+                if not image_prompt and video_prompt:
+                    image_prompt = video_prompt
+                elif not video_prompt and image_prompt:
+                    video_prompt = image_prompt
+                elif not image_prompt and not video_prompt:
+                    image_prompt = f"Cinematic scene for segment {scene_num}"
+                    video_prompt = f"Cinematic panning shot for segment {scene_num}"
+
+                validated_scenes.append({
+                    "segment_number": scene_num,
+                    "title": title,
+                    "image_prompt": image_prompt,
+                    "video_prompt": video_prompt,
+                    "notes": notes
+                })
+            
+            if not validated_scenes:
+                raise ValueError("No valid planned scene objects could be validated.")
+            validated_output["scenes"] = validated_scenes
+            return validated_output
+
+        # Generic tasks fallback
         validated_output = {}
         for field_name in task_config.get("required_fields", []):
-            if field_name not in parsed_output:
-                raise ValueError(f"The chatbot response is missing required field '{field_name}'.")
             field_value = parsed_output.get(field_name)
+            # Try synonym casing or key check
+            if field_value is None:
+                # search case insensitively
+                for k, v in parsed_output.items():
+                    if k.lower().replace("_", "") == field_name.lower().replace("_", ""):
+                        field_value = v
+                        break
+            if field_value is None:
+                field_value = "" # Auto-initialize to empty string instead of throwing ValueError
+            
             if isinstance(field_value, (dict, list)):
                 raise ValueError(f"Field '{field_name}' must be a string value.")
-            validated_output[field_name] = str(field_value if field_value is not None else "").strip()
+            validated_output[field_name] = str(field_value).strip()
+        
+        return validated_output
 
         expected_task = str(task_config.get("output_task") or "").strip()
         if expected_task and validated_output.get("task") != expected_task:
@@ -4151,62 +4516,163 @@ class LTXQueueManager:
         return response_payload
 
     def _build_chatbot_completion_payload_variants(self, task_config, briefing_text, model_id, keep_alive=None):
-        # Determine thinking mode: allow_thinking in task config overrides global default
+        # Determine thinking mode: allow_thinking in task config AND quality preset must both be true,
+        # BUT the global "default to non-thinking" user setting can override and suppress thinking entirely.
         task_allows_thinking = task_config.get("allow_thinking", False) and getattr(self, "autonomous_quality_thinking", True)
-        force_non_thinking = self._chatbot_should_force_non_thinking(model_id=model_id) and not task_allows_thinking
+        force_non_thinking = self._chatbot_should_force_non_thinking(model_id=model_id)
+        # If the user has globally enabled non-thinking, respect it even for tasks that allow thinking.
+        effective_thinking = task_allows_thinking and not force_non_thinking
+
+        base_messages = self._build_chatbot_request_messages(
+            [
+                {"role": "system", "content": task_config["system_prompt"]},
+                {"role": "user", "content": task_config["user_prompt_template"].replace("__BRIEFING_TEXT__", briefing_text.strip())},
+            ],
+            model_id=model_id,
+            force_non_thinking=force_non_thinking,
+        )
         base_payload = {
             "model": model_id,
-            "messages": self._build_chatbot_request_messages(
-                [
-                    {"role": "system", "content": task_config["system_prompt"]},
-                    {"role": "user", "content": task_config["user_prompt_template"].replace("__BRIEFING_TEXT__", briefing_text.strip())},
-                ],
-                model_id=model_id,
-                force_non_thinking=force_non_thinking,
-            ),
+            "messages": base_messages,
             "max_tokens": task_config.get("max_tokens", 4096),
             "stream": False,
         }
         base_payload.update(self._build_chatbot_sampling_payload())
         if self._chatbot_request_targets_gemma4(model_id=model_id):
-            base_payload["think"] = task_allows_thinking and not force_non_thinking
+            base_payload["think"] = effective_thinking
         if keep_alive is not None and self.chatbot_backend_mode == CHATBOT_BACKEND_MODE_OLLAMA:
             base_payload["keep_alive"] = keep_alive
-        # Increase context window for thinking tasks to accommodate reasoning tokens
-        if task_allows_thinking and not force_non_thinking and self.chatbot_backend_mode == CHATBOT_BACKEND_MODE_OLLAMA:
-            base_payload.setdefault("options", {})["num_ctx"] = 32768
-        return [
+        # Ollama-specific options: ensure sufficient context and output token room.
+        if self.chatbot_backend_mode == CHATBOT_BACKEND_MODE_OLLAMA:
+            ollama_options = base_payload.setdefault("options", {})
+            # Always set num_predict to prevent default truncation at 128/2048 tokens.
+            ollama_options.setdefault("num_predict", base_payload.get("max_tokens", 4096))
+            if effective_thinking:
+                ollama_options["num_ctx"] = 32768
+
+        # Build the ordered list of payload variants to try.
+        # Primary variants use the current thinking mode.
+        variants = [
             dict(base_payload, response_format={"type": "json_schema", "json_schema": task_config["json_schema"]}),
             dict(base_payload, response_format={"type": "json_object"}),
             dict(base_payload),
         ]
 
+        # If thinking was enabled, append non-thinking fallback variants.
+        # These fire only when all thinking variants fail (e.g. empty response due to
+        # reasoning tokens consuming the entire output budget).
+        if effective_thinking:
+            non_think_payload = dict(base_payload)
+            if self._chatbot_request_targets_gemma4(model_id=model_id):
+                non_think_payload["think"] = False
+            # Rebuild messages with non-thinking suffix for Qwen-style models
+            non_think_messages = self._build_chatbot_request_messages(
+                [
+                    {"role": "system", "content": task_config["system_prompt"]},
+                    {"role": "user", "content": task_config["user_prompt_template"].replace("__BRIEFING_TEXT__", briefing_text.strip())},
+                ],
+                model_id=model_id,
+                force_non_thinking=True,
+            )
+            non_think_payload["messages"] = non_think_messages
+            # Remove the enlarged context for non-thinking — default is sufficient.
+            if self.chatbot_backend_mode == CHATBOT_BACKEND_MODE_OLLAMA:
+                nt_options = non_think_payload.setdefault("options", {})
+                nt_options.pop("num_ctx", None)
+            variants.append(dict(non_think_payload, response_format={"type": "json_schema", "json_schema": task_config["json_schema"]}))
+            variants.append(dict(non_think_payload, response_format={"type": "json_object"}))
+            variants.append(dict(non_think_payload))
+
+        return variants
+
     def _request_chatbot_structured_output(self, task_name, briefing_text, keep_alive=None):
         task_config = self._get_chatbot_task_config(task_name)
-        timeout_seconds = max(15, int(self.chatbot_request_timeout or DEFAULT_CHATBOT_REQUEST_TIMEOUT))
+        task_timeout = task_config.get("timeout")
+        timeout_seconds = max(15, int(task_timeout or self.chatbot_request_timeout or DEFAULT_CHATBOT_REQUEST_TIMEOUT))
         model_id = self._resolve_chatbot_generation_model_id(timeout_seconds=min(timeout_seconds, 10))
         response_payload = None
         last_error = None
+        validated_output = None
         payload_variants = self._build_chatbot_completion_payload_variants(task_config, briefing_text, model_id, keep_alive=keep_alive)
+
+        self.log_debug(
+            "CHATBOT_STRUCTURED_REQUEST",
+            task=task_name,
+            model=model_id,
+            timeout=timeout_seconds,
+            variants=len(payload_variants),
+            thinking=payload_variants[0].get("think", "n/a"),
+        )
+
         for payload_index, payload in enumerate(payload_variants):
+            response_fmt = payload.get("response_format", {}).get("type", "none")
+            think_mode = payload.get("think", "n/a")
+            variant_label = f"variant {payload_index + 1}/{len(payload_variants)} (format={response_fmt}, think={think_mode})"
             try:
                 response_payload = self._post_chatbot_completion_payload(payload, timeout_seconds=timeout_seconds)
+                response_parts = self._extract_chatbot_response_parts(response_payload)
+                content = str(response_parts.get("content") or "").strip()
+                reasoning = str(response_parts.get("reasoning") or "").strip()
+                if not content and reasoning:
+                    try:
+                        rescued = self._extract_json_object_from_text(reasoning)
+                        if rescued:
+                            content = json.dumps(rescued)
+                            self.log_debug(
+                                "CHATBOT_CONTENT_RESCUED_FROM_REASONING",
+                                variant=variant_label,
+                                task=task_name,
+                            )
+                    except Exception as rescue_exc:
+                        self.log_debug(
+                            "CHATBOT_RESCUE_FROM_REASONING_FAILED",
+                            error=str(rescue_exc),
+                        )
+                if not content:
+                    self.log_debug(
+                        "CHATBOT_EMPTY_REPLY",
+                        variant=variant_label,
+                        task=task_name,
+                    )
+                    raise ValueError("response_format resulted in empty chatbot reply.")
+                # Parse and validate JSON inside the loop so truncated responses trigger retries.
+                parsed_output = self._extract_json_object_from_text(content)
+                validated_output = self._validate_chatbot_structured_output(task_config, parsed_output)
+                validated_output["task_label"] = task_name
+                validated_output["model_id"] = model_id
+                validated_output["raw_content"] = str(content or "")
+                validated_output["reasoning_content"] = str(response_parts.get("reasoning") or "").strip()
+                self.log_debug(
+                    "CHATBOT_STRUCTURED_OK",
+                    variant=variant_label,
+                    task=task_name,
+                    content_len=len(content),
+                )
                 break
             except Exception as exc:
                 last_error = exc
-                if payload_index >= len(payload_variants) - 1 or not self._chatbot_supports_response_format_retry(str(exc)):
+                exc_msg = str(exc)
+                self.log_debug(
+                    "CHATBOT_STRUCTURED_RETRY",
+                    variant=variant_label,
+                    task=task_name,
+                    error=exc_msg[:200],
+                )
+                if payload_index >= len(payload_variants) - 1:
                     raise
+                is_retryable = (
+                    "empty" in exc_msg.lower()
+                    or "unterminated" in exc_msg.lower()
+                    or "json" in exc_msg.lower()
+                    or self._chatbot_supports_response_format_retry(exc_msg)
+                )
+                if not is_retryable:
+                    raise
+                import time
+                time.sleep(2)
 
-        response_parts = self._extract_chatbot_response_parts(response_payload)
-        content = str(response_parts.get("content") or "").strip()
-        if not content:
-            raise ValueError("The chatbot reply was empty.")
-        parsed_output = self._extract_json_object_from_text(content)
-        validated_output = self._validate_chatbot_structured_output(task_config, parsed_output)
-        validated_output["task_label"] = task_name
-        validated_output["model_id"] = model_id
-        validated_output["raw_content"] = str(content or "")
-        validated_output["reasoning_content"] = str(response_parts.get("reasoning") or "").strip()
+        if validated_output is None:
+            raise RuntimeError(f"All {len(payload_variants)} chatbot payload variants failed for task '{task_name}'.")
         return validated_output
 
     def _append_prompt_to_image_queue(self, prompt_text):
@@ -4248,6 +4714,12 @@ class LTXQueueManager:
         task_label = str((self.chatbot_last_result or {}).get("task_label") or (self.chatbot_last_result or {}).get("task") or "").strip()
         if task_label == CHATBOT_TASK_SCENE_PLAN or task_label == "scene_plan":
             self.apply_chatbot_scene_plan_to_timeline()
+            return
+        if task_label == CHATBOT_TASK_YOUTUBE_SCENES or task_label == "youtube_scenes":
+            self.apply_chatbot_youtube_scenes_to_timeline()
+            return
+        if task_label == CHATBOT_TASK_YOUTUBE_SCRIPT or task_label == "youtube_script":
+            self.apply_chatbot_youtube_script_to_timeline()
             return
 
         if not self.chatbot_last_result:
@@ -4309,6 +4781,400 @@ class LTXQueueManager:
         if hasattr(self, "notebook") and hasattr(self, "video_tab"):
             self.notebook.select(self.video_tab)
         messagebox.showinfo("Chatbot", "The planned scenes were applied to the Scene Timeline.")
+
+    def apply_chatbot_youtube_scenes_to_timeline(self):
+        if not self.chatbot_last_result:
+            messagebox.showwarning("Chatbot", "Generate YouTube scenes first.")
+            return
+
+        scenes = self.chatbot_last_result.get("scenes") if isinstance(self.chatbot_last_result.get("scenes"), list) else []
+        normalized_timeline = []
+        for index, scene in enumerate(scenes, start=1):
+            if not isinstance(scene, dict):
+                continue
+            prompt_text = str(scene.get("image_prompt") or scene.get("prompt") or "").strip()
+            i2v_prompt_text = str(scene.get("video_prompt") or "").strip()
+            segment_number = int(scene.get("segment_number") or index)
+            
+            entry = self._create_scene_entry(segment_number, mode=SCENE_MODE_I2V, prompt=prompt_text)
+            entry["prompt_text"] = prompt_text
+            entry["i2v_prompt_text"] = i2v_prompt_text
+            
+            # Carry over any existing voiceover text from the current timeline
+            if segment_number - 1 < len(self.scene_timeline):
+                old_entry = self.scene_timeline[segment_number - 1]
+                if isinstance(old_entry, dict) and "voiceover" in old_entry:
+                    entry["voiceover"] = old_entry["voiceover"]
+            
+            normalized_timeline.append(entry)
+
+        if not normalized_timeline:
+            messagebox.showwarning("Chatbot", "No usable scenes found.")
+            return
+
+        self.scene_timeline = self._normalize_scene_timeline(normalized_timeline)
+        if hasattr(self, "scene_scrollable_frame"):
+            self._rebuild_scene_timeline_from_state(self.scene_timeline)
+            
+        self._record_chatbot_artifact_apply(
+            target_type="scene_timeline",
+            target_scope="youtube_scenes",
+            apply_mode="overwrite",
+            summary="Applied YouTube scenes to timeline.",
+        )
+        self.update_status("YouTube scenes applied to timeline.", "green")
+        if hasattr(self, "notebook") and hasattr(self, "video_tab"):
+            self.notebook.select(self.video_tab)
+        messagebox.showinfo("Chatbot", "Applied scenes to the timeline.")
+
+    def apply_chatbot_youtube_script_to_timeline(self):
+        if not self.chatbot_last_result:
+            messagebox.showwarning("Chatbot", "Generate YouTube script first.")
+            return
+
+        segments = self.chatbot_last_result.get("segments") if isinstance(self.chatbot_last_result.get("segments"), list) else []
+        if not segments:
+            messagebox.showwarning("Chatbot", "No script segments found.")
+            return
+
+        normalized_timeline = []
+        for index, seg in enumerate(segments, start=1):
+            if not isinstance(seg, dict):
+                continue
+            voiceover_text = str(seg.get("voiceover_text") or "").strip()
+            topic = str(seg.get("topic") or "").strip()
+            segment_number = int(seg.get("segment_number") or index)
+            
+            entry = self._create_scene_entry(segment_number, mode=SCENE_MODE_I2V, prompt=topic)
+            entry["voiceover"] = voiceover_text
+            normalized_timeline.append(entry)
+
+        self.scene_timeline = self._normalize_scene_timeline(normalized_timeline)
+        if hasattr(self, "scene_scrollable_frame"):
+            self._rebuild_scene_timeline_from_state(self.scene_timeline)
+
+        self._record_chatbot_artifact_apply(
+            target_type="scene_timeline",
+            target_scope="youtube_script",
+            apply_mode="overwrite",
+            summary="Applied YouTube voiceover script to timeline.",
+        )
+        self.update_status("YouTube script applied to timeline.", "green")
+        if hasattr(self, "notebook") and hasattr(self, "video_tab"):
+            self.notebook.select(self.video_tab)
+        messagebox.showinfo("Chatbot", f"Applied {len(segments)} script segments to the timeline. Next, switch to visual scenes mode to generate visual prompts.")
+
+    def _browse_python_exe(self):
+        filename = filedialog.askopenfilename(
+            title="Select Python Interpreter",
+            initialdir=os.path.dirname(self.vibevoice_python_var.get()) or self.app_root_dir,
+            filetypes=(("Executable files", "*.exe"), ("All files", "*.*"))
+        )
+        if filename:
+            self.vibevoice_python_var.set(os.path.normpath(filename))
+            self.vibevoice_python = os.path.normpath(filename)
+            self.save_global_settings()
+
+    def _get_vibevoice_dir(self):
+        # 1. Check relative to app_root_dir (source or exe folder)
+        path = os.path.normpath(os.path.join(self.app_root_dir, "VibeVoice"))
+        if os.path.exists(path):
+            return path
+        # 2. Check two levels up (if running from dist/Prompt2MTV/Prompt2MTV.exe)
+        candidate = os.path.normpath(os.path.join(self.app_root_dir, "..", "..", "VibeVoice"))
+        if os.path.exists(candidate):
+            return candidate
+        # Fallback to default path
+        return path
+
+    def _is_vibevoice_cuda_available(self):
+        python_exe = self.vibevoice_python_var.get()
+        if not python_exe or not os.path.exists(python_exe):
+            return False
+        try:
+            import subprocess
+            cmd = [python_exe, "-c", "import torch; print(torch.cuda.is_available())"]
+            res = subprocess.run(cmd, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=5)
+            if res.returncode == 0 and res.stdout.strip().lower() == "true":
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _get_available_speakers(self):
+        vibevoice_dir = self._get_vibevoice_dir()
+        voices_dir = os.path.join(vibevoice_dir, "demo", "voices")
+        speakers = []
+        if os.path.exists(voices_dir):
+            try:
+                for f in os.listdir(voices_dir):
+                    if f.startswith("en-") and f.endswith("_voice.wav"):
+                        speaker = f[3:-10]
+                        if speaker not in speakers:
+                            speakers.append(speaker)
+            except Exception as e:
+                print(f"[DEBUG] Error listing voices directory: {e}")
+        if "user" not in speakers:
+            speakers.append("user")
+        return sorted(speakers)
+
+    def _update_speaker_comboboxes(self):
+        speakers = self._get_available_speakers()
+        if hasattr(self, "vibevoice_speaker_combo"):
+            self.vibevoice_speaker_combo["values"] = speakers
+        if hasattr(self, "youtube_speaker_combo"):
+            self.youtube_speaker_combo["values"] = speakers
+
+    def _open_voice_cloning_wizard(self):
+        vibevoice_dir = self._get_vibevoice_dir()
+        if not os.path.exists(vibevoice_dir):
+            messagebox.showerror("Error", f"VibeVoice repository not found at {vibevoice_dir}. Please make sure it is cloned there.")
+            return
+            
+        def on_success(recorded_path):
+            basename = os.path.basename(recorded_path)
+            if basename.startswith("en-") and basename.endswith("_voice.wav"):
+                speaker = basename[3:-10]
+            else:
+                speaker = "user"
+            self._update_speaker_comboboxes()
+            self.vibevoice_speaker_var.set(speaker)
+            self.vibevoice_speaker = speaker
+            self.save_global_settings()
+            messagebox.showinfo("Voice Setup", f"Your cloned voice '{speaker}' is now configured as the active speaker.")
+            
+        VoiceCloningSetupWizard(
+            parent=self.root,
+            vibevoice_dir=vibevoice_dir,
+            python_exe=self.vibevoice_python_var.get(),
+            active_speaker=self.vibevoice_speaker_var.get().strip() or "user",
+            on_success_callback=on_success
+        )
+
+    def _on_project_mode_changed_gui(self, _event=None):
+        mode_str = self.project_mode_combo_var.get()
+        new_mode = "youtube" if "YouTube" in mode_str else "mtv"
+        self.project_mode = new_mode
+        
+        if new_mode == "youtube":
+            self.youtube_settings_frame.pack(fill=tk.X, pady=(0, 12))
+        else:
+            self.youtube_settings_frame.pack_forget()
+            
+        if hasattr(self, "settings_actions_frame"):
+            self.settings_actions_frame.pack_forget()
+            self.settings_actions_frame.pack(fill=tk.X)
+            
+        self._refresh_tab_labels_for_project_mode()
+        self.save_global_settings()
+        self.update_status(f"Project mode changed to {mode_str}.", "green")
+
+    def _refresh_tab_labels_for_project_mode(self):
+        if hasattr(self, "chatbot_header_title_label") and self.chatbot_header_title_label:
+            if self.project_mode == "youtube":
+                self.chatbot_header_title_label.config(text="Talk through the YouTube video before generating prompts")
+                if hasattr(self, "chatbot_header_copy_label") and self.chatbot_header_copy_label:
+                    self.chatbot_header_copy_label.config(text="Use the assistant like a real conversation first. Chat naturally about script ideas, target audience, scene outlines, and visual pacing, then generate scripts and scene drafts when you are ready.")
+            else:
+                self.chatbot_header_title_label.config(text="Talk through the music video before generating prompts")
+                if hasattr(self, "chatbot_header_copy_label") and self.chatbot_header_copy_label:
+                    self.chatbot_header_copy_label.config(text="Use the assistant like a real conversation first. Chat naturally about concept, pacing, scenes, and visual direction, then create prompt drafts only when you are ready.")
+
+        if hasattr(self, "music_lyrics_section"):
+            if self.project_mode == "youtube":
+                self.music_lyrics_section["title"].config(text="Script & Voiceover")
+                if hasattr(self, "music_lyrics_label"):
+                    self.music_lyrics_label.config(text="Script & Voiceover Segment Phrasing")
+                if hasattr(self, "music_lyrics_hint_label"):
+                    self.music_lyrics_hint_label.config(text="Specify the voiceover script segment narration for matching scenes. Each paragraph maps to a timeline scene.")
+            else:
+                self.music_lyrics_section["title"].config(text="Lyrics / Vocal Direction")
+                if hasattr(self, "music_lyrics_label"):
+                    self.music_lyrics_label.config(text="Lyrics / Vocal Direction")
+                if hasattr(self, "music_lyrics_hint_label"):
+                    self.music_lyrics_hint_label.config(text="Optional. Use this for hooks, spoken phrasing, or narrative structure.")
+
+        if hasattr(self, "chatbot_task_combo"):
+            if self.project_mode == "youtube":
+                self.chatbot_task_combo.config(values=[
+                    "Creative Chat",
+                    "Write YouTube Script",
+                    "Brainstorm YouTube Scenes",
+                    "Optimize Prompts"
+                ])
+                self.chatbot_task_var.set("Write YouTube Script")
+            else:
+                self.chatbot_task_combo.config(values=[
+                    "Creative Chat",
+                    "Plan Music Video Scenes",
+                    "Brainstorm Song Lyrics",
+                    "Optimize Prompts"
+                ])
+                self.chatbot_task_var.set("Plan Music Video Scenes")
+            self._on_chatbot_task_changed()
+
+        if hasattr(self, "timeline_voiceover_btn") and hasattr(self, "timeline_export_btn"):
+            self.timeline_voiceover_btn.pack_forget()
+            self.timeline_export_btn.pack_forget()
+            self.timeline_export_btn.pack(side=tk.RIGHT, padx=(8, 0))
+            if self.project_mode == "youtube":
+                self.timeline_voiceover_btn.pack(side=tk.RIGHT, padx=(8, 0))
+                if hasattr(self, "timeline_toolbar_song_lbl"):
+                    self.timeline_toolbar_song_lbl.config(text="\U0001f3b5  Backing Music:")
+            else:
+                if hasattr(self, "timeline_toolbar_song_lbl"):
+                    self.timeline_toolbar_song_lbl.config(text="\U0001f3b5  Song:")
+
+        # Show/hide voiceover row on timeline entry frames
+        for frame in getattr(self, "scene_entry_frames", []):
+            if hasattr(frame, "voiceover_label") and hasattr(frame, "voiceover_shell") and hasattr(frame, "voiceover_audio_lbl") and hasattr(frame, "voiceover_audio_status_lbl"):
+                if self.project_mode == "youtube":
+                    frame.voiceover_label.grid(row=7, column=0, sticky="nw", pady=(4, 6))
+                    frame.voiceover_shell.grid(row=7, column=1, sticky="ew", pady=(4, 6))
+                    frame.voiceover_audio_lbl.grid(row=8, column=0, sticky="w", pady=(0, 6))
+                    frame.voiceover_audio_status_lbl.grid(row=8, column=1, sticky="ew", pady=(0, 6))
+                else:
+                    frame.voiceover_label.grid_forget()
+                    frame.voiceover_shell.grid_forget()
+                    frame.voiceover_audio_lbl.grid_forget()
+                    frame.voiceover_audio_status_lbl.grid_forget()
+
+        if hasattr(self, "autonomous_section") and self.autonomous_section and hasattr(self, "autonomous_youtube_section") and self.autonomous_youtube_section:
+            if self.project_mode == "youtube":
+                self.autonomous_section["container"].grid_forget()
+                self.autonomous_youtube_section["container"].grid(row=0, column=0, sticky="ew", pady=(0, 12))
+            else:
+                self.autonomous_youtube_section["container"].grid_forget()
+                self.autonomous_section["container"].grid(row=0, column=0, sticky="ew", pady=(0, 12))
+
+    def _handle_scene_voiceover_edit(self, frame):
+        vo_text = frame.voiceover_text.get("1.0", tk.END).strip()
+        for sc in self.scene_timeline:
+            if sc.get("scene_id") == frame.scene_id:
+                sc["voiceover"] = vo_text
+                break
+        self.save_project_state()
+
+    def _generate_youtube_voiceovers(self):
+        if not self.scene_timeline:
+            messagebox.showwarning("No Scenes", "There are no scenes in the timeline to generate voiceovers for.")
+            return
+
+        has_vo = any(str(sc.get("voiceover", "")).strip() for sc in self.scene_timeline)
+        if not has_vo:
+            messagebox.showwarning("No Voiceover", "None of the timeline scenes contain voiceover text.")
+            return
+
+        # Verify cloned reference voice file exists
+        vibevoice_dir = self._get_vibevoice_dir()
+        speaker = self.vibevoice_speaker_var.get().strip() if hasattr(self, "vibevoice_speaker_var") else "user"
+        if not speaker:
+            speaker = "user"
+        voice_file = os.path.normpath(os.path.join(vibevoice_dir, "demo", "voices", f"en-{speaker}_voice.wav"))
+        if not os.path.exists(voice_file):
+            ans = messagebox.askyesno(
+                "Voice Recording Required",
+                f"No cloned reference voice found for speaker '{speaker}' at:\n{voice_file}\n\n"
+                "Generating voiceovers requires a cloned reference voice.\n\n"
+                "Would you like to open the Voice Cloning Setup Wizard now to record your voice?"
+            )
+            if ans:
+                self._open_voice_cloning_wizard()
+            return
+
+        self.timeline_voiceover_btn.config(state=tk.DISABLED, text="🎙️ Generating...")
+        self.timeline_status_label.config(text="Generating VibeVoice voiceovers...")
+
+        def _worker():
+            try:
+                active_project = getattr(self, "current_project_dir", None)
+                if not active_project:
+                    active_project = os.path.join(self.base_output_dir, "default_project")
+                
+                vo_dir = os.path.join(active_project, "voiceovers")
+                os.makedirs(vo_dir, exist_ok=True)
+                temp_dir = os.path.join(vo_dir, "temp")
+                os.makedirs(temp_dir, exist_ok=True)
+
+                for idx, sc in enumerate(self.scene_timeline, start=1):
+                    vo_text = str(sc.get("voiceover", "")).strip()
+                    if not vo_text:
+                        sc["voiceover_audio_path"] = ""
+                        sc["audio_duration"] = 0.0
+                        continue
+
+                    temp_txt_name = f"segment_{idx}_{sc['scene_id']}.txt"
+                    temp_txt_path = os.path.join(temp_dir, temp_txt_name)
+                    with open(temp_txt_path, "w", encoding="utf-8") as f:
+                        f.write(f"Speaker 1: {vo_text}\n")
+
+                    python_exe = self.vibevoice_python_var.get()
+                    vibevoice_dir = self._get_vibevoice_dir()
+                    
+                    device = "cuda" if self._is_vibevoice_cuda_available() else "cpu"
+                    
+                    cmd = [
+                        python_exe,
+                        os.path.join(vibevoice_dir, "demo", "inference_from_file.py"),
+                        "--model_path", "microsoft/VibeVoice-1.5b",
+                        "--txt_path", temp_txt_path,
+                        "--speaker_names", self.vibevoice_speaker_var.get(),
+                        "--output_dir", vo_dir,
+                        "--device", device
+                    ]
+                    
+                    print(f"[VIBEVOICE] Running cmd: {' '.join(cmd)}")
+                    self.root.after(0, lambda i=idx: self.timeline_status_label.config(
+                        text=f"VibeVoice: Synthesizing segment {i}/{len(self.scene_timeline)}..."
+                    ))
+
+                    result = subprocess.run(
+                        cmd,
+                        cwd=vibevoice_dir,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                        capture_output=True,
+                        text=True,
+                        check=False
+                    )
+                    
+                    if result.returncode != 0:
+                        print(f"[VIBEVOICE] Error stdout:\n{result.stdout}\n[VIBEVOICE] Error stderr:\n{result.stderr}")
+                        raise RuntimeError(f"VibeVoice synthesis failed for segment {idx}. Stderr:\n{result.stderr}")
+
+                    txt_filename = os.path.splitext(temp_txt_name)[0]
+                    expected_wav_path = os.path.normpath(os.path.join(vo_dir, f"{txt_filename}_generated.wav"))
+                    
+                    if not os.path.exists(expected_wav_path):
+                        raise FileNotFoundError(f"Generated WAV file not found at {expected_wav_path}")
+
+                    duration = self._probe_clip_duration(expected_wav_path)
+                    
+                    sc["voiceover_audio_path"] = expected_wav_path
+                    sc["audio_duration"] = duration
+                    
+                    if self.visual_pacing_var.get() == "loop":
+                        sc["duration"] = duration
+
+                    print(f"[VIBEVOICE] Synthesized segment {idx}: {duration:.2f} seconds -> {expected_wav_path}")
+
+                def _success():
+                    self.timeline_voiceover_btn.config(state=tk.NORMAL, text="🎙️  Generate Voiceovers")
+                    self.timeline_status_label.config(text="Voiceovers generated successfully.")
+                    self.update_status("Voiceovers generated successfully.", "green")
+                    self._rebuild_scene_timeline_from_state(self.scene_timeline)
+                    messagebox.showinfo("VibeVoice", "All voiceovers synthesized successfully! Visual pacing has been synchronized.")
+                
+                self.root.after(0, _success)
+
+            except Exception as e:
+                def _error(err_msg=str(e)):
+                    self.timeline_voiceover_btn.config(state=tk.NORMAL, text="🎙️  Generate Voiceovers")
+                    self.timeline_status_label.config(text="Voiceover generation failed.")
+                    self.update_status("Voiceover generation failed.", "red")
+                    messagebox.showerror("Voiceover Error", f"Voiceover generation failed:\n\n{err_msg}")
+                self.root.after(0, _error)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _handle_chatbot_plan_scenes(self):
         self._handle_chatbot_structured_task(
@@ -4610,15 +5476,16 @@ class LTXQueueManager:
         except Exception as exc:
             last_error = str(exc)
 
-        probe_url = f"{self._chatbot_base_url()}/health"
+        probe_url = self._chatbot_base_url() if self.chatbot_backend_mode == CHATBOT_BACKEND_MODE_OLLAMA else f"{self._chatbot_base_url()}/health"
         try:
             request = urllib.request.Request(probe_url, headers={"Accept": "application/json"})
             with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
                 status_code = getattr(response, "status", 200)
                 if 200 <= status_code < 300:
+                    status_msg = "Ollama is running, but model discovery from /v1/models failed." if self.chatbot_backend_mode == CHATBOT_BACKEND_MODE_OLLAMA else "Backend responded to /health, but model discovery from /v1/models failed."
                     return {
                         "ok": True,
-                        "status": "Backend responded to /health, but model discovery from /v1/models failed.",
+                        "status": status_msg,
                         "reachable_url": probe_url,
                         "detail": last_error,
                     }
@@ -4679,6 +5546,9 @@ class LTXQueueManager:
         default_to_non_thinking=None,
         auto_launch_server=None,
         preferred_drive=None,
+        speculative_decoding_enabled=None,
+        draft_model_path=None,
+        spec_draft_n_max=None,
     ):
         previous_backend_mode = self.chatbot_backend_mode
         if model_family is not None:
@@ -4756,6 +5626,15 @@ class LTXQueueManager:
         if preferred_drive is not None:
             preferred_value = str(preferred_drive or "").strip().upper().rstrip(":")
             self.chatbot_preferred_drive = preferred_value or "M"
+        if speculative_decoding_enabled is not None:
+            self.chatbot_speculative_decoding_enabled = bool(speculative_decoding_enabled)
+        if draft_model_path is not None:
+            self.chatbot_draft_model_path = self._normalize_path(draft_model_path) or ""
+        if spec_draft_n_max is not None:
+            try:
+                self.chatbot_spec_draft_n_max = max(1, min(16, int(spec_draft_n_max)))
+            except (TypeError, ValueError):
+                self.chatbot_spec_draft_n_max = 4
 
         self.save_global_settings()
         self._refresh_chatbot_runtime_ui()
@@ -5070,6 +5949,9 @@ class LTXQueueManager:
         server_url_var = tk.StringVar(value=self.chatbot_server_url or DEFAULT_CHATBOT_SERVER_URL)
         server_executable_var = tk.StringVar(value=self.chatbot_server_executable_path or "")
         auto_launch_var = tk.BooleanVar(value=bool(self.chatbot_auto_launch_server) or self.chatbot_backend_mode == CHATBOT_BACKEND_MODE_MANAGED)
+        speculative_enabled_var = tk.BooleanVar(value=bool(self.chatbot_speculative_decoding_enabled))
+        draft_model_path_var = tk.StringVar(value=self.chatbot_draft_model_path or "")
+        spec_draft_n_max_var = tk.StringVar(value=str(self.chatbot_spec_draft_n_max or 4))
         context_size_var = tk.StringVar(value=str(self.chatbot_context_size or DEFAULT_CHATBOT_CONTEXT_SIZE))
         timeout_var = tk.StringVar(value=str(self.chatbot_request_timeout or DEFAULT_CHATBOT_REQUEST_TIMEOUT))
         temperature_var = tk.StringVar(value=str(self.chatbot_temperature or DEFAULT_CHATBOT_TEMPERATURE))
@@ -5176,6 +6058,43 @@ class LTXQueueManager:
         auto_launch_cb.grid(row=14, column=0, columnspan=3, sticky="w", pady=(0, 10))
         self._style_checkbutton(auto_launch_cb)
 
+        speculative_cb = tk.Checkbutton(card, text="Enable Speculative Decoding / Multi-Token Prediction (MTP) for llama-server", variable=speculative_enabled_var)
+        speculative_cb.grid(row=15, column=0, columnspan=3, sticky="w", pady=(0, 10))
+        self._style_checkbutton(speculative_cb)
+
+        draft_label = tk.Label(card, text="Draft GGUF Model Path")
+        draft_label.grid(row=16, column=0, sticky="w", padx=(0, 12), pady=(0, 10))
+        self._style_label(draft_label, "body_strong", self.colors["surface"])
+
+        draft_path_entry = tk.Entry(card, textvariable=draft_model_path_var)
+        draft_path_entry.grid(row=16, column=1, sticky="ew", pady=(0, 10))
+        self._style_text_input(draft_path_entry)
+
+        browse_draft_btn = tk.Button(
+            card,
+            text="Browse",
+            command=lambda: self._browse_file_into_var(draft_model_path_var, "Select speculative draft GGUF model", (("GGUF files", "*.gguf"), ("All files", "*.*")), self.chatbot_model_root)
+        )
+        browse_draft_btn.grid(row=16, column=2, sticky="e", padx=(8, 0), pady=(0, 10))
+        self._style_button(browse_draft_btn, "secondary", compact=True)
+
+        spec_tokens_label = tk.Label(card, text="Max Draft Tokens (MTP)")
+        spec_tokens_label.grid(row=17, column=0, sticky="w", padx=(0, 12), pady=(0, 10))
+        self._style_label(spec_tokens_label, "body_strong", self.colors["surface"])
+
+        spec_draft_spin = tk.Spinbox(card, from_=1, to=16, textvariable=spec_draft_n_max_var, width=10)
+        spec_draft_spin.grid(row=17, column=1, columnspan=2, sticky="w", pady=(0, 10))
+        self._style_text_input(spec_draft_spin)
+
+        def refresh_speculative_widgets(*_args):
+            state = "normal" if speculative_enabled_var.get() else "disabled"
+            draft_path_entry.config(state=state)
+            browse_draft_btn.config(state=state)
+            spec_draft_spin.config(state=state)
+
+        speculative_enabled_var.trace_add("write", refresh_speculative_widgets)
+        refresh_speculative_widgets()
+
         status_var = tk.StringVar(value="Connect mode uses the server URL. Managed llama.cpp needs llama-server. Ollama mode can auto-detect ollama.exe.")
         status_label = tk.Label(shell, textvariable=status_var, anchor="w", justify=tk.LEFT)
         status_label.pack(fill=tk.X, pady=(12, 0))
@@ -5227,6 +6146,9 @@ class LTXQueueManager:
                 "repeat_penalty": repeat_penalty_var.get(),
                 "default_to_non_thinking": non_thinking_var.get(),
                 "auto_launch_server": auto_launch_var.get(),
+                "speculative_decoding_enabled": speculative_enabled_var.get(),
+                "draft_model_path": draft_model_path_var.get().strip(),
+                "spec_draft_n_max": spec_draft_n_max_var.get().strip(),
             })
             dialog.destroy()
 
@@ -5375,6 +6297,9 @@ class LTXQueueManager:
             repeat_penalty=runtime_result.get("repeat_penalty"),
             default_to_non_thinking=runtime_result.get("default_to_non_thinking"),
             auto_launch_server=runtime_result.get("auto_launch_server"),
+            speculative_decoding_enabled=runtime_result.get("speculative_decoding_enabled"),
+            draft_model_path=runtime_result.get("draft_model_path"),
+            spec_draft_n_max=runtime_result.get("spec_draft_n_max"),
         )
         self.update_status("Advanced chatbot runtime settings updated.", "blue")
 
@@ -6318,7 +7243,7 @@ class LTXQueueManager:
             label += " | Favorite"
         return label
 
-    def _create_scene_entry(self, order_index, mode=SCENE_MODE_T2V, prompt="", prompt_text="", image_asset_id=None, i2v_prompt_text="", scene_id=None, output_path=None, render_status="pending", version_count=1, output_versions=None, active_output_version_id=None):
+    def _create_scene_entry(self, order_index, mode=SCENE_MODE_T2V, prompt="", prompt_text="", image_asset_id=None, i2v_prompt_text="", scene_id=None, output_path=None, render_status="pending", version_count=1, output_versions=None, active_output_version_id=None, voiceover="", voiceover_audio_path=None, audio_duration=0.0):
         resolved_mode = str(mode or SCENE_MODE_T2V).strip().lower()
         if resolved_mode not in {SCENE_MODE_T2V, SCENE_MODE_I2V}:
             resolved_mode = SCENE_MODE_T2V
@@ -6341,6 +7266,9 @@ class LTXQueueManager:
             "version_count": self._coerce_scene_version_count(version_count),
             "output_versions": self._normalize_scene_output_versions(output_versions, output_path=output_path, prompt_snapshot=canonical_prompt, mode=resolved_mode),
             "active_output_version_id": str(active_output_version_id or "").strip() or None,
+            "voiceover": str(voiceover or "").strip(),
+            "voiceover_audio_path": self._normalize_path(voiceover_audio_path),
+            "audio_duration": float(audio_duration or 0.0),
             "updated_at": timestamp
         }
         return self._sync_scene_entry_output_fields(scene_entry)
@@ -6385,7 +7313,10 @@ class LTXQueueManager:
                     render_status=entry.get("render_status", "pending"),
                     version_count=entry.get("version_count", 1),
                     output_versions=entry.get("output_versions"),
-                    active_output_version_id=entry.get("active_output_version_id")
+                    active_output_version_id=entry.get("active_output_version_id"),
+                    voiceover=entry.get("voiceover", ""),
+                    voiceover_audio_path=entry.get("voiceover_audio_path"),
+                    audio_duration=float(entry.get("audio_duration") or 0.0)
                 )
             )
 
@@ -7521,8 +8452,12 @@ class LTXQueueManager:
             if self.active_workflow_type in ("gguf", "gguf_distilled"):
                 return None
             return self.workflow
-        if workflow_key in ("video_gguf", "video_gguf_distilled"):
-            if self.active_workflow_type in ("gguf", "gguf_distilled"):
+        if workflow_key == "video_gguf":
+            if self.active_workflow_type == "gguf":
+                return self.workflow
+            return None
+        if workflow_key == "video_gguf_distilled":
+            if self.active_workflow_type == "gguf_distilled":
                 return self.workflow
             return None
         if workflow_key == "image":
@@ -7568,7 +8503,7 @@ class LTXQueueManager:
             )
         if manifest_filename and observed_values and any(value != manifest_filename for value in observed_values):
             notes.append(
-                f"{entry.get('label', entry.get('id', 'Model'))}: manifest filename differs from workflow JSON value ({manifest_filename} vs {active_filename})."
+                f"{entry.get('label', entry.get('id', 'Model'))}: manifest filename differs from workflow JSON value ({manifest_filename} vs {observed_values[0]})."
             )
 
         return active_filename, notes
@@ -7681,9 +8616,7 @@ class LTXQueueManager:
         reports = []
         manifest_notes = []
 
-        active_music_manifest_id = None
-        if hasattr(self, "music_model_variant_var"):
-            active_music_manifest_id = self._get_active_music_manifest_id()
+        active_music_manifest_id = self._get_active_music_manifest_id()
 
         active_video_gguf_preset = getattr(self, "active_video_model_preset", None)
 
@@ -8561,6 +9494,9 @@ class LTXQueueManager:
         dialog.wait_visibility()
         dialog.focus_set()
 
+    def _is_testing(self):
+        return "unittest" in sys.modules or os.environ.get("PROMPT2MTV_TESTING") == "1"
+
     def run_startup_preflight(self, interactive=False):
         issues = []
         warnings = []
@@ -8609,14 +9545,14 @@ class LTXQueueManager:
 
         if issues:
             self._set_video_preflight_summary(preflight_text, "Setup required", "red")
-            if interactive:
+            if interactive and not self._is_testing():
                 dialog_title = "First Launch Setup" if self.is_first_launch else "Startup Preflight"
                 messagebox.showerror(dialog_title, preflight_text)
             return False
 
         if warnings:
             self._set_video_preflight_summary(preflight_text, "Warnings", "orange")
-            if interactive:
+            if interactive and not self._is_testing():
                 dialog_title = "First Launch Guidance" if self.is_first_launch else "Startup Preflight"
                 messagebox.showwarning(dialog_title, preflight_text)
                 if self.is_first_launch and model_audit.get("installable_missing"):
@@ -9694,6 +10630,10 @@ class LTXQueueManager:
         self._style_panel(self.gallery_inner_frame, self.colors["surface_alt"])
         self._style_panel(self.music_scroll_shell, self.colors["bg"])
         self._style_panel(self.music_canvas, self.colors["bg"])
+        if hasattr(self, "chatbot_scroll_shell"):
+            self._style_panel(self.chatbot_scroll_shell, self.colors["bg"])
+        if hasattr(self, "chatbot_canvas"):
+            self._style_panel(self.chatbot_canvas, self.colors["bg"])
         if hasattr(self, "timeline_canvas"):
             self._style_panel(self.timeline_canvas, self.colors["surface"])
             self._style_panel(self.timeline_canvas_shell, self.colors["bg"])
@@ -10207,21 +11147,29 @@ class LTXQueueManager:
         self._save_comfyui_readiness_history()
 
     def _flash_autonomous_status(self):
-        if not hasattr(self, "autonomous_status_label"):
+        labels_to_flash = []
+        if hasattr(self, "autonomous_status_label"):
+            labels_to_flash.append(self.autonomous_status_label)
+        if hasattr(self, "youtube_autonomous_status_label") and self.youtube_autonomous_status_label:
+            labels_to_flash.append(self.youtube_autonomous_status_label)
+            
+        if not labels_to_flash:
             return
         if self.comfyui_readiness_flash_job is not None:
             return
-        label = self.autonomous_status_label
-        original_bg = label.cget("bg")
+            
+        original_bgs = [lbl.cget("bg") for lbl in labels_to_flash]
         flash_color = self.colors["danger"]
         cycle_count = 8
 
         def flash(index=0):
             if index >= cycle_count:
-                label.config(bg=original_bg)
+                for lbl, bg in zip(labels_to_flash, original_bgs):
+                    lbl.config(bg=bg)
                 self.comfyui_readiness_flash_job = None
                 return
-            label.config(bg=flash_color if index % 2 == 0 else original_bg)
+            for lbl, bg in zip(labels_to_flash, original_bgs):
+                lbl.config(bg=flash_color if index % 2 == 0 else bg)
             self.comfyui_readiness_flash_job = self.root.after(150, lambda: flash(index + 1))
 
         flash()
@@ -10231,7 +11179,9 @@ class LTXQueueManager:
             self.comfyui_readiness_eta_job = None
             return
         avg = self.comfyui_readiness_history.get("average_seconds", 0.0)
-        if avg > 0 and self.comfyui_poll_started_at:
+        if avg <= 0.0:
+            avg = 60.0
+        if self.comfyui_poll_started_at:
             elapsed = time.time() - self.comfyui_poll_started_at
             remaining = max(0, int(avg - elapsed))
             if remaining > 0:
@@ -10240,6 +11190,8 @@ class LTXQueueManager:
                 eta_text = "⏳ Waiting for ComfyUI to become ready... (any moment now)"
             if hasattr(self, "autonomous_status_label"):
                 self.autonomous_status_label.config(text=eta_text)
+            if hasattr(self, "youtube_autonomous_status_label") and self.youtube_autonomous_status_label:
+                self.youtube_autonomous_status_label.config(text=eta_text)
             self._update_comfyui_banner("waiting", eta_text)
         self.comfyui_readiness_eta_job = self.root.after(1000, self._update_comfyui_readiness_eta)
 
@@ -10250,8 +11202,14 @@ class LTXQueueManager:
         self.comfyui_poll_started_at = time.time()
         if hasattr(self, "autonomous_start_btn"):
             self.autonomous_start_btn.config(state=tk.DISABLED)
+        if hasattr(self, "youtube_autonomous_start_btn") and self.youtube_autonomous_start_btn:
+            self.youtube_autonomous_start_btn.config(state=tk.DISABLED)
+            
         if hasattr(self, "autonomous_status_label"):
             self.autonomous_status_label.config(text="⏳ Waiting for ComfyUI to become ready...")
+        if hasattr(self, "youtube_autonomous_status_label") and self.youtube_autonomous_status_label:
+            self.youtube_autonomous_status_label.config(text="⏳ Waiting for ComfyUI to become ready...")
+            
         self._update_comfyui_banner("waiting", "⏳ Waiting for ComfyUI to become ready…")
         self._update_comfyui_readiness_eta()
         self._poll_comfyui_readiness()
@@ -10276,10 +11234,18 @@ class LTXQueueManager:
                 elapsed = time.time() - self.comfyui_poll_started_at
                 self._record_comfyui_readiness_timing(elapsed)
                 self.comfyui_poll_started_at = None
+                
+            ready_msg = "✅ ComfyUI is ready. Enter a creative brief and click Start."
             if hasattr(self, "autonomous_status_label"):
-                self.autonomous_status_label.config(text="✅ ComfyUI is ready. Enter a creative brief and click Start.")
+                self.autonomous_status_label.config(text=ready_msg)
+            if hasattr(self, "youtube_autonomous_status_label") and self.youtube_autonomous_status_label:
+                self.youtube_autonomous_status_label.config(text=ready_msg)
+                
             if hasattr(self, "autonomous_start_btn") and not getattr(self, "autonomous_active", False):
                 self.autonomous_start_btn.config(state=tk.NORMAL)
+            if hasattr(self, "youtube_autonomous_start_btn") and self.youtube_autonomous_start_btn and not getattr(self, "autonomous_active", False):
+                self.youtube_autonomous_start_btn.config(state=tk.NORMAL)
+                
             self.update_status("ComfyUI is online and ready.", "green")
             self._update_comfyui_banner("ready", "✅ ComfyUI is ready")
             self._fire_comfyui_pending_callback()
@@ -10563,6 +11529,22 @@ class LTXQueueManager:
         self.image_vae_name_var = tk.StringVar()
         self.image_unet_name_var = tk.StringVar()
 
+        # Project Mode Selector
+        self.project_mode_row = tk.Frame(self.settings_frame, padx=0, pady=0)
+        self.project_mode_row.pack(fill=tk.X, pady=(0, 10))
+        tk.Label(self.project_mode_row, text="Project Mode: ", font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+        
+        self.project_mode_combo_var = tk.StringVar(value="Music Video (MTV)" if getattr(self, "project_mode", "mtv") == "mtv" else "YouTube Video (Creator)")
+        self.project_mode_combo = ttk.Combobox(
+            self.project_mode_row,
+            textvariable=self.project_mode_combo_var,
+            values=["Music Video (MTV)", "YouTube Video (Creator)"],
+            state="readonly",
+            width=28
+        )
+        self.project_mode_combo.pack(side=tk.LEFT, padx=(5, 15))
+        self.project_mode_combo.bind("<<ComboboxSelected>>", self._on_project_mode_changed_gui)
+
         self.workflow_load_row = tk.Frame(self.settings_frame, padx=0, pady=0)
         self.workflow_load_row.pack(fill=tk.X, pady=(0, 8))
         self.load_btn = tk.Button(self.workflow_load_row, text="Load Workflow JSON", command=self.load_json_dialog)
@@ -10673,26 +11655,121 @@ class LTXQueueManager:
         )
         self.video_output_include_project_cb.pack(anchor="w")
 
-        settings_actions_frame = tk.Frame(self.settings_frame)
-        settings_actions_frame.pack(fill=tk.X)
-        settings_actions_frame.grid_columnconfigure((0, 1, 2), weight=1)
+        # YouTube Settings Section
+        self.youtube_settings_frame = tk.LabelFrame(
+            self.settings_frame,
+            text=" YouTube Creator Settings (VibeVoice & Ducking) ",
+            padx=10,
+            pady=10
+        )
+        if getattr(self, "project_mode", "mtv") == "youtube":
+            self.youtube_settings_frame.pack(fill=tk.X, pady=(0, 12))
+
+        # Python Path
+        py_row = tk.Frame(self.youtube_settings_frame)
+        py_row.pack(fill=tk.X, pady=(0, 8))
+        tk.Label(py_row, text="Python Env Path:", width=15, anchor="w").pack(side=tk.LEFT)
+        self.vibevoice_python_var = tk.StringVar(value=getattr(self, "vibevoice_python", r"C:\Users\Tesla\miniconda3\envs\omni\python.exe"))
+        self.vibevoice_python_entry = tk.Entry(py_row, textvariable=self.vibevoice_python_var)
+        self.vibevoice_python_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        tk.Button(py_row, text="Browse...", command=self._browse_python_exe).pack(side=tk.LEFT)
+
+        # Speaker & Wizard
+        spk_row = tk.Frame(self.youtube_settings_frame)
+        spk_row.pack(fill=tk.X, pady=(0, 8))
+        tk.Label(spk_row, text="Voice Speaker:", width=15, anchor="w").pack(side=tk.LEFT)
+        self.vibevoice_speaker_var = tk.StringVar(value=getattr(self, "vibevoice_speaker", "user"))
+        speakers = self._get_available_speakers()
+        self.vibevoice_speaker_combo = ttk.Combobox(
+            spk_row,
+            textvariable=self.vibevoice_speaker_var,
+            values=speakers,
+            width=13,
+            style="TCombobox"
+        )
+        self.vibevoice_speaker_combo.pack(side=tk.LEFT, padx=5)
+        
+        tk.Button(
+            spk_row,
+            text="🎙️ Record / Clone Voice Wizard",
+            command=self._open_voice_cloning_wizard,
+            bg="#22c55e",
+            fg="white",
+            font=("Segoe UI", 9, "bold")
+        ).pack(side=tk.LEFT, padx=(10, 0))
+
+        tk.Button(
+            spk_row,
+            text="👤 Set Spokesperson Avatar...",
+            command=self._upload_avatar_image,
+            bg="#3b82f6",
+            fg="white",
+            font=("Segoe UI", 9, "bold")
+        ).pack(side=tk.LEFT, padx=(10, 0))
+
+        # Ducking Settings (Threshold, Ratio, Attack, Release, BG Vol, Intro Delay)
+        duck_row = tk.Frame(self.youtube_settings_frame)
+        duck_row.pack(fill=tk.X, pady=(0, 8))
+        
+        # Grid layout for numeric parameters
+        duck_row.grid_columnconfigure((0, 1, 2, 3, 4, 5), weight=1)
+        
+        self.ducking_threshold_var = tk.DoubleVar(value=getattr(self, "ducking_threshold", 0.08))
+        self.ducking_ratio_var = tk.DoubleVar(value=getattr(self, "ducking_ratio", 6.0))
+        self.ducking_attack_var = tk.IntVar(value=getattr(self, "ducking_attack", 100))
+        self.ducking_release_var = tk.IntVar(value=getattr(self, "ducking_release", 500))
+        self.ducking_bg_volume_var = tk.DoubleVar(value=getattr(self, "ducking_bg_volume", 0.25))
+        self.ducking_intro_delay_var = tk.DoubleVar(value=getattr(self, "ducking_intro_delay", 2.0))
+
+        duck_params = [
+            ("Threshold", self.ducking_threshold_var),
+            ("Ratio", self.ducking_ratio_var),
+            ("Attack (ms)", self.ducking_attack_var),
+            ("Release (ms)", self.ducking_release_var),
+            ("BG Music Vol", self.ducking_bg_volume_var),
+            ("Intro Delay (s)", self.ducking_intro_delay_var)
+        ]
+        
+        for idx, (label_txt, var) in enumerate(duck_params):
+            cell = tk.Frame(duck_row)
+            cell.grid(row=0, column=idx, sticky="ew", padx=3)
+            tk.Label(cell, text=label_txt, font=("Segoe UI", 8)).pack(anchor="w")
+            tk.Entry(cell, textvariable=var, width=8).pack(fill=tk.X, pady=(2, 0))
+
+        # Visual Pacing Row
+        pacing_row = tk.Frame(self.youtube_settings_frame)
+        pacing_row.pack(fill=tk.X, pady=(4, 0))
+        tk.Label(pacing_row, text="Visual Pacing Mode:", width=18, anchor="w").pack(side=tk.LEFT)
+        self.visual_pacing_var = tk.StringVar(value=getattr(self, "visual_pacing", "loop"))
+        self.visual_pacing_combo = ttk.Combobox(
+            pacing_row,
+            textvariable=self.visual_pacing_var,
+            values=["loop", "freeze"],
+            state="readonly",
+            width=20
+        )
+        self.visual_pacing_combo.pack(side=tk.LEFT, padx=5)
+
+        self.settings_actions_frame = tk.Frame(self.settings_frame)
+        self.settings_actions_frame.pack(fill=tk.X)
+        self.settings_actions_frame.grid_columnconfigure((0, 1, 2), weight=1)
 
         self.reset_video_profile_btn = tk.Button(
-            settings_actions_frame,
+            self.settings_actions_frame,
             text="Reset Defaults",
             command=self.reset_video_profile_defaults
         )
         self.reset_video_profile_btn.grid(row=0, column=0, sticky="ew")
 
         self.validate_video_btn = tk.Button(
-            settings_actions_frame,
+            self.settings_actions_frame,
             text="Validate",
             command=self.validate_video_setup
         )
         self.validate_video_btn.grid(row=0, column=1, sticky="ew", padx=6)
 
         self.refresh_model_lists_btn = tk.Button(
-            settings_actions_frame,
+            self.settings_actions_frame,
             text="Refresh Models",
             command=self.refresh_video_model_choices
         )
@@ -11220,6 +12297,8 @@ class LTXQueueManager:
                 "prompt_excerpt": (scene.get("prompt_text") or "")[:80],
                 "is_active": True,
                 "is_imported": False,
+                "voiceover_audio_path": scene.get("voiceover_audio_path"),
+                "audio_duration": float(scene.get("audio_duration", 0.0) or 0.0),
             }
         # Merge imported clips
         for clip in (self.timeline_imported_clips or []):
@@ -13751,6 +14830,14 @@ class LTXQueueManager:
         self.timeline_export_btn.pack(side=tk.RIGHT, padx=(8, 0))
         self._style_button(self.timeline_export_btn, "primary", compact=True)
 
+        self.timeline_voiceover_btn = tk.Button(
+            self.timeline_toolbar_frame, text="🎙️  Generate Voiceovers",
+            command=self._generate_youtube_voiceovers
+        )
+        self._style_button(self.timeline_voiceover_btn, "accent", compact=True)
+        if getattr(self, "project_mode", "mtv") == "youtube":
+            self.timeline_voiceover_btn.pack(side=tk.RIGHT, padx=(8, 0))
+
         self.timeline_header_frame = self.timeline_toolbar_frame  # alias for theme compat
 
         # ── Body: full-width preview strip + full-width timeline rail ────
@@ -13935,7 +15022,7 @@ class LTXQueueManager:
 
                 stitch_out = os.path.join(self.stitched_dir, f"timeline_export_{timestamp}.mp4")
 
-                if not has_trims and not has_xfade:
+                if not has_trims and not has_xfade and self.project_mode != "youtube":
                     # ── Fast path: stream-copy concat ──────────────────────
                     list_file = f"timeline_concat_{timestamp}.txt"
                     try:
@@ -13963,25 +15050,46 @@ class LTXQueueManager:
                     filter_parts = []
                     eff_durs     = []
 
+                    intro_delay = float(self.ducking_intro_delay_var.get() or 2.0) if hasattr(self, "ducking_intro_delay_var") else 2.0
                     for i, sc in enumerate(valid_scenes):
                         raw_dur = max(0.1, sc.get("raw_duration") or sc.get("duration") or 5.0)
                         trims   = trims_snap.get(sc["scene_id"], {})
                         ti      = max(0.0, float(trims.get("trim_in",  0.0)))
                         to_     = max(0.0, float(trims.get("trim_out", 0.0)))
-                        eff     = max(0.1, raw_dur - ti - to_)
-                        eff_durs.append(eff)
-                        end_sec = min(raw_dur, ti + eff)
-                        # No input-level -ss/-to: use the filtergraph trim filter instead.
-                        # Input seeking + xfade causes timestamp mismatches; trim filter
-                        # is designed to work with downstream filters like xfade/concat.
-                        # fps=fps=24 is required after setpts: xfade demands CFR input;
-                        # without it the declared frame rate becomes 1/0 (unknown) and
-                        # xfade rejects the stream. All LTX2 clips are 24 fps.
-                        inputs_cmd += ["-i", sc["clip_path"]]
-                        filter_parts.append(
-                            f"[{i}:v]trim=start={ti:.6f}:end={end_sec:.6f},"
-                            f"setpts=PTS-STARTPTS,fps=fps=24[v{i}]"
-                        )
+                        
+                        target_dur = float(sc.get("audio_duration", 0.0) or 0.0) if self.project_mode == "youtube" else 0.0
+                        
+                        if target_dur > 0.0:
+                            if i == 0:
+                                target_dur += intro_delay
+                            
+                            eff = target_dur
+                            eff_durs.append(eff)
+                            
+                            if self.visual_pacing_var.get() == "loop":
+                                inputs_cmd += ["-stream_loop", "-1", "-i", sc["clip_path"]]
+                                filter_parts.append(
+                                    f"[{i}:v]trim=start={ti:.6f}:end={ti + target_dur:.6f},"
+                                    f"setpts=PTS-STARTPTS,fps=fps=24[v{i}]"
+                                )
+                            else: # freeze
+                                inputs_cmd += ["-i", sc["clip_path"]]
+                                end_sec = min(raw_dur, ti + raw_dur - ti - to_)
+                                filter_parts.append(
+                                    f"[{i}:v]trim=start={ti:.6f}:end={end_sec:.6f},"
+                                    f"tpad=stop=-1:stop_mode=clone,"
+                                    f"trim=end={target_dur:.6f},"
+                                    f"setpts=PTS-STARTPTS,fps=fps=24[v{i}]"
+                                )
+                        else:
+                            eff = max(0.1, raw_dur - ti - to_)
+                            eff_durs.append(eff)
+                            end_sec = min(raw_dur, ti + eff)
+                            inputs_cmd += ["-i", sc["clip_path"]]
+                            filter_parts.append(
+                                f"[{i}:v]trim=start={ti:.6f}:end={end_sec:.6f},"
+                                f"setpts=PTS-STARTPTS,fps=fps=24[v{i}]"
+                            )
 
                     if N == 1:
                         filter_parts.append("[v0]null[vout]")
@@ -14010,8 +15118,6 @@ class LTXQueueManager:
                                     f"{current}[v{i}]concat=n=2:v=1:a=0{raw_label}"
                                 )
                                 out_offset += eff_durs[i - 1]
-                            # Normalize timebase of intermediate outputs to 1/24 so
-                            # subsequent xfade filters don't get a 1/1000000 vs 1/24 mismatch.
                             if is_last:
                                 current = raw_label
                             else:
@@ -14040,14 +15146,116 @@ class LTXQueueManager:
                             result.returncode, cmd, result.stdout, result.stderr
                         )
 
-                final_out = stitch_out
-                if merge_audio and stitch_out and os.path.exists(stitch_out):
-                    merged_out = os.path.join(
-                        self.final_mv_dir, f"Timeline_Music_Video_{timestamp}.mp4"
+                # Compiling voiceovers & audio ducking mix for YouTube mode
+                voiceover_compiled = None
+                if self.project_mode == "youtube":
+                    active_project = getattr(self, "current_project_dir", None)
+                    if not active_project:
+                        active_project = os.path.join(self.base_output_dir, "default_project")
+                    
+                    vo_dir = os.path.join(active_project, "voiceovers")
+                    os.makedirs(vo_dir, exist_ok=True)
+                    temp_dir = os.path.join(vo_dir, "temp")
+                    os.makedirs(temp_dir, exist_ok=True)
+                    
+                    vo_inputs = []
+                    vo_filter = []
+                    vo_idx = 0
+                    
+                    # 1. Prepend intro delay silence
+                    intro_delay = float(self.ducking_intro_delay_var.get() or 2.0) if hasattr(self, "ducking_intro_delay_var") else 2.0
+                    intro_silence = os.path.join(temp_dir, f"intro_silence_{timestamp}.wav")
+                    silence_cmd = [
+                        FFMPEG_PATH, "-y", "-f", "lavfi",
+                        "-i", f"anullsrc=r=24000:cl=mono",
+                        "-t", f"{intro_delay:.3f}", intro_silence
+                    ]
+                    subprocess.run(silence_cmd, creationflags=subprocess.CREATE_NO_WINDOW, capture_output=True, check=True)
+                    
+                    vo_inputs += ["-i", intro_silence]
+                    vo_filter.append(f"[{vo_idx}:a]")
+                    vo_idx += 1
+                    
+                    # 2. Add each scene's voiceover or silence
+                    temp_files_to_clean = [intro_silence]
+                    for idx, sc in enumerate(valid_scenes, start=1):
+                        vo_path = sc.get("voiceover_audio_path")
+                        if vo_path and os.path.exists(vo_path):
+                            vo_inputs += ["-i", vo_path]
+                            vo_filter.append(f"[{vo_idx}:a]")
+                            vo_idx += 1
+                        else:
+                            sc_dur = sc.get("duration") or 5.0
+                            sc_silence = os.path.join(temp_dir, f"silence_{idx}_{sc['scene_id']}_{timestamp}.wav")
+                            silence_cmd = [
+                                FFMPEG_PATH, "-y", "-f", "lavfi",
+                                "-i", f"anullsrc=r=24000:cl=mono",
+                                "-t", f"{sc_dur:.3f}", sc_silence
+                            ]
+                            subprocess.run(silence_cmd, creationflags=subprocess.CREATE_NO_WINDOW, capture_output=True, check=True)
+                            vo_inputs += ["-i", sc_silence]
+                            temp_files_to_clean.append(sc_silence)
+                            vo_filter.append(f"[{vo_idx}:a]")
+                            vo_idx += 1
+                            
+                    # Concatenate all segment audios
+                    voiceover_compiled = os.path.normpath(os.path.join(vo_dir, f"voiceover_compiled_{timestamp}.wav"))
+                    filter_complex_str = f"{''.join(vo_filter)}concat=n={vo_idx}:v=0:a=1[aout]"
+                    concat_cmd = [FFMPEG_PATH, "-y"] + vo_inputs + [
+                        "-filter_complex", filter_complex_str,
+                        "-map", "[aout]", voiceover_compiled
+                    ]
+                    print(f"[EXPORT] Compiling voiceovers: {' '.join(concat_cmd)}")
+                    subprocess.run(concat_cmd, creationflags=subprocess.CREATE_NO_WINDOW, capture_output=True, check=True)
+                    
+                    # Clean up temp silences
+                    for temp_f in temp_files_to_clean:
+                        try:
+                            os.remove(temp_f)
+                        except OSError:
+                            pass
+
+                # Audio mixing with ducking
+                audio_track_to_merge = voiceover_compiled
+                backing_music = self.timeline_selected_audio or self.current_generated_audio
+                
+                if backing_music and os.path.exists(backing_music) and voiceover_compiled:
+                    mixed_audio = os.path.normpath(os.path.join(vo_dir, f"audio_mix_{timestamp}.wav"))
+                    
+                    threshold = float(self.ducking_threshold_var.get() or 0.08) if hasattr(self, "ducking_threshold_var") else 0.08
+                    ratio = float(self.ducking_ratio_var.get() or 6.0) if hasattr(self, "ducking_ratio_var") else 6.0
+                    attack = float(self.ducking_attack_var.get() or 100) if hasattr(self, "ducking_attack_var") else 100.0
+                    release = float(self.ducking_release_var.get() or 500) if hasattr(self, "ducking_release_var") else 500.0
+                    bg_volume = float(self.ducking_bg_volume_var.get() or 0.25) if hasattr(self, "ducking_bg_volume_var") else 0.25
+                    
+                    # Construct sidechain compression command
+                    mix_filter = (
+                        f"[0:a]volume={bg_volume}[bg_music]; "
+                        f"[bg_music][1:a]sidechaincompress=threshold={threshold}:ratio={ratio}:attack={attack}:release={release}[ducked_music]; "
+                        f"[ducked_music][1:a]amix=inputs=2:duration=longest[aout]"
                     )
+                    
+                    mix_cmd = [
+                        FFMPEG_PATH, "-y",
+                        "-i", backing_music,
+                        "-i", voiceover_compiled,
+                        "-filter_complex", mix_filter,
+                        "-map", "[aout]", mixed_audio
+                    ]
+                    print(f"[EXPORT] Mixing audio with sidechain: {' '.join(mix_cmd)}")
+                    subprocess.run(mix_cmd, creationflags=subprocess.CREATE_NO_WINDOW, capture_output=True, check=True)
+                    audio_track_to_merge = mixed_audio
+
+                final_out = stitch_out
+                audio_to_merge = audio_track_to_merge if self.project_mode == "youtube" else audio
+                
+                if merge_audio and stitch_out and os.path.exists(stitch_out) and audio_to_merge and os.path.exists(audio_to_merge):
+                    merged_out = os.path.normpath(os.path.join(
+                        self.final_mv_dir, f"Timeline_YouTube_Video_{timestamp}.mp4" if self.project_mode == "youtube" else f"Timeline_Music_Video_{timestamp}.mp4"
+                    ))
                     merge_cmd = [
                         FFMPEG_PATH, "-y",
-                        "-i", stitch_out, "-i", audio,
+                        "-i", stitch_out, "-i", audio_to_merge,
                         "-map", "0:v:0", "-map", "1:a:0",
                         "-c:v", "copy", "-c:a", "aac", "-shortest", merged_out,
                     ]
@@ -14588,14 +15796,37 @@ class LTXQueueManager:
         self.music_preview_status_frame.pack(fill=tk.X, pady=(10, 0))
 
         self._register_music_persistence_hooks()
+        self._register_autonomous_persistence_hooks()
         self._update_music_workspace_balance()
         self._reset_music_settings_to_loaded_workflow()
         self._update_music_config_summary()
         self._refresh_music_sidebar_state()
 
     def setup_chatbot_tab(self):
-        self.chatbot_shell = tk.Frame(self.chatbot_tab, padx=18, pady=18)
-        self.chatbot_shell.pack(fill=tk.BOTH, expand=True)
+        self.chatbot_scroll_shell = tk.Frame(self.chatbot_tab, padx=0, pady=0)
+        self.chatbot_scroll_shell.pack(fill=tk.BOTH, expand=True)
+        self._style_panel(self.chatbot_scroll_shell, self.colors["bg"])
+
+        self.chatbot_canvas = tk.Canvas(self.chatbot_scroll_shell, bd=0, highlightthickness=0)
+        self.chatbot_tab_scrollbar = tk.Scrollbar(self.chatbot_scroll_shell, orient="vertical", command=self.chatbot_canvas.yview)
+        
+        self.chatbot_shell = tk.Frame(self.chatbot_canvas, padx=18, pady=18)
+        self.chatbot_canvas_window_id = self.chatbot_canvas.create_window((0, 0), window=self.chatbot_shell, anchor="nw")
+        self.chatbot_canvas.configure(yscrollcommand=self.chatbot_tab_scrollbar.set)
+
+        self.chatbot_shell.bind(
+            "<Configure>",
+            lambda _event: self.chatbot_canvas.configure(scrollregion=self.chatbot_canvas.bbox("all"))
+        )
+        self.chatbot_canvas.bind(
+            "<Configure>",
+            lambda event: self.chatbot_canvas.itemconfig(self.chatbot_canvas_window_id, width=event.width)
+        )
+
+        self.chatbot_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.chatbot_tab_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        self._style_panel(self.chatbot_canvas, self.colors["bg"])
         self._style_panel(self.chatbot_shell, self.colors["bg"])
 
         self.chatbot_header_frame = tk.Frame(self.chatbot_shell)
@@ -14608,6 +15839,25 @@ class LTXQueueManager:
             "Use the assistant like a real conversation first. Chat naturally about concept, pacing, scenes, and visual direction, then create prompt drafts only when you are ready."
         )
         self.chatbot_header_eyebrow_label, self.chatbot_header_title_label, self.chatbot_header_copy_label = chatbot_intro
+
+        # Create a container inside header for the mode selector, aligned to the right
+        self.chatbot_mode_selector_frame = tk.Frame(self.chatbot_header_frame)
+        self.chatbot_mode_selector_frame.pack(side=tk.RIGHT, anchor="ne", pady=(10, 0))
+        self._style_panel(self.chatbot_mode_selector_frame, self.colors["bg"])
+        
+        mode_select_lbl = tk.Label(self.chatbot_mode_selector_frame, text="Active Workflow Mode:")
+        mode_select_lbl.pack(side=tk.TOP, anchor="w", pady=(0, 4))
+        self._style_label(mode_select_lbl, "body_strong", self.colors["bg"])
+        
+        self.chatbot_project_mode_combo = ttk.Combobox(
+            self.chatbot_mode_selector_frame,
+            textvariable=self.project_mode_combo_var,
+            values=["Music Video (MTV)", "YouTube Video (Creator)"],
+            state="readonly",
+            width=24
+        )
+        self.chatbot_project_mode_combo.pack(side=tk.TOP, anchor="w")
+        self.chatbot_project_mode_combo.bind("<<ComboboxSelected>>", self._on_project_mode_changed_gui)
 
         self.chatbot_workspace_frame = tk.Frame(self.chatbot_shell)
         self.chatbot_workspace_frame.pack(fill=tk.BOTH, expand=True)
@@ -14851,20 +16101,30 @@ class LTXQueueManager:
 
         auto_body = self.autonomous_section["body"]
 
+        # Two-column dashboard layout
+        auto_left_col = tk.Frame(auto_body)
+        auto_left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 15))
+        self._style_panel(auto_left_col, auto_body.cget("bg"))
+
+        auto_right_col = tk.Frame(auto_body, width=340)
+        auto_right_col.pack(side=tk.RIGHT, fill=tk.BOTH, padx=(15, 0))
+        auto_right_col.pack_propagate(False)
+        self._style_panel(auto_right_col, auto_body.cget("bg"))
+
         auto_desc = tk.Label(
-            auto_body,
+            auto_left_col,
             text="Describe the vibe, theme, and mood of your music video below, set a target duration, then click Start. "
                  "The pipeline will automatically plan scenes, render video, generate music, and merge everything.",
-            anchor="w", justify=tk.LEFT, wraplength=860,
+            anchor="w", justify=tk.LEFT, wraplength=520,
         )
         auto_desc.pack(anchor="w", fill=tk.X, pady=(0, 8))
         self._style_label(auto_desc, "muted", auto_body.cget("bg"))
 
-        auto_brief_label = tk.Label(auto_body, text="Creative Brief:", anchor="w")
+        auto_brief_label = tk.Label(auto_left_col, text="Creative Brief:", anchor="w")
         auto_brief_label.pack(anchor="w", pady=(0, 4))
         self._style_label(auto_brief_label, "body_strong", auto_body.cget("bg"))
 
-        self.autonomous_brief_text = tk.Text(auto_body, height=4, wrap=tk.WORD)
+        self.autonomous_brief_text = tk.Text(auto_left_col, height=4, wrap=tk.WORD)
         self.autonomous_brief_text.pack(fill=tk.X, pady=(0, 10))
         self.autonomous_brief_text.insert("1.0", "")
         self.autonomous_brief_text.configure(
@@ -14873,8 +16133,9 @@ class LTXQueueManager:
             highlightthickness=1, highlightcolor=self.colors["accent"],
             highlightbackground=self.colors["border"],
         )
+        self.autonomous_brief_text.bind("<KeyRelease>", self._on_autonomous_text_changed)
 
-        auto_controls = tk.Frame(auto_body)
+        auto_controls = tk.Frame(auto_left_col)
         auto_controls.pack(fill=tk.X, pady=(0, 8))
         self._style_panel(auto_controls, auto_body.cget("bg"))
 
@@ -14896,7 +16157,7 @@ class LTXQueueManager:
         self._update_autonomous_scene_estimate()
 
         # ── Aspect Ratio selector ──
-        auto_aspect_row = tk.Frame(auto_body)
+        auto_aspect_row = tk.Frame(auto_left_col)
         auto_aspect_row.pack(fill=tk.X, pady=(0, 8))
         self._style_panel(auto_aspect_row, auto_body.cget("bg"))
 
@@ -14922,12 +16183,12 @@ class LTXQueueManager:
         )
         self.autonomous_aspect_combo.pack(side=tk.LEFT, padx=(0, 12))
 
-        aspect_hint = tk.Label(auto_aspect_row, text="Sets image + video resolution", anchor="w")
+        aspect_hint = tk.Label(auto_aspect_row, text="Sets resolution", anchor="w")
         aspect_hint.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self._style_label(aspect_hint, "muted", auto_body.cget("bg"))
 
         # ── Quality Preset selector ──
-        auto_quality_row = tk.Frame(auto_body)
+        auto_quality_row = tk.Frame(auto_left_col)
         auto_quality_row.pack(fill=tk.X, pady=(0, 8))
         self._style_panel(auto_quality_row, auto_body.cget("bg"))
 
@@ -14943,12 +16204,12 @@ class LTXQueueManager:
         )
         self.autonomous_quality_combo.pack(side=tk.LEFT, padx=(0, 12))
 
-        quality_hint = tk.Label(auto_quality_row, text="Controls LLM thinking depth and prompt review", anchor="w")
+        quality_hint = tk.Label(auto_quality_row, text="Controls thinking depth", anchor="w")
         quality_hint.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self._style_label(quality_hint, "muted", auto_body.cget("bg"))
 
         # ── Video Model Preset selector ──
-        auto_model_row = tk.Frame(auto_body)
+        auto_model_row = tk.Frame(auto_left_col)
         auto_model_row.pack(fill=tk.X, pady=(0, 8))
         self._style_panel(auto_model_row, auto_body.cget("bg"))
 
@@ -14969,12 +16230,13 @@ class LTXQueueManager:
         self._style_label(self.autonomous_preset_vram_hint, "muted", auto_body.cget("bg"))
         self._update_preset_vram_label()
 
-        auto_btn_row = tk.Frame(auto_body)
-        auto_btn_row.pack(fill=tk.X, pady=(0, 8))
+        # Place execution controls in Right Column
+        auto_btn_row = tk.Frame(auto_right_col)
+        auto_btn_row.pack(fill=tk.X, pady=(10, 8))
         self._style_panel(auto_btn_row, auto_body.cget("bg"))
 
         self.autonomous_start_btn = tk.Button(
-            auto_btn_row, text="🚀  Start Autonomous Generation",
+            auto_btn_row, text="🚀  Start Generation",
             command=self._start_autonomous_pipeline,
         )
         self.autonomous_start_btn.pack(side=tk.LEFT, padx=(0, 8))
@@ -14987,8 +16249,8 @@ class LTXQueueManager:
         self.autonomous_cancel_btn.pack(side=tk.LEFT)
         self._style_button(self.autonomous_cancel_btn, "danger")
 
-        auto_progress_frame = tk.Frame(auto_body)
-        auto_progress_frame.pack(fill=tk.X, pady=(0, 4))
+        auto_progress_frame = tk.Frame(auto_right_col)
+        auto_progress_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
         self._style_panel(auto_progress_frame, auto_body.cget("bg"))
 
         self.autonomous_progress_var = tk.IntVar(value=0)
@@ -14998,7 +16260,7 @@ class LTXQueueManager:
         )
         self.autonomous_progressbar.pack(fill=tk.X, pady=(0, 6))
 
-        self.autonomous_status_label = tk.Label(auto_progress_frame, text="Ready. Enter a creative brief and click Start.", anchor="w", justify=tk.LEFT)
+        self.autonomous_status_label = tk.Label(auto_progress_frame, text="Ready. Enter brief and click Start.", anchor="w", justify=tk.LEFT)
         self.autonomous_status_label.pack(anchor="w", fill=tk.X)
         self._style_label(self.autonomous_status_label, "body", auto_body.cget("bg"))
 
@@ -15008,6 +16270,297 @@ class LTXQueueManager:
             plbl.pack(anchor="w")
             self._style_label(plbl, "muted", auto_body.cget("bg"))
             self.autonomous_phase_labels[phase_key] = plbl
+
+        # ── Autonomous YouTube Creator Panel ──
+        self.autonomous_youtube_section = self._create_collapsible_section(
+            self.chatbot_workspace_frame,
+            "autonomous_youtube_mode",
+            "🚀 Autonomous YouTube Creator",
+            meta_text="One-click scripting & voiceover video",
+            is_open=True,
+            body_expand=False,
+            body_background=self.colors["surface"],
+        )
+        self._style_panel(self.autonomous_youtube_section["container"], self.colors["surface"], border=True)
+        self._style_panel(self.autonomous_youtube_section["header"], self.colors["surface"])
+        self._style_panel(self.autonomous_youtube_section["body"], self.colors["surface"])
+        self._style_label(self.autonomous_youtube_section["title"], "section", self.autonomous_youtube_section["header"].cget("bg"))
+        self._style_label(self.autonomous_youtube_section["meta"], "muted", self.autonomous_youtube_section["header"].cget("bg"))
+        self._style_button(self.autonomous_youtube_section["toggle"], "ghost", compact=True)
+
+        yt_auto_body = self.autonomous_youtube_section["body"]
+
+        # Two-column dashboard layout
+        yt_auto_left_col = tk.Frame(yt_auto_body)
+        yt_auto_left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 15))
+        self._style_panel(yt_auto_left_col, yt_auto_body.cget("bg"))
+
+        yt_auto_right_col = tk.Frame(yt_auto_body, width=340)
+        yt_auto_right_col.pack(side=tk.RIGHT, fill=tk.BOTH, padx=(15, 0))
+        yt_auto_right_col.pack_propagate(False)
+        self._style_panel(yt_auto_right_col, yt_auto_body.cget("bg"))
+
+        yt_auto_desc = tk.Label(
+            yt_auto_left_col,
+            text="Describe the topic, outline, and style of your YouTube video below, set a target duration, then click Start. "
+                 "The pipeline will automatically write a script, clone your voice, render scenes, generate backing music, and merge/duck everything.",
+            anchor="w", justify=tk.LEFT, wraplength=520,
+        )
+        yt_auto_desc.pack(anchor="w", fill=tk.X, pady=(0, 8))
+        self._style_label(yt_auto_desc, "muted", yt_auto_body.cget("bg"))
+
+        yt_auto_brief_label = tk.Label(yt_auto_left_col, text="Creative Brief:", anchor="w")
+        yt_auto_brief_label.pack(anchor="w", pady=(0, 4))
+        self._style_label(yt_auto_brief_label, "body_strong", yt_auto_body.cget("bg"))
+
+        self.youtube_autonomous_brief_text = tk.Text(yt_auto_left_col, height=4, wrap=tk.WORD)
+        self.youtube_autonomous_brief_text.pack(fill=tk.X, pady=(0, 10))
+        self.youtube_autonomous_brief_text.insert("1.0", "")
+        self.youtube_autonomous_brief_text.configure(
+            bg=self.colors["card"], fg=self.colors["text"],
+            insertbackground=self.colors["text"], relief=tk.FLAT,
+            highlightthickness=1, highlightcolor=self.colors["accent"],
+            highlightbackground=self.colors["border"],
+        )
+        self.youtube_autonomous_brief_text.bind("<KeyRelease>", self._on_autonomous_text_changed)
+
+        yt_auto_controls = tk.Frame(yt_auto_left_col)
+        yt_auto_controls.pack(fill=tk.X, pady=(0, 8))
+        self._style_panel(yt_auto_controls, yt_auto_body.cget("bg"))
+
+        yt_dur_label = tk.Label(yt_auto_controls, text="Target Duration (seconds):")
+        yt_dur_label.pack(side=tk.LEFT, padx=(0, 6))
+        self._style_label(yt_dur_label, "body_strong", yt_auto_body.cget("bg"))
+
+        self.youtube_autonomous_duration_var = tk.StringVar(value="120")
+        self.youtube_autonomous_duration_entry = tk.Spinbox(
+            yt_auto_controls, from_=5, to=3600, increment=5,
+            textvariable=self.youtube_autonomous_duration_var, width=8,
+        )
+        self.youtube_autonomous_duration_entry.pack(side=tk.LEFT, padx=(0, 12))
+        self.youtube_autonomous_duration_var.trace_add("write", self._update_youtube_autonomous_scene_estimate)
+
+        self.youtube_autonomous_estimate_label = tk.Label(yt_auto_controls, text="", anchor="w")
+        self.youtube_autonomous_estimate_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._style_label(self.youtube_autonomous_estimate_label, "muted", yt_auto_body.cget("bg"))
+        self._update_youtube_autonomous_scene_estimate()
+
+        # ── Aspect Ratio selector ──
+        yt_auto_aspect_row = tk.Frame(yt_auto_left_col)
+        yt_auto_aspect_row.pack(fill=tk.X, pady=(0, 8))
+        self._style_panel(yt_auto_aspect_row, yt_auto_body.cget("bg"))
+
+        yt_aspect_label = tk.Label(yt_auto_aspect_row, text="Aspect Ratio:")
+        yt_aspect_label.pack(side=tk.LEFT, padx=(0, 6))
+        self._style_label(yt_aspect_label, "body_strong", yt_auto_body.cget("bg"))
+
+        self.youtube_autonomous_aspect_ratio_var = tk.StringVar(value="16:9 (1280×720)")
+        self.youtube_autonomous_aspect_combo = ttk.Combobox(
+            yt_auto_aspect_row, textvariable=self.youtube_autonomous_aspect_ratio_var,
+            values=[
+                "16:9 (1920×1080)",
+                "16:9 (1280×720)",
+                "16:9 (960×544)",
+                "9:16 (1080×1920)",
+                "9:16 (720×1280)",
+                "1:1 (1024×1024)",
+                "1:1 (768×768)",
+                "4:3 (1280×960)",
+                "3:4 (960×1280)",
+            ],
+            state="readonly", width=22,
+        )
+        self.youtube_autonomous_aspect_combo.pack(side=tk.LEFT, padx=(0, 12))
+
+        yt_aspect_hint = tk.Label(yt_auto_aspect_row, text="Sets resolution", anchor="w")
+        yt_aspect_hint.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._style_label(yt_aspect_hint, "muted", yt_auto_body.cget("bg"))
+
+        # ── Quality Preset selector ──
+        yt_auto_quality_row = tk.Frame(yt_auto_left_col)
+        yt_auto_quality_row.pack(fill=tk.X, pady=(0, 8))
+        self._style_panel(yt_auto_quality_row, yt_auto_body.cget("bg"))
+
+        yt_quality_label = tk.Label(yt_auto_quality_row, text="AI Quality:")
+        yt_quality_label.pack(side=tk.LEFT, padx=(0, 6))
+        self._style_label(yt_quality_label, "body_strong", yt_auto_body.cget("bg"))
+
+        self.youtube_autonomous_quality_preset_var = tk.StringVar(value="Balanced")
+        self.youtube_autonomous_quality_combo = ttk.Combobox(
+            yt_auto_quality_row, textvariable=self.youtube_autonomous_quality_preset_var,
+            values=["Fast", "Balanced", "Quality"],
+            state="readonly", width=12,
+        )
+        self.youtube_autonomous_quality_combo.pack(side=tk.LEFT, padx=(0, 12))
+
+        yt_quality_hint = tk.Label(yt_auto_quality_row, text="Controls thinking depth", anchor="w")
+        yt_quality_hint.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._style_label(yt_quality_hint, "muted", yt_auto_body.cget("bg"))
+
+        # ── Video Model Preset selector ──
+        yt_auto_model_row = tk.Frame(yt_auto_left_col)
+        yt_auto_model_row.pack(fill=tk.X, pady=(0, 8))
+        self._style_panel(yt_auto_model_row, yt_auto_body.cget("bg"))
+
+        yt_model_label = tk.Label(yt_auto_model_row, text="Video Model:")
+        yt_model_label.pack(side=tk.LEFT, padx=(0, 6))
+        self._style_label(yt_model_label, "body_strong", yt_auto_body.cget("bg"))
+
+        self.youtube_autonomous_model_preset_combo = ttk.Combobox(
+            yt_auto_model_row, textvariable=self.video_model_preset_var,
+            values=list(self.video_preset_key_to_label.values()),
+            state="readonly", width=22,
+        )
+        self.youtube_autonomous_model_preset_combo.pack(side=tk.LEFT, padx=(0, 12))
+        self.youtube_autonomous_model_preset_combo.bind("<<ComboboxSelected>>", self.on_video_model_preset_changed)
+
+        self.youtube_autonomous_preset_vram_hint = tk.Label(yt_auto_model_row, text="", anchor="w")
+        self.youtube_autonomous_preset_vram_hint.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._style_label(self.youtube_autonomous_preset_vram_hint, "muted", yt_auto_body.cget("bg"))
+
+        # ── Voiceover & Ducking Parameters Collapsible Sub-Section ──
+        self.youtube_voice_duck_section = self._create_collapsible_section(
+            yt_auto_left_col,
+            "youtube_voice_duck_params",
+            "🎙️ Voiceover & Ducking Parameters",
+            meta_text="Configure speaker & compression",
+            is_open=False,
+            body_expand=False,
+            body_background=self.colors["surface"]
+        )
+        self.youtube_voice_duck_section["container"].pack(fill=tk.X, pady=(0, 10))
+        self._style_panel(self.youtube_voice_duck_section["container"], self.colors["surface"], border=True)
+        self._style_panel(self.youtube_voice_duck_section["header"], self.colors["surface"])
+        self._style_panel(self.youtube_voice_duck_section["body"], self.colors["surface"])
+        self._style_label(self.youtube_voice_duck_section["title"], "body_strong", self.youtube_voice_duck_section["header"].cget("bg"))
+        self._style_label(self.youtube_voice_duck_section["meta"], "muted", self.youtube_voice_duck_section["header"].cget("bg"))
+        self._style_button(self.youtube_voice_duck_section["toggle"], "ghost", compact=True)
+        
+        yt_vd_body = self.youtube_voice_duck_section["body"]
+
+        # Python Env Path
+        vd_py_row = tk.Frame(yt_vd_body)
+        vd_py_row.pack(fill=tk.X, pady=(0, 8))
+        self._style_panel(vd_py_row, yt_vd_body.cget("bg"))
+        vd_py_lbl = tk.Label(vd_py_row, text="Python Env Path:", width=15, anchor="w")
+        vd_py_lbl.pack(side=tk.LEFT)
+        self._style_label(vd_py_lbl, "body", vd_py_row.cget("bg"))
+        vd_py_entry = tk.Entry(vd_py_row, textvariable=self.vibevoice_python_var)
+        vd_py_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        self._style_text_input(vd_py_entry)
+        vd_py_btn = tk.Button(vd_py_row, text="Browse...", command=self._browse_python_exe)
+        vd_py_btn.pack(side=tk.LEFT)
+        self._style_button(vd_py_btn, "secondary")
+
+        # Voice Speaker & Wizard
+        vd_spk_row = tk.Frame(yt_vd_body)
+        vd_spk_row.pack(fill=tk.X, pady=(0, 8))
+        self._style_panel(vd_spk_row, yt_vd_body.cget("bg"))
+        vd_spk_lbl = tk.Label(vd_spk_row, text="Voice Speaker:", width=15, anchor="w")
+        vd_spk_lbl.pack(side=tk.LEFT)
+        self._style_label(vd_spk_lbl, "body", vd_spk_row.cget("bg"))
+        speakers = self._get_available_speakers()
+        self.youtube_speaker_combo = ttk.Combobox(
+            vd_spk_row,
+            textvariable=self.vibevoice_speaker_var,
+            values=speakers,
+            width=13,
+            style="TCombobox"
+        )
+        self.youtube_speaker_combo.pack(side=tk.LEFT, padx=5)
+        
+        vd_wiz_btn = tk.Button(
+            vd_spk_row,
+            text="🎙️ Record / Clone Voice Wizard",
+            command=self._open_voice_cloning_wizard,
+            bg="#22c55e",
+            fg="white",
+            font=("Segoe UI", 9, "bold")
+        )
+        vd_wiz_btn.pack(side=tk.LEFT, padx=(10, 0))
+
+        # Ducking parameters grid
+        vd_duck_row = tk.Frame(yt_vd_body)
+        vd_duck_row.pack(fill=tk.X, pady=(4, 0))
+        self._style_panel(vd_duck_row, yt_vd_body.cget("bg"))
+        vd_duck_row.grid_columnconfigure((0, 1, 2, 3, 4, 5), weight=1)
+        
+        vd_duck_params = [
+            ("Threshold", self.ducking_threshold_var),
+            ("Ratio", self.ducking_ratio_var),
+            ("Attack (ms)", self.ducking_attack_var),
+            ("Release (ms)", self.ducking_release_var),
+            ("BG Music Vol", self.ducking_bg_volume_var),
+            ("Intro Delay (s)", self.ducking_intro_delay_var)
+        ]
+        
+        for idx, (label_txt, var) in enumerate(vd_duck_params):
+            cell = tk.Frame(vd_duck_row)
+            cell.grid(row=0, column=idx, sticky="ew", padx=3)
+            self._style_panel(cell, yt_vd_body.cget("bg"))
+            
+            lbl = tk.Label(cell, text=label_txt, font=("Segoe UI", 8))
+            lbl.pack(anchor="w")
+            self._style_label(lbl, "muted", cell.cget("bg"))
+            
+            ent = tk.Entry(cell, textvariable=var, width=8)
+            ent.pack(fill=tk.X, pady=(2, 0))
+            self._style_text_input(ent)
+
+        # Place execution controls in Right Column
+        yt_auto_btn_row = tk.Frame(yt_auto_right_col)
+        yt_auto_btn_row.pack(fill=tk.X, pady=(10, 8))
+        self._style_panel(yt_auto_btn_row, yt_auto_body.cget("bg"))
+
+        self.youtube_autonomous_start_btn = tk.Button(
+            yt_auto_btn_row, text="🚀  Start Creation",
+            command=self._start_autonomous_pipeline,
+        )
+        self.youtube_autonomous_start_btn.pack(side=tk.LEFT, padx=(0, 8))
+        self._style_button(self.youtube_autonomous_start_btn, "primary")
+
+        self.youtube_autonomous_cancel_btn = tk.Button(
+            yt_auto_btn_row, text="Cancel",
+            command=self._cancel_autonomous_pipeline, state=tk.DISABLED,
+        )
+        self.youtube_autonomous_cancel_btn.pack(side=tk.LEFT)
+        self._style_button(self.youtube_autonomous_cancel_btn, "danger")
+
+        yt_auto_progress_frame = tk.Frame(yt_auto_right_col)
+        yt_auto_progress_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
+        self._style_panel(yt_auto_progress_frame, yt_auto_body.cget("bg"))
+
+        self.youtube_autonomous_progress_var = tk.IntVar(value=0)
+        self.youtube_autonomous_progressbar = ttk.Progressbar(
+            yt_auto_progress_frame, variable=self.youtube_autonomous_progress_var,
+            maximum=100, mode="determinate",
+        )
+        self.youtube_autonomous_progressbar.pack(fill=tk.X, pady=(0, 6))
+
+        self.youtube_autonomous_status_label = tk.Label(yt_auto_progress_frame, text="Ready. Enter brief and click Start.", anchor="w", justify=tk.LEFT)
+        self.youtube_autonomous_status_label.pack(anchor="w", fill=tk.X)
+        self._style_label(self.youtube_autonomous_status_label, "body", yt_auto_body.cget("bg"))
+
+        self.youtube_autonomous_phase_labels = {}
+        yt_phase_labels_map = {
+            AUTONOMOUS_STATE_EXPANDING_CONCEPT: "Expanding Concept",
+            AUTONOMOUS_STATE_PLANNING_SCENES: "Writing Script & Scenes",
+            AUTONOMOUS_STATE_PLANNING_SONG: "Bypassed (No Song Lyrics)",
+            AUTONOMOUS_STATE_GENERATING_IMAGES: "Generating Start Frames",
+            AUTONOMOUS_STATE_BUILDING_TIMELINE: "Synthesizing Voiceovers",
+            AUTONOMOUS_STATE_RENDERING: "Rendering Video Scenes",
+            AUTONOMOUS_STATE_STITCHING: "Stitching Video Clips",
+            AUTONOMOUS_STATE_GENERATING_MUSIC: "Generating Backing Music",
+            AUTONOMOUS_STATE_MERGING: "Final Ducking & Merge",
+        }
+        for phase_key in AUTONOMOUS_PHASE_ORDER:
+            lbl_txt = yt_phase_labels_map.get(phase_key, AUTONOMOUS_PHASE_LABELS[phase_key])
+            plbl = tk.Label(yt_auto_progress_frame, text=f"  ○  {lbl_txt}", anchor="w")
+            plbl.pack(anchor="w")
+            self._style_label(plbl, "muted", yt_auto_body.cget("bg"))
+            self.youtube_autonomous_phase_labels[phase_key] = plbl
+
+        self._update_preset_vram_label()
 
         self._update_chatbot_workspace_balance()
         self._on_chatbot_task_changed()
@@ -15090,9 +16643,17 @@ class LTXQueueManager:
             node_data = workflow.get(node_id)
             if not node_data:
                 continue
-            node_inputs = node_data.setdefault("inputs", {})
-            node_inputs[role_ref["input"]] = value
-            updated_count += 1
+            if "widget_index" in role_ref:
+                widgets_values = node_data.setdefault("widgets_values", [])
+                idx = role_ref["widget_index"]
+                while len(widgets_values) <= idx:
+                    widgets_values.append(None)
+                widgets_values[idx] = value
+                updated_count += 1
+            else:
+                node_inputs = node_data.setdefault("inputs", {})
+                node_inputs[role_ref["input"]] = value
+                updated_count += 1
         return updated_count
 
     def _get_workflow_role_value(self, workflow, role_name, default="", profile_key=None):
@@ -15531,6 +17092,44 @@ class LTXQueueManager:
     def _on_music_setting_changed(self, *_args):
         self._schedule_project_state_save()
 
+    def _on_autonomous_text_changed(self, event=None):
+        self._schedule_project_state_save()
+
+    def _on_autonomous_setting_changed(self, *args):
+        self._schedule_project_state_save()
+
+    def _on_global_setting_changed(self, *args):
+        self.save_global_settings()
+
+    def _register_autonomous_persistence_hooks(self):
+        # 1. Register traces for project-specific autonomous inputs
+        for var_name in [
+            "autonomous_duration_var",
+            "youtube_autonomous_duration_var",
+            "autonomous_aspect_ratio_var",
+            "youtube_autonomous_aspect_ratio_var",
+            "autonomous_quality_preset_var",
+            "youtube_autonomous_quality_preset_var"
+        ]:
+            if hasattr(self, var_name):
+                var = getattr(self, var_name)
+                var.trace_add("write", self._on_autonomous_setting_changed)
+
+        # 2. Register traces for global voice & ducking inputs
+        for var_name in [
+            "vibevoice_python_var",
+            "vibevoice_speaker_var",
+            "ducking_threshold_var",
+            "ducking_ratio_var",
+            "ducking_attack_var",
+            "ducking_release_var",
+            "ducking_bg_volume_var",
+            "ducking_intro_delay_var"
+        ]:
+            if hasattr(self, var_name):
+                var = getattr(self, var_name)
+                var.trace_add("write", self._on_global_setting_changed)
+
     def _register_music_persistence_hooks(self):
         for variable in [
             self.music_duration_var,
@@ -15620,12 +17219,12 @@ class LTXQueueManager:
         self._on_music_setting_changed()
 
     def _get_active_music_model_filename(self):
-        variant = self.music_model_variant_var.get()
+        variant = self.music_model_variant_var.get() if hasattr(self, "music_model_variant_var") else MUSIC_MODEL_VARIANT_DEFAULT
         info = MUSIC_MODEL_VARIANT_MAP.get(variant, MUSIC_MODEL_VARIANT_MAP[MUSIC_MODEL_VARIANT_DEFAULT])
         return info["filename"]
 
     def _get_active_music_manifest_id(self):
-        variant = self.music_model_variant_var.get()
+        variant = self.music_model_variant_var.get() if hasattr(self, "music_model_variant_var") else MUSIC_MODEL_VARIANT_DEFAULT
         info = MUSIC_MODEL_VARIANT_MAP.get(variant, MUSIC_MODEL_VARIANT_MAP[MUSIC_MODEL_VARIANT_DEFAULT])
         return info["manifest_id"]
 
@@ -16477,6 +18076,8 @@ class LTXQueueManager:
             self.video_preset_vram_label.config(text=vram_text)
         if hasattr(self, "autonomous_preset_vram_hint"):
             self.autonomous_preset_vram_hint.config(text=vram_text)
+        if hasattr(self, "youtube_autonomous_preset_vram_hint") and self.youtube_autonomous_preset_vram_hint:
+            self.youtube_autonomous_preset_vram_hint.config(text=vram_text)
 
     def _get_selected_video_model_preset_key(self):
         selected_label = self.video_model_preset_var.get()
@@ -17019,6 +18620,49 @@ class LTXQueueManager:
             _w.bind("<MouseWheel>", self._redirect_scroll_to_scene_canvas)
             _w.bind("<Button-4>", self._redirect_scroll_to_scene_canvas)
             _w.bind("<Button-5>", self._redirect_scroll_to_scene_canvas)
+
+        # Voiceover segment fields (only shown/active in YouTube Mode)
+        frame.voiceover_val = str(scene_data.get("voiceover", "") or "").strip()
+        frame.voiceover_audio_path = self._normalize_path(scene_data.get("voiceover_audio_path"))
+        frame.audio_duration = float(scene_data.get("audio_duration", 0.0) or 0.0)
+
+        # Voiceover widgets
+        frame.voiceover_label = tk.Label(body_row, text="Voiceover")
+        self._style_label(frame.voiceover_label, "muted", self.colors["card"])
+
+        frame.voiceover_shell = tk.Frame(body_row)
+        self._style_panel(frame.voiceover_shell, self.colors["card"])
+
+        frame.voiceover_text = tk.Text(frame.voiceover_shell, height=2, width=50, wrap=tk.WORD)
+        frame.voiceover_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._style_text_input(frame.voiceover_text, multiline=True)
+
+        frame.voiceover_scrollbar = tk.Scrollbar(frame.voiceover_shell, orient=tk.VERTICAL, command=frame.voiceover_text.yview)
+        frame.voiceover_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        frame.voiceover_text.configure(yscrollcommand=frame.voiceover_scrollbar.set)
+
+        if frame.voiceover_val:
+            frame.voiceover_text.insert("1.0", frame.voiceover_val)
+
+        # Sync voiceover changes dynamically to state
+        frame.voiceover_text.bind("<KeyRelease>", lambda _event, f=frame: self._handle_scene_voiceover_edit(f))
+
+        # Voiceover Audio Status row
+        frame.voiceover_audio_lbl = tk.Label(body_row, text="Voiceover Audio")
+        self._style_label(frame.voiceover_audio_lbl, "muted", self.colors["card"])
+
+        audio_info = "No voiceover generated yet."
+        if frame.voiceover_audio_path and os.path.exists(frame.voiceover_audio_path):
+            audio_info = f"{os.path.basename(frame.voiceover_audio_path)} ({frame.audio_duration:.2f}s)"
+        frame.voiceover_audio_status_lbl = tk.Label(body_row, text=audio_info, anchor="w")
+        self._style_label(frame.voiceover_audio_status_lbl, "muted", self.colors["card"])
+
+        # Display if YouTube Creator mode is active
+        if getattr(self, "project_mode", "mtv") == "youtube":
+            frame.voiceover_label.grid(row=7, column=0, sticky="nw", pady=(4, 6))
+            frame.voiceover_shell.grid(row=7, column=1, sticky="ew", pady=(4, 6))
+            frame.voiceover_audio_lbl.grid(row=8, column=0, sticky="w", pady=(0, 6))
+            frame.voiceover_audio_status_lbl.grid(row=8, column=1, sticky="ew", pady=(0, 6))
 
         self.scene_entry_frames.append(frame)
         self._refresh_scene_version_controls(frame)
@@ -17864,7 +19508,10 @@ class LTXQueueManager:
                     render_status=getattr(frame, "render_status", "pending"),
                     version_count=frame.version_count_var.get() if hasattr(frame, "version_count_var") else 1,
                     output_versions=copy.deepcopy(getattr(frame, "output_versions", [])),
-                    active_output_version_id=getattr(frame, "active_output_version_id", None)
+                    active_output_version_id=getattr(frame, "active_output_version_id", None),
+                    voiceover=frame.voiceover_text.get("1.0", tk.END).strip() if hasattr(frame, "voiceover_text") else getattr(frame, "voiceover_val", ""),
+                    voiceover_audio_path=getattr(frame, "voiceover_audio_path", None),
+                    audio_duration=getattr(frame, "audio_duration", 0.0)
                 )
             )
         return self._reindex_ordered_entries(scene_entries)
@@ -18018,7 +19665,134 @@ class LTXQueueManager:
             break
         self._update_prompt_collection_summary()
 
-    def _build_i2v_workflow_for_scene(self, prompt_text, image_path, filename_prefix, video_settings):
+    def _get_audio_path_for_scene(self, scene_entry):
+        audio_path = scene_entry.get("voiceover_audio_path")
+        if audio_path and os.path.exists(audio_path):
+            return audio_path
+
+        scene_id = scene_entry.get("scene_id")
+        vo_text = str(scene_entry.get("voiceover", "")).strip()
+
+        # If a voiceover is expected for this scene
+        if vo_text and scene_id:
+            # Check if it was already generated in the background
+            bg_results = getattr(self, "_bg_voiceover_results", {})
+            if scene_id in bg_results:
+                bg_path = bg_results[scene_id]
+                if os.path.exists(bg_path):
+                    duration = self._probe_clip_duration(bg_path)
+                    scene_entry["voiceover_audio_path"] = bg_path
+                    scene_entry["audio_duration"] = duration
+                    if self.visual_pacing_var.get() == "loop":
+                        scene_entry["duration"] = duration
+                    return bg_path
+
+            # If background thread is running, wait for it
+            bg_thread = getattr(self, "_voiceover_gen_thread", None)
+            if bg_thread and bg_thread.is_alive():
+                print(f"[Autonomous] Scene {scene_id} voiceover is generating in the background. Awaiting...")
+                start_wait = time.time()
+                while bg_thread.is_alive() and (time.time() - start_wait < 180):
+                    if scene_id in self._bg_voiceover_results:
+                        bg_path = self._bg_voiceover_results[scene_id]
+                        if os.path.exists(bg_path):
+                            duration = self._probe_clip_duration(bg_path)
+                            scene_entry["voiceover_audio_path"] = bg_path
+                            scene_entry["audio_duration"] = duration
+                            if self.visual_pacing_var.get() == "loop":
+                                scene_entry["duration"] = duration
+                            print(f"[Autonomous] Awaited voiceover generated successfully for scene {scene_id} in {time.time() - start_wait:.1f}s.")
+                            return bg_path
+                    time.sleep(1.0)
+
+                # Check one last time after loop
+                if scene_id in self._bg_voiceover_results:
+                    bg_path = self._bg_voiceover_results[scene_id]
+                    if os.path.exists(bg_path):
+                        duration = self._probe_clip_duration(bg_path)
+                        scene_entry["voiceover_audio_path"] = bg_path
+                        scene_entry["audio_duration"] = duration
+                        if self.visual_pacing_var.get() == "loop":
+                            scene_entry["duration"] = duration
+                        return bg_path
+
+            # If background thread died or timed out, and still not generated, run it synchronously
+            print(f"[Autonomous] Background voiceover for scene {scene_id} not found. Synthesizing synchronously...")
+            active_project = getattr(self, "current_project_dir", None)
+            if not active_project:
+                active_project = os.path.join(self.base_output_dir, "default_project")
+            vo_dir = os.path.join(active_project, "voiceovers")
+            os.makedirs(vo_dir, exist_ok=True)
+            temp_dir = os.path.join(vo_dir, "temp")
+            os.makedirs(temp_dir, exist_ok=True)
+            
+            temp_txt_name = f"sync_segment_{scene_id}.txt"
+            temp_txt_path = os.path.join(temp_dir, temp_txt_name)
+            try:
+                with open(temp_txt_path, "w", encoding="utf-8") as f:
+                    f.write(f"Speaker 1: {vo_text}\n")
+                
+                python_exe = self.vibevoice_python_var.get()
+                vibevoice_dir = self._get_vibevoice_dir()
+                device = "cpu"  # Keep on CPU to avoid ComfyUI VRAM collision
+                
+                cmd = [
+                    python_exe,
+                    os.path.join(vibevoice_dir, "demo", "inference_from_file.py"),
+                    "--model_path", "microsoft/VibeVoice-1.5b",
+                    "--txt_path", temp_txt_path,
+                    "--speaker_names", self.vibevoice_speaker_var.get(),
+                    "--output_dir", vo_dir,
+                    "--device", device
+                ]
+                print(f"[Autonomous] Running synchronous VibeVoice cmd: {' '.join(cmd)}")
+                res = subprocess.run(
+                    cmd,
+                    cwd=vibevoice_dir,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                    capture_output=True,
+                    text=True,
+                    check=False
+                )
+                if res.returncode == 0:
+                    txt_filename = os.path.splitext(temp_txt_name)[0]
+                    expected_wav_path = os.path.normpath(os.path.join(vo_dir, f"{txt_filename}_generated.wav"))
+                    if os.path.exists(expected_wav_path):
+                        duration = self._probe_clip_duration(expected_wav_path)
+                        scene_entry["voiceover_audio_path"] = expected_wav_path
+                        scene_entry["audio_duration"] = duration
+                        if self.visual_pacing_var.get() == "loop":
+                            scene_entry["duration"] = duration
+                        return expected_wav_path
+            except Exception as e:
+                print(f"[Autonomous] Synchronous voiceover generation failed: {e}")
+
+        # Generate silent audio fallback
+        sc_dur = scene_entry.get("duration") or 5.0
+        active_project = getattr(self, "current_project_dir", None)
+        if not active_project:
+            active_project = os.path.join(self.base_output_dir, "default_project")
+        
+        vo_dir = os.path.join(active_project, "voiceovers")
+        os.makedirs(vo_dir, exist_ok=True)
+        timestamp = int(time.time())
+        sc_silence = os.path.normpath(os.path.join(vo_dir, f"silence_{scene_entry.get('scene_id', 'unknown')}_{timestamp}.wav"))
+        
+        silence_cmd = [
+            FFMPEG_PATH, "-y", "-f", "lavfi",
+            "-i", "anullsrc=r=24000:cl=mono",
+            "-t", f"{sc_dur:.3f}", sc_silence
+        ]
+        try:
+            subprocess.run(silence_cmd, creationflags=subprocess.CREATE_NO_WINDOW, capture_output=True, check=True)
+            scene_entry["voiceover_audio_path"] = sc_silence
+            scene_entry["audio_duration"] = sc_dur
+            return sc_silence
+        except Exception as e:
+            self.log_debug("SILENCE_GENERATION_FAILED", error=str(e))
+            return None
+
+    def _build_i2v_workflow_for_scene(self, prompt_text, image_path, filename_prefix, video_settings, audio_path=None):
         i2v_profile = self._get_active_i2v_profile()
         roles = i2v_profile["roles"]
         workflow_to_submit = copy.deepcopy(self.i2v_workflow)
@@ -18036,6 +19810,33 @@ class LTXQueueManager:
         self._set_workflow_role_value_from_roles(workflow_to_submit, roles, "lora_name", video_settings["lora_name"])
         self._set_workflow_role_value_from_roles(workflow_to_submit, roles, "upscaler_name", video_settings["upscaler_name"])
         self._set_workflow_role_value_from_roles(workflow_to_submit, roles, "image_path", image_path)
+
+        if audio_path:
+            self._set_workflow_role_value_from_roles(workflow_to_submit, roles, "audio_start", 0.0)
+            comfy_root = self.comfyui_root
+            if comfy_root and not os.path.exists(os.path.join(comfy_root, "input")):
+                alt_root = os.path.join(comfy_root, "ComfyUI")
+                if os.path.exists(os.path.join(alt_root, "input")):
+                    comfy_root = alt_root
+            comfy_input_dir = os.path.join(comfy_root, "input")
+            if os.path.exists(comfy_input_dir) and os.path.exists(audio_path):
+                audio_filename = os.path.basename(audio_path)
+                comfy_audio_dest = os.path.join(comfy_input_dir, audio_filename)
+                try:
+                    import shutil
+                    shutil.copy2(audio_path, comfy_audio_dest)
+                    self._set_workflow_role_value_from_roles(workflow_to_submit, roles, "audio_path", audio_filename)
+                except Exception as e:
+                    print(f"Error copying audio to ComfyUI input: {e}")
+                    self._set_workflow_role_value_from_roles(workflow_to_submit, roles, "audio_path", audio_path)
+            else:
+                self._set_workflow_role_value_from_roles(workflow_to_submit, roles, "audio_path", audio_path)
+            try:
+                audio_dur = self._probe_clip_duration(audio_path)
+                if audio_dur > 0:
+                    self._set_workflow_role_value_from_roles(workflow_to_submit, roles, "duration", audio_dur)
+            except Exception:
+                pass
 
         # GGUF-specific roles: unet_name, vae_name, connectors, and audio VAE
         if self.active_workflow_type in ("gguf", "gguf_distilled"):
@@ -18127,11 +19928,13 @@ class LTXQueueManager:
         filename_prefix = self._build_video_filename_prefix(video_settings, "timeline", scene_order if scene_order > 0 else None, suffix=filename_suffix)
         if scene_entry.get("mode", SCENE_MODE_T2V) == SCENE_MODE_I2V:
             asset = self._get_image_asset_by_id(scene_entry.get("image_asset_id"))
+            audio_path = self._get_audio_path_for_scene(scene_entry)
             return self._build_i2v_workflow_for_scene(
                 prompt_text,
                 asset.get("project_path"),
                 filename_prefix,
-                video_settings
+                video_settings,
+                audio_path=audio_path
             )
         return self._build_video_workflow_for_prompt(
             prompt_text,
@@ -18684,8 +20487,21 @@ class LTXQueueManager:
             "chatbot_repeat_penalty": self.chatbot_repeat_penalty,
             "chatbot_default_to_non_thinking": self.chatbot_default_to_non_thinking,
             "chatbot_auto_launch_server": self.chatbot_auto_launch_server,
+            "chatbot_speculative_decoding_enabled": self.chatbot_speculative_decoding_enabled,
+            "chatbot_draft_model_path": self.chatbot_draft_model_path,
+            "chatbot_spec_draft_n_max": self.chatbot_spec_draft_n_max,
             "chatbot_model_family": self.chatbot_model_family,
-            "chatbot_gemma4_ollama_tag": self.chatbot_gemma4_ollama_tag
+            "chatbot_gemma4_ollama_tag": self.chatbot_gemma4_ollama_tag,
+            "project_mode": getattr(self, "project_mode", "mtv"),
+            "vibevoice_speaker": self.vibevoice_speaker_var.get() if hasattr(self, "vibevoice_speaker_var") else getattr(self, "vibevoice_speaker", "user"),
+            "vibevoice_python": self.vibevoice_python_var.get() if hasattr(self, "vibevoice_python_var") else getattr(self, "vibevoice_python", r"C:\Users\Tesla\miniconda3\envs\omni\python.exe"),
+            "ducking_threshold": self.ducking_threshold_var.get() if hasattr(self, "ducking_threshold_var") else getattr(self, "ducking_threshold", 0.08),
+            "ducking_ratio": self.ducking_ratio_var.get() if hasattr(self, "ducking_ratio_var") else getattr(self, "ducking_ratio", 6.0),
+            "ducking_attack": self.ducking_attack_var.get() if hasattr(self, "ducking_attack_var") else getattr(self, "ducking_attack", 100),
+            "ducking_release": self.ducking_release_var.get() if hasattr(self, "ducking_release_var") else getattr(self, "ducking_release", 500),
+            "ducking_bg_volume": self.ducking_bg_volume_var.get() if hasattr(self, "ducking_bg_volume_var") else getattr(self, "ducking_bg_volume", 0.25),
+            "ducking_intro_delay": self.ducking_intro_delay_var.get() if hasattr(self, "ducking_intro_delay_var") else getattr(self, "ducking_intro_delay", 2.0),
+            "visual_pacing": self.visual_pacing_var.get() if hasattr(self, "visual_pacing_var") else getattr(self, "visual_pacing", "loop")
         }
         try:
             os.makedirs(os.path.dirname(self.global_settings_file), exist_ok=True)
@@ -18699,6 +20515,19 @@ class LTXQueueManager:
             settings, loaded_from = self._read_global_settings_payload()
             self.is_first_launch = loaded_from is None
             self._sync_runtime_paths(settings)
+            
+            # YouTube Creator Mode Settings
+            self.project_mode = settings.get("project_mode", "mtv")
+            self.vibevoice_speaker = settings.get("vibevoice_speaker", "user")
+            self.vibevoice_python = settings.get("vibevoice_python", r"C:\Users\Tesla\miniconda3\envs\omni\python.exe")
+            self.ducking_threshold = float(settings.get("ducking_threshold", 0.08))
+            self.ducking_ratio = float(settings.get("ducking_ratio", 6.0))
+            self.ducking_attack = int(settings.get("ducking_attack", 100))
+            self.ducking_release = int(settings.get("ducking_release", 500))
+            self.ducking_bg_volume = float(settings.get("ducking_bg_volume", 0.25))
+            self.ducking_intro_delay = float(settings.get("ducking_intro_delay", 2.0))
+            self.visual_pacing = settings.get("visual_pacing", "loop")
+            
             chatbot_settings_dirty = False
 
             self._load_video_profile_state(
@@ -18776,6 +20605,12 @@ class LTXQueueManager:
                 self.chatbot_repeat_penalty = DEFAULT_CHATBOT_REPEAT_PENALTY
             self.chatbot_default_to_non_thinking = bool(settings.get("chatbot_default_to_non_thinking", DEFAULT_CHATBOT_DEFAULT_TO_NON_THINKING))
             self.chatbot_auto_launch_server = bool(settings.get("chatbot_auto_launch_server", False))
+            self.chatbot_speculative_decoding_enabled = bool(settings.get("chatbot_speculative_decoding_enabled", False))
+            self.chatbot_draft_model_path = self._normalize_path(settings.get("chatbot_draft_model_path")) or ""
+            try:
+                self.chatbot_spec_draft_n_max = max(1, min(16, int(settings.get("chatbot_spec_draft_n_max", 4))))
+            except (TypeError, ValueError):
+                self.chatbot_spec_draft_n_max = 4
             saved_model_family = str(settings.get("chatbot_model_family", DEFAULT_CHATBOT_MODEL_FAMILY)).strip().lower()
             self.chatbot_model_family = saved_model_family if saved_model_family in {CHATBOT_MODEL_FAMILY_QWEN3, CHATBOT_MODEL_FAMILY_GEMMA4} else DEFAULT_CHATBOT_MODEL_FAMILY
             saved_gemma4_tag = str(settings.get("chatbot_gemma4_ollama_tag", DEFAULT_GEMMA4_OLLAMA_TAG)).strip()
@@ -18795,6 +20630,18 @@ class LTXQueueManager:
             self._refresh_chatbot_runtime_ui()
             self.load_tutorial_phase_history()
             self._load_comfyui_readiness_history()
+
+            if hasattr(self, "project_mode_combo_var"):
+                self.project_mode_combo_var.set("Music Video (MTV)" if self.project_mode == "mtv" else "YouTube Video (Creator)")
+            if hasattr(self, "youtube_settings_frame"):
+                if self.project_mode == "youtube":
+                    self.youtube_settings_frame.pack(fill=tk.X, pady=(0, 12))
+                else:
+                    self.youtube_settings_frame.pack_forget()
+                if hasattr(self, "settings_actions_frame"):
+                    self.settings_actions_frame.pack_forget()
+                    self.settings_actions_frame.pack(fill=tk.X)
+            self._refresh_tab_labels_for_project_mode()
 
             # On first launch, let the user choose where to store projects
             if self.is_first_launch and not settings.get("output_root"):
@@ -19305,6 +21152,13 @@ class LTXQueueManager:
             "selected_video_for_music": self.selected_video_for_music,
             "current_final_video": getattr(self, 'current_final_video', None),
             "autonomous_target_duration": self.autonomous_target_duration,
+            "autonomous_brief": self.autonomous_brief_text.get("1.0", tk.END).strip() if hasattr(self, "autonomous_brief_text") else getattr(self, "autonomous_creative_brief", ""),
+            "youtube_autonomous_brief": self.youtube_autonomous_brief_text.get("1.0", tk.END).strip() if hasattr(self, "youtube_autonomous_brief_text") else "",
+            "youtube_autonomous_duration": self.youtube_autonomous_duration_var.get() if hasattr(self, "youtube_autonomous_duration_var") else "120",
+            "autonomous_aspect_ratio": self.autonomous_aspect_ratio_var.get() if hasattr(self, "autonomous_aspect_ratio_var") else "16:9 (1280×720)",
+            "youtube_autonomous_aspect_ratio": self.youtube_autonomous_aspect_ratio_var.get() if hasattr(self, "youtube_autonomous_aspect_ratio_var") else "16:9 (1280×720)",
+            "autonomous_quality_preset": self.autonomous_quality_preset_var.get() if hasattr(self, "autonomous_quality_preset_var") else "Balanced",
+            "youtube_autonomous_quality_preset": self.youtube_autonomous_quality_preset_var.get() if hasattr(self, "youtube_autonomous_quality_preset_var") else "Balanced",
             "timeline_arrangement": self.timeline_arrangement,
             "timeline_excluded_scene_ids": list(self.timeline_excluded_scene_ids or []),
             "timeline_imported_clips": list(self.timeline_imported_clips or []),
@@ -19401,6 +21255,30 @@ class LTXQueueManager:
                     self.autonomous_target_duration = int(saved_auto_dur)
                     if hasattr(self, "autonomous_duration_var"):
                         self.autonomous_duration_var.set(str(self.autonomous_target_duration))
+
+                # Dynamic restores for autonomous inputs
+                if hasattr(self, "autonomous_brief_text"):
+                    self.autonomous_brief_text.delete("1.0", tk.END)
+                    self.autonomous_brief_text.insert("1.0", state.get("autonomous_brief", ""))
+                
+                if hasattr(self, "youtube_autonomous_brief_text"):
+                    self.youtube_autonomous_brief_text.delete("1.0", tk.END)
+                    self.youtube_autonomous_brief_text.insert("1.0", state.get("youtube_autonomous_brief", ""))
+                    
+                if hasattr(self, "youtube_autonomous_duration_var") and "youtube_autonomous_duration" in state:
+                    self.youtube_autonomous_duration_var.set(state.get("youtube_autonomous_duration"))
+                    
+                if hasattr(self, "autonomous_aspect_ratio_var") and "autonomous_aspect_ratio" in state:
+                    self.autonomous_aspect_ratio_var.set(state.get("autonomous_aspect_ratio"))
+                    
+                if hasattr(self, "youtube_autonomous_aspect_ratio_var") and "youtube_autonomous_aspect_ratio" in state:
+                    self.youtube_autonomous_aspect_ratio_var.set(state.get("youtube_autonomous_aspect_ratio"))
+                    
+                if hasattr(self, "autonomous_quality_preset_var") and "autonomous_quality_preset" in state:
+                    self.autonomous_quality_preset_var.set(state.get("autonomous_quality_preset"))
+                    
+                if hasattr(self, "youtube_autonomous_quality_preset_var") and "youtube_autonomous_quality_preset" in state:
+                    self.youtube_autonomous_quality_preset_var.set(state.get("youtube_autonomous_quality_preset"))
 
                 # Update UI for loaded music state
                 if self.selected_video_for_music and os.path.exists(self.selected_video_for_music):
@@ -20008,7 +21886,7 @@ class LTXQueueManager:
         label_text = str(image_asset.get("label") or "").strip() if image_asset else ""
         if not label_text:
             label_text = os.path.splitext(os.path.basename(image_path))[0]
-        source_text = str(image_asset.get("source") or self._infer_image_source(image_path) or "linked").strip().title() or "Linked"
+        source_text = str((image_asset.get("source") if image_asset else None) or self._infer_image_source(image_path) or "linked").strip().title() or "Linked"
         usage_text = f"Used in scenes {', '.join(str(number) for number in scene_numbers)}" if scene_numbers else "Unused in scene timeline"
         prompt_text = str(image_asset.get("prompt_text") or "").strip() if image_asset else ""
 
@@ -20875,6 +22753,7 @@ class LTXQueueManager:
                 self.root.after(0, lambda: self.sync_image_to_scene_btn.config(state=tk.NORMAL))
 
     def queue_prompt(self, workflow):
+        self._unload_chatbot_model()
         prompt_preview = self._get_prompt_preview_from_workflow(workflow)
 
         self.log_debug(
@@ -20904,6 +22783,7 @@ class LTXQueueManager:
                     error_body = ""
                     try:
                         error_body = e.read().decode('utf-8', errors='replace')
+                        print("RAW_HTTP_ERROR_BODY:", error_body)
                         error_detail = json.loads(error_body)
                         node_errors = error_detail.get("node_errors", {})
                         error_msg = error_detail.get("error", {}).get("message", "")
@@ -20925,7 +22805,7 @@ class LTXQueueManager:
                             self.update_status("Error: 400 Bad Request (Invalid JSON workflow).", "red")
                     except Exception:
                         self.update_status("Error: 400 Bad Request (Invalid JSON workflow).", "red")
-                    self.log_debug("QUEUE_PROMPT_ERROR", reason="http_400", details=str(e), body=error_body[:500])
+                    self.log_debug("QUEUE_PROMPT_ERROR", reason="http_400", details=str(e), body=error_body)
                     return None
                 if attempt < max_retries - 1:
                     self.update_status(f"Server booting, retrying ({attempt+1}/{max_retries})...", "orange")
@@ -21113,6 +22993,32 @@ class LTXQueueManager:
                                         break
                                 if downloaded_output:
                                     break
+                            
+                            if not downloaded_output and resolved_output_kind == "video":
+                                comfy_root = self.comfyui_root
+                                if comfy_root and not os.path.exists(os.path.join(comfy_root, "output")):
+                                    alt_root = os.path.join(comfy_root, "ComfyUI")
+                                    if os.path.exists(os.path.join(alt_root, "output")):
+                                        comfy_root = alt_root
+                                comfy_output_dir = os.path.join(comfy_root, "output")
+                                if os.path.exists(comfy_output_dir):
+                                    import glob
+                                    candidate_files = []
+                                    for ext in ("*.mp4", "*.webp", "*.avi", "*/*.mp4", "*/*.webp", "*/*.avi"):
+                                        candidate_files.extend(glob.glob(os.path.join(comfy_output_dir, ext)))
+                                    if candidate_files:
+                                        candidate_files.sort(key=os.path.getmtime)
+                                        newest_file = candidate_files[-1]
+                                        start_time = getattr(self, "eta_item_start_time", 0)
+                                        if os.path.getmtime(newest_file) >= start_time - 15:
+                                            filename = os.path.basename(newest_file)
+                                            dest_path = os.path.join(resolved_destination_dir, filename)
+                                            import shutil
+                                            shutil.copy2(newest_file, dest_path)
+                                            downloaded_output = True
+                                            downloaded_output_path = dest_path
+                                            self.root.after(0, self.refresh_gallery)
+                                            self.log_debug("PROMPT_OUTPUT_DOWNLOADED_FALLBACK", prompt_id=prompt_id, media_type=resolved_output_kind, filename=filename, dest_path=dest_path)
                         except Exception as e:
                             print(f"Error parsing history for output: {e}")
                             self.log_debug("PROMPT_HISTORY_PARSE_ERROR", prompt_id=prompt_id, details=str(e))
@@ -21202,7 +23108,7 @@ class LTXQueueManager:
 
             except urllib.error.URLError as e:
                 error_count += 1
-                if error_count >= 10:
+                if error_count >= 300:
                     self.update_status("Fatal Error: Server unresponsive. Aborting.", "red")
                     self.update_music_status("Fatal Error: Server unresponsive. Aborting.", "red")
                     if tutorial_progress_phase:
@@ -21218,7 +23124,7 @@ class LTXQueueManager:
                 pass # Let it fall through to time.sleep(3) and try again
             except Exception as e:
                 error_count += 1
-                if error_count >= 10:
+                if error_count >= 300:
                     self.update_status("Fatal Error: Server unresponsive. Aborting.", "red")
                     self.update_music_status("Fatal Error: Server unresponsive. Aborting.", "red")
                     if tutorial_progress_phase:
@@ -21560,14 +23466,25 @@ class LTXQueueManager:
         if hasattr(self, "autonomous_estimate_label"):
             self.autonomous_estimate_label.config(text=f"{scene_count} scenes × ~{sps:.1f}s = ~{actual_dur:.0f}s total video")
 
+    def _update_youtube_autonomous_scene_estimate(self, *_args):
+        try:
+            dur = int(self.youtube_autonomous_duration_var.get())
+        except (ValueError, tk.TclError):
+            dur = 0
+        if dur <= 0:
+            if hasattr(self, "youtube_autonomous_estimate_label"):
+                self.youtube_autonomous_estimate_label.config(text="Enter a duration above 0.")
+            return
+        scene_count, actual_dur, sps = self._calculate_autonomous_scene_count(dur)
+        if hasattr(self, "youtube_autonomous_estimate_label"):
+            self.youtube_autonomous_estimate_label.config(text=f"{scene_count} scenes × ~{sps:.1f}s = ~{actual_dur:.0f}s total video")
+
     def _autonomous_preflight(self):
         errors = []
-        try:
-            req = urllib.request.Request("http://127.0.0.1:8188/queue")
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                resp.read()
-        except Exception:
-            errors.append("ComfyUI is not reachable at http://127.0.0.1:8188. Start it first.")
+        if not self._is_comfyui_running():
+            launcher = self._normalize_path(self.comfyui_launcher_path) if self.comfyui_launcher_path else None
+            if not launcher or not os.path.exists(launcher):
+                errors.append("ComfyUI launcher is not configured or does not exist. Use Project → Configure Runtime Paths.")
         if not self.current_project_dir:
             errors.append("No project is open. Create or open a project first.")
         if not self.workflow:
@@ -21579,20 +23496,62 @@ class LTXQueueManager:
         return errors
 
     def _start_autonomous_pipeline(self):
-        self._ensure_comfyui_ready_or_launch(self._start_autonomous_pipeline_inner)
+        if self.project_mode == "youtube":
+            vibevoice_dir = self._get_vibevoice_dir()
+            speaker = self.vibevoice_speaker_var.get().strip() if hasattr(self, "vibevoice_speaker_var") else "user"
+            if not speaker:
+                speaker = "user"
+            voice_file = os.path.normpath(os.path.join(vibevoice_dir, "demo", "voices", f"en-{speaker}_voice.wav"))
+            if not os.path.exists(voice_file):
+                ans = messagebox.askyesno(
+                    "Voice Recording Required",
+                    f"No cloned reference voice found for speaker '{speaker}' at:\n{voice_file}\n\n"
+                    "The YouTube Video Creator pipeline requires a cloned reference voice for voiceover narration.\n\n"
+                    "Would you like to open the Voice Cloning Setup Wizard now to record your voice?"
+                )
+                if ans:
+                    self._open_voice_cloning_wizard()
+                return
+
+        self._start_autonomous_pipeline_inner()
 
     def _start_autonomous_pipeline_inner(self):
-        brief = self.autonomous_brief_text.get("1.0", tk.END).strip() if hasattr(self, "autonomous_brief_text") else ""
-        if not brief:
-            messagebox.showwarning("Autonomous Mode", "Enter a creative brief in the Autonomous Mode panel.\n\nDescribe the music video concept, mood, style, or any visual ideas.")
-            return
-        try:
-            target_dur = int(self.autonomous_duration_var.get())
-        except (ValueError, tk.TclError):
-            target_dur = 0
-        if target_dur <= 0:
-            messagebox.showwarning("Autonomous Mode", "Set a target duration greater than 0 seconds.")
-            return
+        if self.project_mode == "youtube":
+            brief = self.youtube_autonomous_brief_text.get("1.0", tk.END).strip() if hasattr(self, "youtube_autonomous_brief_text") else ""
+            if not brief and hasattr(self, "chatbot_briefing_text"):
+                brief = self.chatbot_briefing_text.get("1.0", tk.END).strip()
+                if brief and hasattr(self, "youtube_autonomous_brief_text"):
+                    self.youtube_autonomous_brief_text.delete("1.0", tk.END)
+                    self.youtube_autonomous_brief_text.insert("1.0", brief)
+                    self._schedule_project_state_save()
+            if not brief:
+                messagebox.showwarning("Autonomous Mode", "Enter a creative brief in the Autonomous YouTube Creator panel.\n\nDescribe the video topic, outline, or visual directions.")
+                return
+            try:
+                target_dur = int(self.youtube_autonomous_duration_var.get())
+            except (ValueError, tk.TclError):
+                target_dur = 0
+            if target_dur <= 0:
+                messagebox.showwarning("Autonomous Mode", "Set a target duration greater than 0 seconds.")
+                return
+        else:
+            brief = self.autonomous_brief_text.get("1.0", tk.END).strip() if hasattr(self, "autonomous_brief_text") else ""
+            if not brief and hasattr(self, "chatbot_briefing_text"):
+                brief = self.chatbot_briefing_text.get("1.0", tk.END).strip()
+                if brief and hasattr(self, "autonomous_brief_text"):
+                    self.autonomous_brief_text.delete("1.0", tk.END)
+                    self.autonomous_brief_text.insert("1.0", brief)
+                    self._schedule_project_state_save()
+            if not brief:
+                messagebox.showwarning("Autonomous Mode", "Enter a creative brief in the Autonomous Music Video panel.\n\nDescribe the music video concept, mood, style, or any visual ideas.")
+                return
+            try:
+                target_dur = int(self.autonomous_duration_var.get())
+            except (ValueError, tk.TclError):
+                target_dur = 0
+            if target_dur <= 0:
+                messagebox.showwarning("Autonomous Mode", "Set a target duration greater than 0 seconds.")
+                return
 
         preflight_errors = self._autonomous_preflight()
         if preflight_errors:
@@ -21635,18 +23594,37 @@ class LTXQueueManager:
     def _set_autonomous_ui_running(self, is_running):
         def apply():
             state = tk.DISABLED if is_running else tk.NORMAL
-            if hasattr(self, "autonomous_start_btn"):
-                self.autonomous_start_btn.config(state=state)
-            if hasattr(self, "autonomous_cancel_btn"):
-                self.autonomous_cancel_btn.config(state=tk.NORMAL if is_running else tk.DISABLED)
-            if hasattr(self, "autonomous_duration_entry"):
-                self.autonomous_duration_entry.config(state="readonly" if is_running else tk.NORMAL)
-            if hasattr(self, "autonomous_aspect_combo"):
-                self.autonomous_aspect_combo.config(state="disabled" if is_running else "readonly")
-            if hasattr(self, "autonomous_model_preset_combo"):
-                self.autonomous_model_preset_combo.config(state="disabled" if is_running else "readonly")
-            if hasattr(self, "autonomous_brief_text"):
-                self.autonomous_brief_text.config(state=tk.DISABLED if is_running else tk.NORMAL)
+            if self.project_mode == "youtube":
+                if hasattr(self, "youtube_autonomous_start_btn"):
+                    self.youtube_autonomous_start_btn.config(state=state)
+                if hasattr(self, "youtube_autonomous_cancel_btn"):
+                    self.youtube_autonomous_cancel_btn.config(state=tk.NORMAL if is_running else tk.DISABLED)
+                if hasattr(self, "youtube_autonomous_duration_entry"):
+                    self.youtube_autonomous_duration_entry.config(state="readonly" if is_running else tk.NORMAL)
+                if hasattr(self, "youtube_autonomous_aspect_combo"):
+                    self.youtube_autonomous_aspect_combo.config(state="disabled" if is_running else "readonly")
+                if hasattr(self, "youtube_autonomous_quality_combo"):
+                    self.youtube_autonomous_quality_combo.config(state="disabled" if is_running else "readonly")
+                if hasattr(self, "youtube_autonomous_model_preset_combo"):
+                    self.youtube_autonomous_model_preset_combo.config(state="disabled" if is_running else "readonly")
+                if hasattr(self, "youtube_autonomous_brief_text"):
+                    self.youtube_autonomous_brief_text.config(state=tk.DISABLED if is_running else tk.NORMAL)
+            else:
+                if hasattr(self, "autonomous_start_btn"):
+                    self.autonomous_start_btn.config(state=state)
+                if hasattr(self, "autonomous_cancel_btn"):
+                    self.autonomous_cancel_btn.config(state=tk.NORMAL if is_running else tk.DISABLED)
+                if hasattr(self, "autonomous_duration_entry"):
+                    self.autonomous_duration_entry.config(state="readonly" if is_running else tk.NORMAL)
+                if hasattr(self, "autonomous_aspect_combo"):
+                    self.autonomous_aspect_combo.config(state="disabled" if is_running else "readonly")
+                if hasattr(self, "autonomous_quality_combo"):
+                    self.autonomous_quality_combo.config(state="disabled" if is_running else "readonly")
+                if hasattr(self, "autonomous_model_preset_combo"):
+                    self.autonomous_model_preset_combo.config(state="disabled" if is_running else "readonly")
+                if hasattr(self, "autonomous_brief_text"):
+                    self.autonomous_brief_text.config(state=tk.DISABLED if is_running else tk.NORMAL)
+
             if hasattr(self, "chatbot_send_btn"):
                 self.chatbot_send_btn.config(state=state)
             if hasattr(self, "chatbot_scene_plan_btn"):
@@ -21659,16 +23637,6 @@ class LTXQueueManager:
 
     def _update_autonomous_progress(self, current_phase, message, phase_progress=0.0):
         def apply():
-            if hasattr(self, "autonomous_status_label"):
-                self.autonomous_status_label.config(text=message)
-            if hasattr(self, "autonomous_phase_labels"):
-                for phase_key, label_widget in self.autonomous_phase_labels.items():
-                    if phase_key in self.autonomous_completed_phases:
-                        label_widget.config(text=f"  ✓  {AUTONOMOUS_PHASE_LABELS[phase_key]}", fg=self.colors["success"])
-                    elif phase_key == current_phase:
-                        label_widget.config(text=f"  ⟳  {AUTONOMOUS_PHASE_LABELS[phase_key]}", fg=self.colors["accent"])
-                    else:
-                        label_widget.config(text=f"  ○  {AUTONOMOUS_PHASE_LABELS[phase_key]}", fg=self.colors["text_muted"])
             overall = 0.0
             for p in AUTONOMOUS_PHASE_ORDER:
                 w = AUTONOMOUS_PHASE_WEIGHTS.get(p, 0)
@@ -21676,8 +23644,46 @@ class LTXQueueManager:
                     overall += w
                 elif p == current_phase:
                     overall += w * max(0.0, min(1.0, phase_progress))
-            if hasattr(self, "autonomous_progress_var"):
-                self.autonomous_progress_var.set(int(overall * 100))
+
+            if self.project_mode == "youtube":
+                if hasattr(self, "youtube_autonomous_status_label"):
+                    self.youtube_autonomous_status_label.config(text=message)
+                if hasattr(self, "youtube_autonomous_phase_labels") and self.youtube_autonomous_phase_labels:
+                    yt_labels = {
+                        AUTONOMOUS_STATE_EXPANDING_CONCEPT: "Expanding Concept",
+                        AUTONOMOUS_STATE_PLANNING_SCENES: "Writing Script & Scenes",
+                        AUTONOMOUS_STATE_PLANNING_SONG: "Bypassed (No Song Lyrics)",
+                        AUTONOMOUS_STATE_GENERATING_IMAGES: "Generating Start Frames",
+                        AUTONOMOUS_STATE_BUILDING_TIMELINE: "Synthesizing Voiceovers",
+                        AUTONOMOUS_STATE_RENDERING: "Rendering Video Scenes",
+                        AUTONOMOUS_STATE_STITCHING: "Stitching Video Clips",
+                        AUTONOMOUS_STATE_GENERATING_MUSIC: "Generating Backing Music",
+                        AUTONOMOUS_STATE_MERGING: "Final Ducking & Merge",
+                    }
+                    for phase_key, label_widget in self.youtube_autonomous_phase_labels.items():
+                        lbl_text = yt_labels.get(phase_key, AUTONOMOUS_PHASE_LABELS.get(phase_key, phase_key))
+                        if phase_key in self.autonomous_completed_phases:
+                            label_widget.config(text=f"  ✓  {lbl_text}", fg=self.colors["success"])
+                        elif phase_key == current_phase:
+                            label_widget.config(text=f"  ⟳  {lbl_text}", fg=self.colors["accent"])
+                        else:
+                            label_widget.config(text=f"  ○  {lbl_text}", fg=self.colors["text_muted"])
+                if hasattr(self, "youtube_autonomous_progress_var"):
+                    self.youtube_autonomous_progress_var.set(int(overall * 100))
+            else:
+                if hasattr(self, "autonomous_status_label"):
+                    self.autonomous_status_label.config(text=message)
+                if hasattr(self, "autonomous_phase_labels") and self.autonomous_phase_labels:
+                    for phase_key, label_widget in self.autonomous_phase_labels.items():
+                        lbl_text = AUTONOMOUS_PHASE_LABELS.get(phase_key, phase_key)
+                        if phase_key in self.autonomous_completed_phases:
+                            label_widget.config(text=f"  ✓  {lbl_text}", fg=self.colors["success"])
+                        elif phase_key == current_phase:
+                            label_widget.config(text=f"  ⟳  {lbl_text}", fg=self.colors["accent"])
+                        else:
+                            label_widget.config(text=f"  ○  {lbl_text}", fg=self.colors["text_muted"])
+                if hasattr(self, "autonomous_progress_var"):
+                    self.autonomous_progress_var.set(int(overall * 100))
         self.root.after(0, apply)
 
     def _run_autonomous_pipeline(self):
@@ -21689,6 +23695,10 @@ class LTXQueueManager:
         self._log_ollama_tuning_recommendations()
 
         try:
+            # Free any leftover ComfyUI VRAM to make room for LLM model loading
+            if self._is_comfyui_running():
+                self._free_comfyui_vram()
+
             # ── Pre-flight: check that required models are downloaded ──
             model_audit = self.audit_required_models()
             missing = model_audit.get("missing", [])
@@ -21716,42 +23726,66 @@ class LTXQueueManager:
                 raise InterruptedError("Cancelled by user.")
             self.autonomous_completed_phases.add(AUTONOMOUS_STATE_EXPANDING_CONCEPT)
 
-            # ── Phase 2: Plan Scene Outline ──
-            self.autonomous_state = AUTONOMOUS_STATE_PLANNING_SCENES
-            self._update_autonomous_progress(AUTONOMOUS_STATE_PLANNING_SCENES, f"Outlining {scene_count} scenes...", 0.1)
+            if self.project_mode == "youtube":
+                # ── Phase 2 (YouTube): Write Script ──
+                self.autonomous_state = AUTONOMOUS_STATE_PLANNING_SCENES
+                self._update_autonomous_progress(AUTONOMOUS_STATE_PLANNING_SCENES, "Planning YouTube script...", 0.1)
+                
+                script_result = self._autonomous_plan_youtube_script(brief, scene_count=scene_count, target_duration=actual_duration)
+                if self.autonomous_cancel_requested:
+                    raise InterruptedError("Cancelled by user.")
+                
+                # ── Phase 3 (YouTube): Brainstorm Scenes ──
+                self._update_autonomous_progress(AUTONOMOUS_STATE_PLANNING_SCENES, "Brainstorming matching scene prompts...", 0.5)
+                self._autonomous_plan_youtube_scenes(brief, script_result, scene_count=scene_count)
+                if self.autonomous_cancel_requested:
+                    raise InterruptedError("Cancelled by user.")
+                
+                # Start background voiceover generation on CPU concurrently
+                self._start_background_voiceover_generation()
+                
+                # Set backing music tags dynamically
+                self.autonomous_music_tags = f"{script_result.get('title', 'YouTube background')}, ambient instrumental background music"
+                self.autonomous_music_lyrics = ""
+                self.autonomous_completed_phases.add(AUTONOMOUS_STATE_PLANNING_SCENES)
+                self.autonomous_completed_phases.add(AUTONOMOUS_STATE_PLANNING_SONG)
+            else:
+                # ── Phase 2: Plan Scene Outline ──
+                self.autonomous_state = AUTONOMOUS_STATE_PLANNING_SCENES
+                self._update_autonomous_progress(AUTONOMOUS_STATE_PLANNING_SCENES, f"Outlining {scene_count} scenes...", 0.1)
 
-            outline_result = self._autonomous_plan_scene_outline(brief, scene_count)
-            if self.autonomous_cancel_requested:
-                raise InterruptedError("Cancelled by user.")
-            if not outline_result:
-                raise RuntimeError("Scene outline failed — no scenes were generated.")
-            self.autonomous_completed_phases.add(AUTONOMOUS_STATE_PLANNING_SCENES)
+                outline_result = self._autonomous_plan_scene_outline(brief, scene_count)
+                if self.autonomous_cancel_requested:
+                    raise InterruptedError("Cancelled by user.")
+                if not outline_result:
+                    raise RuntimeError("Scene outline failed — no scenes were generated.")
+                self.autonomous_completed_phases.add(AUTONOMOUS_STATE_PLANNING_SCENES)
 
-            # ── Phase 3: Plan Song ──
-            self.autonomous_state = AUTONOMOUS_STATE_PLANNING_SONG
-            self._update_autonomous_progress(AUTONOMOUS_STATE_PLANNING_SONG, "Writing song lyrics and style tags...", 0.1)
+                # ── Phase 3: Plan Song ──
+                self.autonomous_state = AUTONOMOUS_STATE_PLANNING_SONG
+                self._update_autonomous_progress(AUTONOMOUS_STATE_PLANNING_SONG, "Writing song lyrics and style tags...", 0.1)
 
-            if self.autonomous_cancel_requested:
-                raise InterruptedError("Cancelled by user.")
-            song_result = self._autonomous_plan_song(brief, actual_duration, outline_result)
-            if self.autonomous_cancel_requested:
-                raise InterruptedError("Cancelled by user.")
-            if not song_result:
-                raise RuntimeError("Song planning failed — no lyrics or style tags were generated.")
+                if self.autonomous_cancel_requested:
+                    raise InterruptedError("Cancelled by user.")
+                song_result = self._autonomous_plan_song(brief, actual_duration, outline_result)
+                if self.autonomous_cancel_requested:
+                    raise InterruptedError("Cancelled by user.")
+                if not song_result:
+                    raise RuntimeError("Song planning failed — no lyrics or style tags were generated.")
 
-            song_apply_done = threading.Event()
-            self.root.after(0, lambda: (self._autonomous_apply_song(song_result, actual_duration), song_apply_done.set()))
-            song_apply_done.wait()
-            self.autonomous_completed_phases.add(AUTONOMOUS_STATE_PLANNING_SONG)
+                song_apply_done = threading.Event()
+                self.root.after(0, lambda: (self._autonomous_apply_song(song_result, actual_duration), song_apply_done.set()))
+                song_apply_done.wait()
+                self.autonomous_completed_phases.add(AUTONOMOUS_STATE_PLANNING_SONG)
 
-            # ── Phase 3b: Batch-generate ALL image + video prompts ──
-            self._update_autonomous_progress(AUTONOMOUS_STATE_PLANNING_SCENES, "Generating all scene prompts...", 0.0)
+                # ── Phase 3b: Batch-generate ALL image + video prompts ──
+                self._update_autonomous_progress(AUTONOMOUS_STATE_PLANNING_SCENES, "Generating all scene prompts...", 0.0)
 
-            if self.autonomous_cancel_requested:
-                raise InterruptedError("Cancelled by user.")
-            self._autonomous_generate_all_prompts()
-            if self.autonomous_cancel_requested:
-                raise InterruptedError("Cancelled by user.")
+                if self.autonomous_cancel_requested:
+                    raise InterruptedError("Cancelled by user.")
+                self._autonomous_generate_all_prompts()
+                if self.autonomous_cancel_requested:
+                    raise InterruptedError("Cancelled by user.")
 
             # ── Phase 3c: Batch review + targeted regen (if quality preset enables it) ──
             if getattr(self, "autonomous_quality_batch_review", False):
@@ -21762,6 +23796,11 @@ class LTXQueueManager:
 
             # ── Unload LLM to free VRAM for ComfyUI ──
             self._unload_chatbot_model()
+
+            # ── Launch ComfyUI just-in-time (deferred from pipeline start) ──
+            if not self._is_comfyui_running():
+                self._update_autonomous_progress(AUTONOMOUS_STATE_GENERATING_IMAGES, "Launching ComfyUI...", 0.0)
+                self._autonomous_launch_and_wait_for_comfyui()
 
             # ═══════════════════════════════════════════════════════════════
             # IMAGE BLOCK — ComfyUI renders all images with models staying
@@ -21800,6 +23839,17 @@ class LTXQueueManager:
             self.root.after(0, lambda: (self._autonomous_rebuild_timeline_ui(), rebuild_done.set()))
             rebuild_done.wait()
             self.autonomous_completed_phases.add(AUTONOMOUS_STATE_BUILDING_TIMELINE)
+
+            # ── Phase 5b (YouTube): Generate Voiceovers ──
+            if self.project_mode == "youtube":
+                self._update_autonomous_progress(AUTONOMOUS_STATE_BUILDING_TIMELINE, "Synthesizing voiceovers with VibeVoice...", 0.8)
+                if self.autonomous_cancel_requested:
+                    raise InterruptedError("Cancelled by user.")
+                self._autonomous_generate_voiceovers()
+                # Rebuild UI again to display correct voiceover audios and durations
+                rebuild_done = threading.Event()
+                self.root.after(0, lambda: (self._autonomous_rebuild_timeline_ui(), rebuild_done.set()))
+                rebuild_done.wait()
 
             # ── Phase 6: Render All Scenes (pure ComfyUI, no LLM) ──
             self.autonomous_state = AUTONOMOUS_STATE_RENDERING
@@ -21883,6 +23933,23 @@ class LTXQueueManager:
 
     # ── Autonomous sub-phase implementations ──
 
+    def _autonomous_launch_and_wait_for_comfyui(self):
+        """Asynchronously triggers ComfyUI launch and blocks the worker thread until port 8188 is ready."""
+        self.root.after(0, self.launch_comfyui)
+        
+        start_time = time.time()
+        timeout = 180  # 3 minutes maximum timeout
+        while time.time() - start_time < timeout:
+            if self.autonomous_cancel_requested:
+                raise InterruptedError("Cancelled by user.")
+            if self._is_comfyui_running():
+                self.comfyui_ready = True
+                self.root.after(0, lambda: self._update_comfyui_banner("ready", "✅ ComfyUI is ready"))
+                return
+            time.sleep(2)
+            
+        raise RuntimeError("ComfyUI launch timed out. Make sure it is configured correctly in Configure Runtime Paths.")
+
     def _log_ollama_tuning_recommendations(self):
         """Log performance tuning tips for Ollama users."""
         if self.chatbot_backend_mode != CHATBOT_BACKEND_MODE_OLLAMA:
@@ -21907,7 +23974,10 @@ class LTXQueueManager:
         Balanced: Thinking for planning tasks, self-assessment (confidence >= 6), no batch review.
         Quality:  Thinking for planning tasks, strict self-assessment (confidence >= 7), batch review + regen.
         """
-        preset = getattr(self, "autonomous_quality_preset_var", None)
+        if self.project_mode == "youtube":
+            preset = getattr(self, "youtube_autonomous_quality_preset_var", None)
+        else:
+            preset = getattr(self, "autonomous_quality_preset_var", None)
         preset = preset.get() if preset else "Balanced"
 
         if preset == "Fast":
@@ -21948,6 +24018,8 @@ class LTXQueueManager:
                         timeout_seconds=10,
                     )
                     self.log_debug("CHATBOT_MODEL_UNLOADED", model_id=model_id, backend="ollama")
+                    import time
+                    time.sleep(2)
             self.chatbot_model_warm = False
         except Exception as exc:
             self.log_debug("CHATBOT_MODEL_UNLOAD_FAILED", error=str(exc))
@@ -21965,8 +24037,348 @@ class LTXQueueManager:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 resp.read()
             self.log_debug("COMFYUI_VRAM_FREED")
+            import time
+            time.sleep(2)
         except Exception as exc:
             self.log_debug("COMFYUI_VRAM_FREE_FAILED", error=str(exc))
+
+    def _autonomous_plan_youtube_script(self, brief, scene_count=None, target_duration=None):
+        backend_result = self._ensure_chatbot_backend_ready_for_use(action_label="autonomous youtube script")
+        if not backend_result.get("ok"):
+            raise RuntimeError(f"Chatbot backend not ready: {backend_result.get('ok') or backend_result.get('status')}")
+        self.chatbot_model_warm = True
+
+        if scene_count is None:
+            scene_count = 6
+
+        all_segments = []
+        batch_size = 10
+        total_batches = math.ceil(scene_count / batch_size)
+        title = ""
+        intro = ""
+
+        for batch_idx in range(total_batches):
+            start_seg = batch_idx * batch_size + 1
+            end_seg = min((batch_idx + 1) * batch_size, scene_count)
+            self._update_autonomous_progress(
+                AUTONOMOUS_STATE_PLANNING_SCENES,
+                f"Planning YouTube script (batch {batch_idx + 1}/{total_batches}, segments {start_seg}-{end_seg})...",
+                0.1 + (batch_idx / total_batches) * 0.4
+            )
+
+            augmented_brief = (
+                f"Write a paragraph-by-paragraph YouTube voiceover script based on this concept:\n\n{brief}\n\n"
+                f"CRITICAL CONSTRAINT: You are generating the script in chunks. You MUST generate exactly the segments from segment {start_seg} to segment {end_seg} (inclusive).\n"
+                f"Do not write more than {end_seg - start_seg + 1} segments in this response."
+            )
+            
+            if batch_idx > 0:
+                context_segs = all_segments[-3:]
+                augmented_brief += (
+                    f"\n\nCONTEXT: You have already written segments 1 to {start_seg - 1}.\n"
+                    f"Title of the script: {title}\n"
+                    f"Intro of the script: {intro}\n"
+                    f"Here are the last few segments for continuity:\n"
+                    f"{json.dumps(context_segs, indent=2)}\n\n"
+                    f"Please continue writing seamlessly starting from segment {start_seg}."
+                )
+
+            # Per-batch retry: allow one automatic retry before propagating the error.
+            batch_last_error = None
+            result = None
+            for attempt in range(2):
+                try:
+                    result = self._request_chatbot_structured_output(CHATBOT_TASK_YOUTUBE_SCRIPT, augmented_brief, keep_alive="30m")
+                    break
+                except Exception as batch_exc:
+                    batch_last_error = batch_exc
+                    self.log_debug(
+                        "CHATBOT_BATCH_RETRY",
+                        task="youtube_script",
+                        batch=batch_idx + 1,
+                        attempt=attempt + 1,
+                        error=str(batch_exc)[:200],
+                    )
+                    if attempt >= 1:
+                        raise
+                    continue
+            
+            if batch_idx == 0:
+                title = str(result.get("title") or "").strip()
+                intro = str(result.get("intro") or "").strip()
+                
+            segments = result.get("segments") if isinstance(result.get("segments"), list) else []
+            if not segments:
+                raise RuntimeError(f"YouTube script planning failed — no script segments generated for batch {batch_idx + 1}.")
+            
+            for idx, seg in enumerate(segments):
+                seg["segment_number"] = start_seg + idx
+                all_segments.append(seg)
+                
+            if len(all_segments) >= scene_count:
+                all_segments = all_segments[:scene_count]
+                break
+
+        final_result = {
+            "task": "youtube_script",
+            "title": title,
+            "intro": intro,
+            "segments": all_segments
+        }
+        
+        self.autonomous_youtube_script = final_result
+        self.autonomous_voiceovers = [str(seg.get("voiceover_text", "")).strip() for seg in all_segments]
+        
+        conversation_id = self._ensure_active_chatbot_conversation()
+        self._append_chatbot_turn("user", f"[Autonomous] Write YouTube Script ({scene_count} segments)", kind="chat", conversation_id=conversation_id)
+        display_text = json.dumps(final_result, indent=2)
+        self._append_chatbot_turn("assistant", display_text, kind="artifact", conversation_id=conversation_id)
+        self.chatbot_last_result = final_result
+        self._record_chatbot_history_entry(CHATBOT_TASK_YOUTUBE_SCRIPT, brief, final_result)
+        return final_result
+
+    def _autonomous_plan_youtube_scenes(self, brief, script_result, scene_count=None):
+        backend_result = self._ensure_chatbot_backend_ready_for_use(action_label="autonomous youtube scenes")
+        if not backend_result.get("ok"):
+            raise RuntimeError(f"Chatbot backend not ready: {backend_result.get('detail') or backend_result.get('status')}")
+        self.chatbot_model_warm = True
+
+        script_segments = script_result.get("segments") or []
+        if not script_segments:
+            raise ValueError("The provided script result does not contain any segments.")
+            
+        if scene_count is None:
+            scene_count = len(script_segments)
+
+        all_scenes = []
+        batch_size = 10
+        total_batches = math.ceil(scene_count / batch_size)
+
+        for batch_idx in range(total_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min((batch_idx + 1) * batch_size, scene_count)
+            self._update_autonomous_progress(
+                AUTONOMOUS_STATE_PLANNING_SCENES, 
+                f"Brainstorming scene prompts (batch {batch_idx + 1}/{total_batches}, scenes {start_idx + 1}-{end_idx})...", 
+                0.5 + (batch_idx / total_batches) * 0.4
+            )
+
+            batch_segments = script_segments[start_idx:end_idx]
+            batch_script = {
+                "task": "youtube_script",
+                "title": script_result.get("title", ""),
+                "intro": script_result.get("intro", ""),
+                "segments": batch_segments
+            }
+
+            augmented_brief = (
+                f"Creative concept:\n{brief}\n\n"
+                f"Reference Voiceover Script segments for this batch:\n{json.dumps(batch_script, indent=2)}\n\n"
+                f"Brainstorm matching visual scenes (T2I & I2V prompts) for each script segment in this batch.\n"
+                f"You MUST brainstorm exactly {len(batch_segments)} visual scenes corresponding to the script segments above."
+            )
+            
+            if batch_idx > 0:
+                context_scenes = all_scenes[-3:]
+                augmented_brief += (
+                    f"\n\nCONTEXT: You have already planned scenes 1 to {start_idx}.\n"
+                    f"Here are the last few planned scenes for visual and style continuity:\n"
+                    f"{json.dumps(context_scenes, indent=2)}\n\n"
+                    f"Please maintain the visual style, characters, and color palettes described in the context."
+                )
+
+            # Per-batch retry: allow one automatic retry before propagating the error.
+            batch_last_error = None
+            result = None
+            for attempt in range(2):
+                try:
+                    result = self._request_chatbot_structured_output(CHATBOT_TASK_YOUTUBE_SCENES, augmented_brief, keep_alive="30m")
+                    break
+                except Exception as batch_exc:
+                    batch_last_error = batch_exc
+                    self.log_debug(
+                        "CHATBOT_BATCH_RETRY",
+                        task="youtube_scenes",
+                        batch=batch_idx + 1,
+                        attempt=attempt + 1,
+                        error=str(batch_exc)[:200],
+                    )
+                    if attempt >= 1:
+                        raise
+                    continue
+            scenes = result.get("scenes") if isinstance(result.get("scenes"), list) else []
+            if not scenes:
+                raise RuntimeError(f"YouTube scenes planning failed — no scenes generated for batch {batch_idx + 1}.")
+                
+            for idx, scene in enumerate(scenes):
+                scene["segment_number"] = start_idx + 1 + idx
+                if "scene_id" not in scene:
+                    scene["scene_id"] = self._generate_entity_id("scene")
+                all_scenes.append(scene)
+                
+            if len(all_scenes) >= scene_count:
+                all_scenes = all_scenes[:scene_count]
+                break
+
+        final_result = {
+            "task": "youtube_scenes",
+            "scenes": all_scenes
+        }
+
+        self.autonomous_scene_outline = all_scenes
+        self.autonomous_image_prompts = [str(sc.get("image_prompt", "")).strip() for sc in all_scenes]
+        self.autonomous_video_prompts = [str(sc.get("video_prompt", "")).strip() for sc in all_scenes]
+        self.autonomous_scene_count = len(all_scenes)
+
+        conversation_id = self._ensure_active_chatbot_conversation()
+        self._append_chatbot_turn("user", f"[Autonomous] Generate YouTube Scenes ({self.autonomous_scene_count} scenes)", kind="chat", conversation_id=conversation_id)
+        display_text = json.dumps(final_result, indent=2)
+        self._append_chatbot_turn("assistant", display_text, kind="artifact", conversation_id=conversation_id)
+        self.chatbot_last_result = final_result
+        self._record_chatbot_history_entry(CHATBOT_TASK_YOUTUBE_SCENES, brief, final_result)
+        return final_result
+
+    def _autonomous_generate_voiceovers(self):
+        active_project = getattr(self, "current_project_dir", None)
+        if not active_project:
+            active_project = os.path.join(self.base_output_dir, "default_project")
+        
+        vo_dir = os.path.join(active_project, "voiceovers")
+        os.makedirs(vo_dir, exist_ok=True)
+        temp_dir = os.path.join(vo_dir, "temp")
+        os.makedirs(temp_dir, exist_ok=True)
+
+        for idx, sc in enumerate(self.scene_timeline, start=1):
+            vo_text = str(sc.get("voiceover", "")).strip()
+            if not vo_text:
+                continue
+
+            temp_txt_name = f"segment_{idx}_{sc['scene_id']}.txt"
+            temp_txt_path = os.path.join(temp_dir, temp_txt_name)
+            with open(temp_txt_path, "w", encoding="utf-8") as f:
+                f.write(f"Speaker 1: {vo_text}\n")
+
+            python_exe = self.vibevoice_python_var.get()
+            vibevoice_dir = self._get_vibevoice_dir()
+            
+            device = "cuda" if self._is_vibevoice_cuda_available() else "cpu"
+            
+            cmd = [
+                python_exe,
+                os.path.join(vibevoice_dir, "demo", "inference_from_file.py"),
+                "--model_path", "microsoft/VibeVoice-1.5b",
+                "--txt_path", temp_txt_path,
+                "--speaker_names", self.vibevoice_speaker_var.get(),
+                "--output_dir", vo_dir,
+                "--device", device
+            ]
+            
+            print(f"[VIBEVOICE] Running cmd: {' '.join(cmd)}")
+            self.root.after(0, lambda i=idx: self.update_status(f"[Autonomous] Synthesizing voiceover segment {i}/{len(self.scene_timeline)}...", "blue"))
+
+            result = subprocess.run(
+                cmd,
+                cwd=vibevoice_dir,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            
+            if result.returncode != 0:
+                raise RuntimeError(f"VibeVoice synthesis failed for segment {idx}. Stderr:\n{result.stderr}")
+
+            txt_filename = os.path.splitext(temp_txt_name)[0]
+            expected_wav_path = os.path.normpath(os.path.join(vo_dir, f"{txt_filename}_generated.wav"))
+            
+            if not os.path.exists(expected_wav_path):
+                raise FileNotFoundError(f"Generated WAV file not found at {expected_wav_path}")
+
+            duration = self._probe_clip_duration(expected_wav_path)
+            
+            sc["voiceover_audio_path"] = expected_wav_path
+            sc["audio_duration"] = duration
+            
+            if self.visual_pacing_var.get() == "loop":
+                sc["duration"] = duration
+
+    def _start_background_voiceover_generation(self):
+        self._bg_voiceover_results = {}
+        self._voiceover_gen_thread = threading.Thread(target=self._bg_generate_voiceovers)
+        self._voiceover_gen_thread.daemon = True
+        self._voiceover_gen_thread.start()
+
+    def _bg_generate_voiceovers(self):
+        active_project = getattr(self, "current_project_dir", None)
+        if not active_project:
+            return
+        
+        vo_dir = os.path.join(active_project, "voiceovers")
+        os.makedirs(vo_dir, exist_ok=True)
+        temp_dir = os.path.join(vo_dir, "temp")
+        os.makedirs(temp_dir, exist_ok=True)
+
+        scene_outline = getattr(self, "autonomous_scene_outline", None) or []
+        voiceovers = getattr(self, "autonomous_voiceovers", [])
+        
+        # Ensure every scene outline entry has a scene_id assigned
+        for idx, sc in enumerate(scene_outline, start=1):
+            if "scene_id" not in sc:
+                sc["scene_id"] = self._generate_entity_id("scene")
+
+        for idx, sc in enumerate(scene_outline, start=1):
+            if self.autonomous_cancel_requested:
+                break
+            vo_text = voiceovers[idx - 1] if idx <= len(voiceovers) else ""
+            vo_text = str(vo_text).strip()
+            if not vo_text:
+                continue
+
+            sc_id = sc["scene_id"]
+            temp_txt_name = f"segment_{idx}_{sc_id}.txt"
+            temp_txt_path = os.path.join(temp_dir, temp_txt_name)
+            try:
+                with open(temp_txt_path, "w", encoding="utf-8") as f:
+                    f.write(f"Speaker 1: {vo_text}\n")
+            except Exception as e:
+                print(f"[BG-VIBEVOICE] Error writing temp text: {e}")
+                continue
+
+            python_exe = self.vibevoice_python_var.get()
+            vibevoice_dir = self._get_vibevoice_dir()
+            
+            # Force CPU to avoid CUDA conflicts with ComfyUI
+            device = "cpu"
+            
+            cmd = [
+                python_exe,
+                os.path.join(vibevoice_dir, "demo", "inference_from_file.py"),
+                "--model_path", "microsoft/VibeVoice-1.5b",
+                "--txt_path", temp_txt_path,
+                "--speaker_names", self.vibevoice_speaker_var.get(),
+                "--output_dir", vo_dir,
+                "--device", device
+            ]
+            
+            print(f"[BG-VIBEVOICE] Running cmd: {' '.join(cmd)}")
+            
+            result = subprocess.run(
+                cmd,
+                cwd=vibevoice_dir,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            
+            if result.returncode == 0:
+                txt_filename = os.path.splitext(temp_txt_name)[0]
+                expected_wav_path = os.path.normpath(os.path.join(vo_dir, f"{txt_filename}_generated.wav"))
+                if os.path.exists(expected_wav_path):
+                    self._bg_voiceover_results[sc_id] = expected_wav_path
+                    print(f"[BG-VIBEVOICE] Successfully generated voiceover for scene {sc_id}")
+            else:
+                print(f"[BG-VIBEVOICE] Synthesis failed for segment {idx}. Stderr: {result.stderr}")
 
     def _autonomous_expand_concept(self, brief):
         backend_result = self._ensure_chatbot_backend_ready_for_use(action_label="autonomous concept expansion")
@@ -22001,28 +24413,58 @@ class LTXQueueManager:
         self.chatbot_model_warm = True
 
         concept = self.autonomous_expanded_concept or brief
-        augmented_brief = (
-            f"Create exactly {scene_count} scenes for a music video.\n"
-            f"The video will be approximately {self.autonomous_actual_duration:.0f} seconds long "
-            f"({scene_count} clips of ~{self.autonomous_actual_duration / max(scene_count, 1):.1f}s each).\n\n"
-            f"Creative concept:\n{concept}"
-        )
-        result = self._request_chatbot_structured_output(CHATBOT_TASK_SCENE_OUTLINE, augmented_brief, keep_alive="30m")
-        scenes = result.get("scenes") if isinstance(result.get("scenes"), list) else []
-        if not scenes:
-            return None
+        all_scenes = []
+        batch_size = 10
+        total_batches = math.ceil(scene_count / batch_size)
 
-        # Cap to requested scene_count — LLM may return more scenes than asked for
-        scenes = scenes[:scene_count]
-        self.autonomous_scene_outline = scenes
+        for batch_idx in range(total_batches):
+            start_idx = batch_idx * batch_size + 1
+            end_idx = min((batch_idx + 1) * batch_size, scene_count)
+            self._update_autonomous_progress(
+                AUTONOMOUS_STATE_PLANNING_SCENES, 
+                f"Outlining scenes (batch {batch_idx + 1}/{total_batches}, scenes {start_idx}-{end_idx})...", 
+                0.1 + (batch_idx / total_batches) * 0.4
+            )
+
+            augmented_brief = (
+                f"Create exactly {end_idx - start_idx + 1} scenes for a music video (scenes {start_idx} to {end_idx} of {scene_count}).\n"
+                f"The video will be approximately {self.autonomous_actual_duration:.0f} seconds long.\n\n"
+                f"Creative concept:\n{concept}"
+            )
+            
+            if batch_idx > 0:
+                context_scenes = all_scenes[-3:]
+                augmented_brief += (
+                    f"\n\nCONTEXT: You have already outlined scenes 1 to {start_idx - 1}.\n"
+                    f"Here are the last few scenes for continuity:\n"
+                    f"{json.dumps(context_scenes, indent=2)}\n\n"
+                    f"Please continue outlining starting from scene {start_idx}."
+                )
+
+            result = self._request_chatbot_structured_output(CHATBOT_TASK_SCENE_OUTLINE, augmented_brief, keep_alive="30m")
+            scenes = result.get("scenes") if isinstance(result.get("scenes"), list) else []
+            if not scenes:
+                raise RuntimeError(f"Scene outline failed — no scenes generated for batch {batch_idx + 1}.")
+                
+            for idx, sc in enumerate(scenes):
+                sc["scene_number"] = start_idx + idx
+                if "scene_id" not in sc:
+                    sc["scene_id"] = self._generate_entity_id("scene")
+                all_scenes.append(sc)
+                
+            if len(all_scenes) >= scene_count:
+                all_scenes = all_scenes[:scene_count]
+                break
+
+        self.autonomous_scene_outline = all_scenes
 
         conversation_id = self._ensure_active_chatbot_conversation()
         self._append_chatbot_turn("user", f"[Autonomous] Outline {scene_count} scenes", kind="chat", conversation_id=conversation_id)
-        display_text = result.get("raw_content") or json.dumps(result, indent=2)
+        display_text = json.dumps({"task": "scene_outline", "scenes": all_scenes}, indent=2)
         self._append_chatbot_turn("assistant", display_text, kind="artifact", conversation_id=conversation_id)
-        self.chatbot_last_result = result
-        self._record_chatbot_history_entry(CHATBOT_TASK_SCENE_OUTLINE, augmented_brief, result)
-        return result
+        self.chatbot_last_result = {"task": "scene_outline", "scenes": all_scenes}
+        self._record_chatbot_history_entry(CHATBOT_TASK_SCENE_OUTLINE, brief, {"task": "scene_outline", "scenes": all_scenes})
+        return {"task": "scene_outline", "scenes": all_scenes}
 
     def _autonomous_generate_single_image_prompt(self, outline_entry, scene_index, total_scenes, previous_image_prompt="", keep_alive=None):
         concept = self.autonomous_expanded_concept or self.autonomous_creative_brief
@@ -22396,9 +24838,53 @@ class LTXQueueManager:
             "3:4 (960\u00d71280)": (960, 1280),
         }
         if aspect_label is None:
-            aspect_label = getattr(self, "autonomous_aspect_ratio_var", None)
+            if self.project_mode == "youtube":
+                aspect_label = getattr(self, "youtube_autonomous_aspect_ratio_var", None)
+            else:
+                aspect_label = getattr(self, "autonomous_aspect_ratio_var", None)
             aspect_label = aspect_label.get() if aspect_label else None
         return presets.get(aspect_label, (1280, 720))
+
+    def _get_avatar_asset(self):
+        for asset in getattr(self, "image_assets", []):
+            if asset.get("source") == "avatar" or str(asset.get("label") or "").lower().startswith("avatar"):
+                if os.path.exists(asset.get("project_path", "")):
+                    return asset
+        # Check if there is an avatar image in the imported directory
+        if getattr(self, "imported_image_dir", None) and os.path.exists(self.imported_image_dir):
+            for filename in os.listdir(self.imported_image_dir):
+                if os.path.splitext(filename)[0].lower() == "avatar":
+                    full_path = os.path.normpath(os.path.join(self.imported_image_dir, filename))
+                    asset = self._upsert_image_asset(full_path, source="avatar", status="ready")
+                    if asset:
+                        return asset
+        return None
+
+    def _upload_avatar_image(self):
+        active_project = getattr(self, "current_project_dir", None)
+        if not active_project or not getattr(self, "imported_image_dir", None):
+            messagebox.showwarning("Project Required", "Please open or create a project first before uploading an avatar.")
+            return
+
+        file_path = filedialog.askopenfilename(
+            title="Select Spokesperson Avatar Image",
+            filetypes=[("Image Files", "*.png *.jpg *.jpeg *.webp")]
+        )
+        if not file_path:
+            return
+
+        ext = os.path.splitext(file_path)[1].lower()
+        dest_filename = f"avatar{ext}"
+        dest_path = os.path.normpath(os.path.join(self.imported_image_dir, dest_filename))
+
+        try:
+            shutil.copy2(file_path, dest_path)
+            self._upsert_image_asset(dest_path, source="avatar", original_path=file_path, status="ready")
+            self.save_project_state()
+            self._refresh_scene_asset_choices()
+            messagebox.showinfo("Spokesperson Avatar", f"Avatar image uploaded successfully as {dest_filename} and registered as an asset!")
+        except Exception as e:
+            messagebox.showerror("Upload Error", f"Failed to upload avatar image: {e}")
 
     def _autonomous_generate_images(self):
         """Render all scene images using pre-planned prompts (no LLM calls)."""
@@ -22425,6 +24911,20 @@ class LTXQueueManager:
         for index, prompt_text in enumerate(image_prompts, start=1):
             if self.autonomous_cancel_requested:
                 return False
+
+            # Check if avatar is enabled for this scene
+            scene_outline = getattr(self, "autonomous_scene_outline", [])
+            is_avatar_scene = False
+            if index <= len(scene_outline):
+                is_avatar_scene = bool(scene_outline[index - 1].get("avatar_enabled"))
+
+            if is_avatar_scene:
+                avatar_asset = self._get_avatar_asset()
+                if avatar_asset:
+                    self.autonomous_image_asset_map[index] = avatar_asset.get("asset_id")
+                    continue
+                else:
+                    self.update_status(f"[Warning] Avatar requested for scene {index} but no avatar image was found. Generating visual scene instead.", "orange")
 
             phase_progress = (index - 1) / total
             self._update_autonomous_progress(
@@ -22476,7 +24976,15 @@ class LTXQueueManager:
             raise RuntimeError("No scene outline or image assets available to build timeline.")
 
         normalized_timeline = []
+        is_youtube = (getattr(self, "project_mode", "mtv") == "youtube")
+        voiceovers = getattr(self, "autonomous_voiceovers", [])
         for index in range(1, len(scene_outline) + 1):
+            sc = scene_outline[index - 1]
+            sc_id = sc.get("scene_id")
+            if not sc_id:
+                sc_id = self._generate_entity_id("scene")
+                sc["scene_id"] = sc_id
+                
             asset_id = asset_map.get(index)
             if not asset_id:
                 continue
@@ -22484,12 +24992,15 @@ class LTXQueueManager:
             if not asset or not os.path.exists(asset.get("project_path", "")):
                 continue
             # Use a placeholder prompt — the actual video prompt will be generated JIT during rendering
+            vo_text = voiceovers[index - 1] if is_youtube and index <= len(voiceovers) else ""
             normalized_timeline.append(
                 self._create_scene_entry(
                     order_index=index,
                     mode=SCENE_MODE_I2V,
                     prompt="(JIT — will be generated before render)",
                     image_asset_id=asset_id,
+                    scene_id=sc_id,
+                    voiceover=vo_text
                 )
             )
 
@@ -22519,43 +25030,32 @@ class LTXQueueManager:
 
         video_prompts = getattr(self, "autonomous_video_prompts", None) or []
         total = len(scene_timeline)
-        rendered_paths = []
 
+        # ── Step 1: Pre-enqueue all workflows ──
+        queued_items = []
         for index, scene_entry in enumerate(scene_timeline, start=1):
             if self.autonomous_cancel_requested:
                 return False
 
-            phase_progress = (index - 1) / total
-            self._update_autonomous_progress(
-                AUTONOMOUS_STATE_RENDERING,
-                f"Rendering scene {index} of {total}...",
-                phase_progress,
-            )
-
             scene_id = scene_entry.get("scene_id")
-            self.root.after(0, lambda sid=scene_id: self._set_scene_entry_render_state(sid, "rendering"))
-            self.root.after(0, lambda i=index, t=total: self.update_status(f"[Autonomous] Rendering scene {i} of {t}...", "blue"))
-
             # ── Use pre-planned video prompt ──
             prompt_text = video_prompts[index - 1] if index <= len(video_prompts) else ""
-
             if not prompt_text:
                 self.root.after(0, lambda sid=scene_id: self._set_scene_entry_render_state(sid, "failed"))
                 continue
 
-            # Update the scene entry with the actual prompt
             scene_entry["prompt"] = prompt_text
-
             before_files = self._snapshot_media_files(self.scenes_dir, SUPPORTED_VIDEO_EXTENSIONS)
             filename_prefix = self._build_video_filename_prefix(video_settings, "timeline", index)
 
-            scene_mode = scene_entry.get("mode", SCENE_MODE_T2V)
+            scene_mode = scene_entry.get("mode", SCENE_MODE_I2V)
             if scene_mode == SCENE_MODE_I2V:
                 asset = self._get_image_asset_by_id(scene_entry.get("image_asset_id"))
                 if not asset or not os.path.exists(asset.get("project_path", "")):
                     self.root.after(0, lambda sid=scene_id: self._set_scene_entry_render_state(sid, "failed"))
                     continue
-                workflow_to_submit = self._build_i2v_workflow_for_scene(prompt_text, asset.get("project_path"), filename_prefix, video_settings)
+                audio_path = self._get_audio_path_for_scene(scene_entry)
+                workflow_to_submit = self._build_i2v_workflow_for_scene(prompt_text, asset.get("project_path"), filename_prefix, video_settings, audio_path=audio_path)
             else:
                 workflow_to_submit = self._build_video_workflow_for_prompt(prompt_text, filename_prefix, video_settings)
 
@@ -22563,16 +25063,51 @@ class LTXQueueManager:
                 self.root.after(0, lambda sid=scene_id: self._set_scene_entry_render_state(sid, "failed"))
                 continue
 
-            # ── Submit to ComfyUI with retry ──
-            success = False
+            # Queue prompt in ComfyUI with retry
+            prompt_id = None
             for attempt in range(2):
-                prompt_id = self.queue_prompt(workflow_to_submit)
-                if not prompt_id:
-                    continue
-                self.eta_item_start_time = time.time()
-                success = self.wait_for_completion(prompt_id)
-                if success:
+                if self.autonomous_cancel_requested:
                     break
+                prompt_id = self.queue_prompt(workflow_to_submit)
+                if prompt_id:
+                    break
+
+            if not prompt_id:
+                self.root.after(0, lambda sid=scene_id: self._set_scene_entry_render_state(sid, "failed"))
+                continue
+
+            queued_items.append({
+                "index": index,
+                "scene_entry": scene_entry,
+                "scene_id": scene_id,
+                "prompt_id": prompt_id,
+                "before_files": before_files
+            })
+            print(f"[Autonomous] Successfully enqueued scene {index}/{total} with prompt_id {prompt_id}")
+
+        # ── Step 2: Sequential Wait for completions ──
+        rendered_paths = []
+        for item in queued_items:
+            if self.autonomous_cancel_requested:
+                break
+
+            index = item["index"]
+            scene_entry = item["scene_entry"]
+            scene_id = item["scene_id"]
+            prompt_id = item["prompt_id"]
+            before_files = item["before_files"]
+
+            phase_progress = (index - 1) / total
+            self._update_autonomous_progress(
+                AUTONOMOUS_STATE_RENDERING,
+                f"Rendering scene {index} of {total}...",
+                phase_progress,
+            )
+            self.root.after(0, lambda sid=scene_id: self._set_scene_entry_render_state(sid, "rendering"))
+            self.root.after(0, lambda i=index, t=total: self.update_status(f"[Autonomous] Rendering scene {i} of {t}...", "blue"))
+
+            self.eta_item_start_time = time.time()
+            success = self.wait_for_completion(prompt_id)
 
             if not success:
                 self.root.after(0, lambda sid=scene_id: self._set_scene_entry_render_state(sid, "failed"))
@@ -22620,35 +25155,130 @@ class LTXQueueManager:
             target_w, target_h, target_fps = 1920, 1080, 24
 
         timestamp = int(time.time())
-        list_file = os.path.join(self.stitched_dir, f"concat_auto_{timestamp}.txt")
-        output_file = os.path.join(self.stitched_dir, f"final_master_render_{timestamp}.mp4")
-        try:
-            with open(list_file, 'w', encoding='utf-8') as f:
-                for path in filepaths:
-                    formatted_path = path.replace('\\', '/')
-                    f.write(f"file '{formatted_path}'\n")
-            # Re-encode with explicit resolution and fps to guarantee uniform
-            # dimensions across all clips — prevents aspect-ratio mismatches
-            # when the concat demuxer encounters slightly different streams.
-            cmd = [
-                FFMPEG_PATH, '-y',
-                '-f', 'concat', '-safe', '0', '-i', list_file,
-                '-vf', f'scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,'
-                       f'pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,'
-                       f'fps={target_fps}',
-                '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
-                '-pix_fmt', 'yuv420p',
-                '-an', output_file,
-            ]
-            subprocess.run(cmd, creationflags=subprocess.CREATE_NO_WINDOW, capture_output=True, text=True, check=True)
-        except Exception as exc:
-            raise RuntimeError(f"Stitching failed: {exc}")
-        finally:
-            if os.path.exists(list_file):
-                try:
-                    os.remove(list_file)
-                except Exception:
-                    pass
+        output_file = os.path.normpath(os.path.join(self.stitched_dir, f"final_master_render_{timestamp}.mp4"))
+        
+        if self.project_mode == "youtube":
+            # Stitch with visual pacing (loop/freeze) matching voiceover durations
+            valid_scenes = self._get_timeline_ordered_scenes()
+            if not valid_scenes:
+                raise RuntimeError("No video clips found in the timeline to stitch.")
+                
+            N            = len(valid_scenes)
+            inputs_cmd   = []
+            filter_parts = []
+            eff_durs     = []
+            trims_snap   = dict(self.timeline_clip_trims or {})
+            
+            intro_delay = float(self.ducking_intro_delay_var.get() or 2.0) if hasattr(self, "ducking_intro_delay_var") else 2.0
+            for i, sc in enumerate(valid_scenes):
+                raw_dur = max(0.1, sc.get("raw_duration") or sc.get("duration") or 5.0)
+                trims   = trims_snap.get(sc["scene_id"], {})
+                ti      = max(0.0, float(trims.get("trim_in",  0.0)))
+                to_     = max(0.0, float(trims.get("trim_out", 0.0)))
+                
+                target_dur = float(sc.get("audio_duration", 0.0) or 0.0)
+                
+                if target_dur > 0.0:
+                    if i == 0:
+                        target_dur += intro_delay
+                    
+                    eff = target_dur
+                    eff_durs.append(eff)
+                    
+                    if self.visual_pacing_var.get() == "loop":
+                        inputs_cmd += ["-stream_loop", "-1", "-i", sc["clip_path"]]
+                        filter_parts.append(
+                            f"[{i}:v]trim=start={ti:.6f}:end={ti + target_dur:.6f},"
+                            f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+                            f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,"
+                            f"setpts=PTS-STARTPTS,fps=fps={target_fps}[v{i}]"
+                        )
+                    else: # freeze
+                        inputs_cmd += ["-i", sc["clip_path"]]
+                        end_sec = min(raw_dur, ti + raw_dur - ti - to_)
+                        filter_parts.append(
+                            f"[{i}:v]trim=start={ti:.6f}:end={end_sec:.6f},"
+                            f"tpad=stop=-1:stop_mode=clone,"
+                            f"trim=end={target_dur:.6f},"
+                            f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+                            f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,"
+                            f"setpts=PTS-STARTPTS,fps=fps={target_fps}[v{i}]"
+                        )
+                else:
+                    eff = max(0.1, raw_dur - ti - to_)
+                    eff_durs.append(eff)
+                    end_sec = min(raw_dur, ti + eff)
+                    inputs_cmd += ["-i", sc["clip_path"]]
+                    filter_parts.append(
+                        f"[{i}:v]trim=start={ti:.6f}:end={end_sec:.6f},"
+                        f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+                        f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,"
+                        f"setpts=PTS-STARTPTS,fps=fps={target_fps}[v{i}]"
+                    )
+
+            if N == 1:
+                filter_parts.append("[v0]null[vout]")
+            else:
+                current    = "[v0]"
+                out_offset = 0.0
+                for i in range(1, N):
+                    is_last  = (i == N - 1)
+                    raw_label = "[vout]" if is_last else f"[x{i}]"
+                    filter_parts.append(
+                        f"{current}[v{i}]concat=n=2:v=1:a=0{raw_label}"
+                    )
+                    out_offset += eff_durs[i - 1]
+                    if is_last:
+                        current = raw_label
+                    else:
+                        norm_label = f"[n{i}]"
+                        filter_parts.append(f"{raw_label}fps=fps={target_fps}{norm_label}")
+                        current = norm_label
+
+            filter_complex = "; ".join(filter_parts)
+            cmd = (
+                [FFMPEG_PATH, "-y"]
+                + inputs_cmd
+                + ["-filter_complex", filter_complex,
+                   "-map", "[vout]",
+                   "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                   "-pix_fmt", "yuv420p",
+                   "-movflags", "+faststart",
+                   "-an", output_file]
+            )
+            try:
+                print(f"[EXPORT] filter_complex: {filter_complex}")
+                print(f"[EXPORT] cmd: {' '.join(cmd)}")
+                subprocess.run(cmd, creationflags=subprocess.CREATE_NO_WINDOW, capture_output=True, text=True, check=True)
+            except Exception as exc:
+                raise RuntimeError(f"Autonomous stitching with pacing failed: {exc}")
+        else:
+            # Standard MTV Mode Stitching using concat file list
+            list_file = os.path.join(self.stitched_dir, f"concat_auto_{timestamp}.txt")
+            try:
+                with open(list_file, 'w', encoding='utf-8') as f:
+                    for path in filepaths:
+                        formatted_path = path.replace('\\', '/')
+                        f.write(f"file '{formatted_path}'\n")
+                cmd = [
+                    FFMPEG_PATH, '-y',
+                    '-f', 'concat', '-safe', '0', '-i', list_file,
+                    '-vf', f'scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,'
+                           f'pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,'
+                           f'fps={target_fps}',
+                    '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+                    '-pix_fmt', 'yuv420p',
+                    '-an', output_file,
+                ]
+                subprocess.run(cmd, creationflags=subprocess.CREATE_NO_WINDOW, capture_output=True, text=True, check=True)
+            except Exception as exc:
+                raise RuntimeError(f"Stitching failed: {exc}")
+            finally:
+                if os.path.exists(list_file):
+                    try:
+                        os.remove(list_file)
+                    except Exception:
+                        pass
 
         if not os.path.exists(output_file):
             return False
@@ -22711,31 +25341,146 @@ class LTXQueueManager:
     def _autonomous_final_merge(self):
         if not self.selected_video_for_music or not os.path.exists(self.selected_video_for_music):
             raise RuntimeError("No stitched video available for final merge.")
-        if not self.current_generated_audio or not os.path.exists(self.current_generated_audio):
-            raise RuntimeError("No generated audio available for final merge.")
 
         timestamp = int(time.time())
-        output_file = os.path.join(self.final_mv_dir, f"Final_Music_Video_{timestamp}.mp4")
-        cmd = [
-            FFMPEG_PATH, '-y',
-            '-i', self.selected_video_for_music,
-            '-i', self.current_generated_audio,
-            '-map', '0:v:0', '-map', '1:a:0',
-            '-c:v', 'copy', '-c:a', 'aac',
-            '-shortest', output_file
-        ]
-        try:
-            subprocess.run(cmd, creationflags=subprocess.CREATE_NO_WINDOW, capture_output=True, text=True, check=True)
-        except subprocess.CalledProcessError as exc:
-            raise RuntimeError(f"Final merge FFmpeg error: {exc.stderr}")
-        except FileNotFoundError:
-            raise RuntimeError("FFmpeg not found. Install FFmpeg or imageio-ffmpeg.")
+        
+        if self.project_mode == "youtube":
+            # YouTube Mode: sidechain compress voiceovers and backing music
+            active_project = getattr(self, "current_project_dir", None)
+            if not active_project:
+                active_project = os.path.join(self.base_output_dir, "default_project")
+            
+            vo_dir = os.path.join(active_project, "voiceovers")
+            os.makedirs(vo_dir, exist_ok=True)
+            temp_dir = os.path.join(vo_dir, "temp")
+            os.makedirs(temp_dir, exist_ok=True)
+            
+            # Find valid scenes
+            valid_scenes = self._get_timeline_ordered_scenes()
+            
+            # Compile voiceovers
+            vo_inputs = []
+            vo_filter = []
+            vo_idx = 0
+            
+            intro_delay = float(self.ducking_intro_delay_var.get() or 2.0) if hasattr(self, "ducking_intro_delay_var") else 2.0
+            intro_silence = os.path.join(temp_dir, f"intro_silence_{timestamp}.wav")
+            silence_cmd = [
+                FFMPEG_PATH, "-y", "-f", "lavfi",
+                "-i", f"anullsrc=r=24000:cl=mono",
+                "-t", f"{intro_delay:.3f}", intro_silence
+            ]
+            subprocess.run(silence_cmd, creationflags=subprocess.CREATE_NO_WINDOW, capture_output=True, check=True)
+            
+            vo_inputs += ["-i", intro_silence]
+            vo_filter.append(f"[{vo_idx}:a]")
+            vo_idx += 1
+            
+            temp_files_to_clean = [intro_silence]
+            for idx, sc in enumerate(valid_scenes, start=1):
+                vo_path = sc.get("voiceover_audio_path")
+                if vo_path and os.path.exists(vo_path):
+                    vo_inputs += ["-i", vo_path]
+                    vo_filter.append(f"[{vo_idx}:a]")
+                    vo_idx += 1
+                else:
+                    sc_dur = sc.get("duration") or 5.0
+                    sc_silence = os.path.join(temp_dir, f"silence_{idx}_{sc['scene_id']}_{timestamp}.wav")
+                    silence_cmd = [
+                        FFMPEG_PATH, "-y", "-f", "lavfi",
+                        "-i", f"anullsrc=r=24000:cl=mono",
+                        "-t", f"{sc_dur:.3f}", sc_silence
+                    ]
+                    subprocess.run(silence_cmd, creationflags=subprocess.CREATE_NO_WINDOW, capture_output=True, check=True)
+                    vo_inputs += ["-i", sc_silence]
+                    temp_files_to_clean.append(sc_silence)
+                    vo_filter.append(f"[{vo_idx}:a]")
+                    vo_idx += 1
+                    
+            voiceover_compiled = os.path.normpath(os.path.join(vo_dir, f"voiceover_compiled_{timestamp}.wav"))
+            filter_complex_str = f"{''.join(vo_filter)}concat=n={vo_idx}:v=0:a=1[aout]"
+            concat_cmd = [FFMPEG_PATH, "-y"] + vo_inputs + [
+                "-filter_complex", filter_complex_str,
+                "-map", "[aout]", voiceover_compiled
+            ]
+            subprocess.run(concat_cmd, creationflags=subprocess.CREATE_NO_WINDOW, capture_output=True, check=True)
+            
+            for temp_f in temp_files_to_clean:
+                try:
+                    os.remove(temp_f)
+                except OSError:
+                    pass
+            
+            audio_track_to_merge = voiceover_compiled
+            backing_music = self.current_generated_audio
+            
+            if backing_music and os.path.exists(backing_music):
+                mixed_audio = os.path.normpath(os.path.join(vo_dir, f"audio_mix_{timestamp}.wav"))
+                threshold = float(self.ducking_threshold_var.get() or 0.08) if hasattr(self, "ducking_threshold_var") else 0.08
+                ratio = float(self.ducking_ratio_var.get() or 6.0) if hasattr(self, "ducking_ratio_var") else 6.0
+                attack = float(self.ducking_attack_var.get() or 100) if hasattr(self, "ducking_attack_var") else 100.0
+                release = float(self.ducking_release_var.get() or 500) if hasattr(self, "ducking_release_var") else 500.0
+                bg_volume = float(self.ducking_bg_volume_var.get() or 0.25) if hasattr(self, "ducking_bg_volume_var") else 0.25
+                
+                mix_filter = (
+                    f"[0:a]volume={bg_volume}[bg_music]; "
+                    f"[bg_music][1:a]sidechaincompress=threshold={threshold}:ratio={ratio}:attack={attack}:release={release}[ducked_music]; "
+                    f"[ducked_music][1:a]amix=inputs=2:duration=longest[aout]"
+                )
+                
+                mix_cmd = [
+                    FFMPEG_PATH, "-y",
+                    "-i", backing_music,
+                    "-i", voiceover_compiled,
+                    "-filter_complex", mix_filter,
+                    "-map", "[aout]", mixed_audio
+                ]
+                subprocess.run(mix_cmd, creationflags=subprocess.CREATE_NO_WINDOW, capture_output=True, check=True)
+                audio_track_to_merge = mixed_audio
+
+            output_file = os.path.normpath(os.path.join(self.final_mv_dir, f"Final_YouTube_Video_{timestamp}.mp4"))
+            cmd = [
+                FFMPEG_PATH, '-y',
+                '-i', self.selected_video_for_music,
+                '-i', audio_track_to_merge,
+                '-map', '0:v:0', '-map', '1:a:0',
+                '-c:v', 'copy', '-c:a', 'aac',
+                '-shortest', output_file
+            ]
+            try:
+                subprocess.run(cmd, creationflags=subprocess.CREATE_NO_WINDOW, capture_output=True, text=True, check=True)
+            except subprocess.CalledProcessError as exc:
+                raise RuntimeError(f"Final merge FFmpeg error: {exc.stderr}")
+            except FileNotFoundError:
+                raise RuntimeError("FFmpeg not found. Install FFmpeg or imageio-ffmpeg.")
+                
+            self.current_final_video = output_file
+        else:
+            if not self.current_generated_audio or not os.path.exists(self.current_generated_audio):
+                raise RuntimeError("No generated audio available for final merge.")
+            
+            output_file = os.path.normpath(os.path.join(self.final_mv_dir, f"Final_Music_Video_{timestamp}.mp4"))
+            cmd = [
+                FFMPEG_PATH, '-y',
+                '-i', self.selected_video_for_music,
+                '-i', self.current_generated_audio,
+                '-map', '0:v:0', '-map', '1:a:0',
+                '-c:v', 'copy', '-c:a', 'aac',
+                '-shortest', output_file
+            ]
+            try:
+                subprocess.run(cmd, creationflags=subprocess.CREATE_NO_WINDOW, capture_output=True, text=True, check=True)
+            except subprocess.CalledProcessError as exc:
+                raise RuntimeError(f"Final merge FFmpeg error: {exc.stderr}")
+            except FileNotFoundError:
+                raise RuntimeError("FFmpeg not found. Install FFmpeg or imageio-ffmpeg.")
+                
+            self.current_final_video = output_file
 
         if not os.path.exists(output_file):
             raise RuntimeError("Final merge produced no output file.")
 
-        self.current_final_video = output_file
-        self._update_autonomous_progress(AUTONOMOUS_STATE_MERGING, f"Music video complete: {os.path.basename(output_file)}", 1.0)
+        self._update_autonomous_progress(AUTONOMOUS_STATE_MERGING, f"YouTube video complete: {os.path.basename(output_file)}" if self.project_mode == "youtube" else f"Music video complete: {os.path.basename(output_file)}", 1.0)
         self.root.after(0, self.refresh_gallery)
 
     def on_closing(self):
