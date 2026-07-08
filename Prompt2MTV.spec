@@ -17,6 +17,7 @@ workflow_datas = [
     (str(project_root / 'video_ltx2_3_t2v_gguf.json'), '.'),
     (str(project_root / 'video_ltx2_3_t2v_gguf_distilled.json'), '.'),
     (str(project_root / 'video_ltx2_3_i2v.json'), '.'),
+    (str(project_root / 'video_ltx2_3_ia2v.json'), '.'),
     (str(project_root / 'video_ltx2_3_i2v_gguf.json'), '.'),
     (str(project_root / 'video_ltx2_3_i2v_gguf_distilled.json'), '.'),
     (str(project_root / 'image_z_image.json'), '.'),

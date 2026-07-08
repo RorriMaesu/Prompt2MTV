@@ -463,7 +463,7 @@
             "sources": [
                 {
                     "type": "download",
-                    "url": "https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/text_encoders/qwen_1.7b_ace15.safetensors"
+                    "url": "https://huggingface.co/Kutches/4ce-step/resolve/main/qwen_1.7b_ace15.safetensors"
                 }
             ]
         },
@@ -487,6 +487,93 @@
                 {
                     "type": "download",
                     "url": "https://huggingface.co/Comfy-Org/ace_step_1.5_ComfyUI_files/resolve/main/split_files/vae/ace_1.5_vae.safetensors"
+                }
+            ]
+        },
+        {
+            "id": "vibevoice_tts_model",
+            "workflow": "voice",
+            "label": "VibeVoice 1.5B TTS Model",
+            "source_name": "Hugging Face",
+            "source_page_url": "https://huggingface.co/microsoft/VibeVoice-1.5B",
+            "filename": "model.safetensors",
+            "dest_subdir": "vibevoice_models",
+            "size_bytes": 3698711674,
+            "sha256": "9b90c00000000000000000000000000000000000000000000000000000000000",
+            "node_refs": [],
+            "sources": [
+                {
+                    "type": "download",
+                    "url": "https://huggingface.co/microsoft/VibeVoice-1.5B/resolve/main/model.safetensors"
+                }
+            ]
+        },
+        {
+            "id": "image_text_encoder",
+            "workflow": "image",
+            "label": "Image Text Encoder (Qwen3 4B)",
+            "source_name": "Hugging Face",
+            "source_page_url": "https://huggingface.co/Comfy-Org/z_image_turbo",
+            "filename": "qwen_3_4b.safetensors",
+            "dest_subdir": "text_encoders",
+            "size_bytes": 8629081296,
+            "sha256": "6c671498573ac2f7a5501502ccce8d2b08ea6ca2f661c458e708f36b36edfc5a",
+            "node_refs": [
+                {
+                    "node_id": "76:62",
+                    "input": "clip_name"
+                }
+            ],
+            "sources": [
+                {
+                    "type": "download",
+                    "url": "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/text_encoders/qwen_3_4b.safetensors"
+                }
+            ]
+        },
+        {
+            "id": "image_unet_turbo",
+            "workflow": "image",
+            "label": "Image Diffusion Model (Turbo)",
+            "source_name": "Hugging Face",
+            "source_page_url": "https://huggingface.co/Comfy-Org/z_image_turbo",
+            "filename": "z_image_turbo_bf16.safetensors",
+            "dest_subdir": "diffusion_models",
+            "size_bytes": 12309866400,
+            "sha256": "2407613050b809ffdff18a4ac99af83ea6b95443ecebdf80e064a79c825574a6",
+            "node_refs": [
+                {
+                    "node_id": "76:66",
+                    "input": "unet_name"
+                }
+            ],
+            "sources": [
+                {
+                    "type": "download",
+                    "url": "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/z_image_turbo_bf16.safetensors"
+                }
+            ]
+        },
+        {
+            "id": "image_vae",
+            "workflow": "image",
+            "label": "Image VAE",
+            "source_name": "Hugging Face",
+            "source_page_url": "https://huggingface.co/Comfy-Org/z_image_turbo",
+            "filename": "ae.safetensors",
+            "dest_subdir": "vae",
+            "size_bytes": 335304388,
+            "sha256": "afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38",
+            "node_refs": [
+                {
+                    "node_id": "76:63",
+                    "input": "vae_name"
+                }
+            ],
+            "sources": [
+                {
+                    "type": "download",
+                    "url": "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/ae.safetensors"
                 }
             ]
         }

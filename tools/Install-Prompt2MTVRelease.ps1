@@ -1,9 +1,25 @@
 param(
-    [string]$InstallerPath = (Join-Path $PSScriptRoot '..\dist_installer\Prompt2MTV-Setup-0.3.0.exe'),
+    [string]$InstallerPath,
     [string]$InstallDir = "$env:LOCALAPPDATA\Programs\Prompt2MTV"
 )
 
 $ErrorActionPreference = 'Stop'
+
+if (-not $InstallerPath) {
+    $searchDir = Join-Path $PSScriptRoot '..\dist_installer'
+    if (Test-Path $searchDir) {
+        $latestInstaller = Get-ChildItem (Join-Path $searchDir 'Prompt2MTV-Setup-*.exe') -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+        if ($latestInstaller) {
+            $InstallerPath = $latestInstaller.FullName
+        }
+    }
+}
+
+if (-not $InstallerPath) {
+    $InstallerPath = Join-Path $PSScriptRoot '..\dist_installer\Prompt2MTV-Setup-4.0.0.exe'
+}
 
 function Get-Prompt2MTVUninstallEntry {
     $roots = @(
@@ -14,7 +30,7 @@ function Get-Prompt2MTVUninstallEntry {
 
     foreach ($root in $roots) {
         $entry = Get-ItemProperty -Path $root -ErrorAction SilentlyContinue |
-            Where-Object { $_.DisplayName -eq 'Prompt2MTV' } |
+            Where-Object { $_.PSChildName -eq '{8F6A8C07-EB70-4F5E-AF2F-0C7AA0F11CF1}_is1' } |
             Select-Object -First 1
         if ($entry) {
             return $entry
@@ -36,7 +52,18 @@ function Invoke-Prompt2MTVManagedUninstall {
         $exePath = if ($Matches.exe) { $Matches.exe } else { $Matches['exe'] }
         $args = $Matches.args
         $silentArgs = if ($args) { "$args /VERYSILENT /SUPPRESSMSGBOXES /NORESTART" } else { '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART' }
-        Start-Process -FilePath $exePath -ArgumentList $silentArgs -Wait
+        if (Test-Path $exePath) {
+            Start-Process -FilePath $exePath -ArgumentList $silentArgs -Wait
+        } else {
+            Write-Output "Orphaned registry uninstall entry found at $($Entry.PSPath)."
+            Write-Output "Attempting to clean up orphaned registry entry..."
+            try {
+                Remove-Item -Path $Entry.PSPath -Force -ErrorAction Stop
+                Write-Output "Successfully removed orphaned registry entry."
+            } catch {
+                Write-Warning "Could not remove registry entry. If the installer fails, please run PowerShell as Administrator and run the script again."
+            }
+        }
     }
 }
 

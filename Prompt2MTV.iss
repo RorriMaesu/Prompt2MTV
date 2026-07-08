@@ -22,8 +22,12 @@ AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
 AppComments={#MyAppTagline}
 DefaultDirName={autopf}\{#MyAppName}
+DisableDirPage=no
+UsePreviousAppDir=no
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
+PrivilegesRequired=lowest
+PrivilegesRequiredOverridesAllowed=dialog commandline
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 Compression=lzma
@@ -53,6 +57,7 @@ Type: filesandordirs; Name: "{app}\*"
 
 [Files]
 Source: "{#MyAppDistDir}\*"; DestDir: "{app}"; Excludes: "_internal\\bundled_models\\*"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "VibeVoice\*"; DestDir: "{app}\VibeVoice"; Excludes: ".git\*,demo\example\*,Figures\*"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
@@ -75,8 +80,11 @@ var
 begin
   sUnInstPath := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{8F6A8C07-EB70-4F5E-AF2F-0C7AA0F11CF1}_is1';
   sUnInstallString := '';
-  if not RegQueryStringValue(HKLM, sUnInstPath, 'UninstallString', sUnInstallString) then
-    RegQueryStringValue(HKCU, sUnInstPath, 'UninstallString', sUnInstallString);
+  // Check 64-bit and 32-bit registry paths under both HKLM and HKCU
+  if not RegQueryStringValue(HKLM64, sUnInstPath, 'UninstallString', sUnInstallString) then
+    if not RegQueryStringValue(HKLM32, sUnInstPath, 'UninstallString', sUnInstallString) then
+      if not RegQueryStringValue(HKCU64, sUnInstPath, 'UninstallString', sUnInstallString) then
+        RegQueryStringValue(HKCU32, sUnInstPath, 'UninstallString', sUnInstallString);
   Result := sUnInstallString;
 end;
 
@@ -91,5 +99,20 @@ begin
   begin
     sUnInstallString := RemoveQuotes(sUnInstallString);
     Exec(sUnInstallString, '/VERYSILENT /NORESTART /SUPPRESSMSGBOXES', '', SW_HIDE, ewWaitUntilTerminated, iResultCode);
+  end;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usUninstall then
+  begin
+    if MsgBox('Do you want to delete all Prompt2MTV configurations, settings, logs, and downloaded models inside the installation folder?', mbConfirmation, MB_YESNO) = IDYES then
+    begin
+      // Delete the user settings folders
+      DelTree(ExpandConstant('{localappdata}\Prompt2MTV'), True, True, True);
+      DelTree(ExpandConstant('{userappdata}\Prompt2MTV'), True, True, True);
+      // Delete any leftover files/folders in the app folder (e.g. downloaded models)
+      DelTree(ExpandConstant('{app}'), True, True, True);
+    end;
   end;
 end;

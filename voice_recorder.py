@@ -67,13 +67,21 @@ class AudioRecorder:
 
 
 class VoiceCloningSetupWizard(tk.Toplevel):
-    def __init__(self, parent, vibevoice_dir, python_exe, active_speaker="user", on_success_callback=None):
+    def __init__(self, parent, vibevoice_dir, python_exe, active_speaker="user", on_success_callback=None, model_path=None):
         super().__init__(parent)
         self.parent = parent
         self.vibevoice_dir = vibevoice_dir
         self.python_exe = python_exe
+        self.model_path = model_path or "microsoft/VibeVoice-1.5B"
         self.active_speaker = active_speaker or "user"
         self.on_success_callback = on_success_callback
+        
+        local_app_data = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+        if local_app_data:
+            self.user_voices_dir = os.path.join(local_app_data, "Prompt2MTV", "voices")
+        else:
+            self.user_voices_dir = os.path.join(os.path.expanduser("~"), ".prompt2mtv", "voices")
+        os.makedirs(self.user_voices_dir, exist_ok=True)
         
         self.title("Voice Cloning Setup Wizard")
         self.geometry("700x820")
@@ -296,18 +304,18 @@ class VoiceCloningSetupWizard(tk.Toplevel):
 
     def _scan_existing_profiles(self):
         voices_dir = os.path.normpath(os.path.join(self.vibevoice_dir, "demo", "voices"))
-        if not os.path.exists(voices_dir):
-            return ["user"]
-            
         profiles = []
-        try:
-            for f in os.listdir(voices_dir):
-                if f.lower().endswith(".wav") and f.startswith("en-") and f.endswith("_voice.wav"):
-                    name = f[3:-10]
-                    if name:
-                        profiles.append(name)
-        except Exception as e:
-            print(f"Error scanning voice profiles: {e}")
+        
+        for target_dir in [voices_dir, getattr(self, "user_voices_dir", None)]:
+            if target_dir and os.path.exists(target_dir):
+                try:
+                    for f in os.listdir(target_dir):
+                        if f.lower().endswith(".wav") and f.startswith("en-") and f.endswith("_voice.wav"):
+                            name = f[3:-10]
+                            if name:
+                                profiles.append(name)
+                except Exception as e:
+                    print(f"Error scanning voice profiles in {target_dir}: {e}")
             
         if "user" not in profiles:
             profiles.insert(0, "user")
@@ -508,20 +516,51 @@ class VoiceCloningSetupWizard(tk.Toplevel):
             cmd = [
                 self.python_exe,
                 os.path.join(self.vibevoice_dir, "demo", "inference_from_file.py"),
-                "--model_path", "microsoft/VibeVoice-1.5b",
+                "--model_path", self.model_path,
                 "--txt_path", self.test_script_path,
                 "--speaker_names", speaker,
                 "--output_dir", self.test_output_dir,
                 "--cfg_scale", "1.3"
             ]
-            
+
             try:
                 # Execute subprocess
+                env = os.environ.copy()
+                for var in ["PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV", "CONDA_PREFIX", "CONDA_DEFAULT_ENV", "PYTHONIOENCODING", "PYTHONDONTWRITEBYTECODE"]:
+                    env.pop(var, None)
+                # Disable user site-packages so they cannot shadow the target env
+                env["PYTHONNOUSERSITE"] = "1"
+                # Resolve the vibevoice package from the app's own VibeVoice tree
+                if os.path.isdir(os.path.join(self.vibevoice_dir, "vibevoice")):
+                    env["PYTHONPATH"] = self.vibevoice_dir
+                if self.model_path and os.path.isdir(self.model_path):
+                    # Fully local model: no hub lookups needed
+                    env["HF_HUB_OFFLINE"] = "1"
+                if self.python_exe and os.path.exists(self.python_exe):
+                    env_dir = os.path.dirname(os.path.abspath(self.python_exe))
+                    if os.path.basename(env_dir).lower() == "scripts":
+                        env_dir = os.path.dirname(env_dir)
+                    extra_paths = [
+                        env_dir,
+                        os.path.join(env_dir, "Scripts"),
+                        os.path.join(env_dir, "Library", "bin"),
+                        os.path.join(env_dir, "Library", "usr", "bin"),
+                        os.path.join(env_dir, "Library", "mingw-w64", "bin"),
+                        os.path.join(env_dir, "bin")
+                    ]
+                    valid_extras = [p for p in extra_paths if os.path.isdir(p)]
+                    if valid_extras:
+                        current_path = env.get("PATH", "")
+                        new_path = os.pathsep.join(valid_extras)
+                        if current_path:
+                            new_path = new_path + os.pathsep + current_path
+                        env["PATH"] = new_path
                 process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     cwd=self.vibevoice_dir,
+                    env=env,
                     text=True
                 )
                 
@@ -622,4 +661,28 @@ class VoiceCloningSetupWizard(tk.Toplevel):
         speaker = "".join(c for c in speaker if c.isalnum() or c in ("_", "-"))
         if not speaker:
             speaker = "user"
-        return os.path.normpath(os.path.join(self.vibevoice_dir, "demo", "voices", f"en-{speaker}_voice.wav"))
+            
+        voices_dir = os.path.normpath(os.path.join(self.vibevoice_dir, "demo", "voices"))
+        filename = f"en-{speaker}_voice.wav"
+        
+        is_writable = False
+        if os.path.exists(voices_dir):
+            try:
+                test_file = os.path.join(voices_dir, ".test_write")
+                with open(test_file, "w") as f:
+                    f.write("test")
+                os.remove(test_file)
+                is_writable = True
+            except (OSError, IOError):
+                is_writable = False
+        else:
+            try:
+                os.makedirs(voices_dir, exist_ok=True)
+                is_writable = True
+            except (OSError, IOError):
+                is_writable = False
+                
+        if is_writable:
+            return os.path.normpath(os.path.join(voices_dir, filename))
+        else:
+            return os.path.normpath(os.path.join(self.user_voices_dir, filename))

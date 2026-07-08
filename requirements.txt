@@ -3,3 +3,6 @@ ttkbootstrap
 imageio-ffmpeg
 tkinterdnd2
 websocket-client
+sounddevice
+soundfile
+numpy

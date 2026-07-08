@@ -33,3 +33,13 @@ bundled_models/
 clean_close_profile/
 ffmpeg_fixed_profile/
 smoke_test_profile/
+
+# Large Models
+LLM_Models/
+VibeVoice/
+hub/
+
+# Test/Log outputs
+build_log.txt
+error_details.json
+solid_white_test.png

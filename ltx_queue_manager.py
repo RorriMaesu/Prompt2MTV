@@ -13,11 +13,13 @@ import os
 import re
 import sys
 import subprocess
+import socket
 import shutil
 import tempfile
 import ctypes
 import queue
 import uuid
+import hashlib
 import webbrowser
 from datetime import datetime
 from PIL import Image, ImageTk
@@ -184,6 +186,12 @@ AUTONOMOUS_PHASE_ORDER = [
     AUTONOMOUS_STATE_GENERATING_MUSIC,
     AUTONOMOUS_STATE_MERGING,
 ]
+# Synthetic checkpoint key for the YouTube voiceover sub-phase (not part of
+# AUTONOMOUS_PHASE_ORDER; tracked in autonomous_completed_phases for resume).
+AUTONOMOUS_VOICEOVERS_DONE = "voiceovers_synthesized"
+AUTONOMOUS_MANIFEST_FILENAME = "autonomous_pipeline_state.json"
+AUTONOMOUS_MANIFEST_SCHEMA_VERSION = 1
+AUTONOMOUS_RESUMABLE_STATUSES = ("running", "failed", "cancelled", "paused")
 AUTONOMOUS_PHASE_WEIGHTS = {
     AUTONOMOUS_STATE_EXPANDING_CONCEPT: 0.03,
     AUTONOMOUS_STATE_PLANNING_SCENES: 0.04,
@@ -220,6 +228,13 @@ DEFAULT_COMFYUI_ROOT_CANDIDATES = [
     r"D:\ComfyUI",
     r"D:\ComfyUI\ComfyUI"
 ]
+COMFYUI_URLS = {
+    "nvidia_rtx": "https://github.com/Comfy-Org/ComfyUI/releases/latest/download/ComfyUI_windows_portable_nvidia.7z",
+    "nvidia_legacy": "https://github.com/Comfy-Org/ComfyUI/releases/latest/download/ComfyUI_windows_portable_nvidia_cu126.7z",
+    "amd": "https://github.com/Comfy-Org/ComfyUI/releases/latest/download/ComfyUI_windows_portable_amd.7z",
+    "intel": "https://github.com/Comfy-Org/ComfyUI/releases/latest/download/ComfyUI_windows_portable_intel.7z",
+    "cpu": "https://github.com/Comfy-Org/ComfyUI/releases/latest/download/ComfyUI_windows_portable_nvidia_cu126.7z"
+}
 DEFAULT_COMFYUI_LAUNCHER_NAMES = [
     "run_ltx2_queue_manager.bat",
     "run_nvidia_gpu.bat",
@@ -283,9 +298,21 @@ CHATBOT_TASK_JIT_VIDEO_PROMPT = "Generate Video Prompt (JIT)"
 CHATBOT_TASK_SONG_BRAINSTORM = "Brainstorm Song (Lyrics & Style)"
 CHATBOT_TASK_CONCEPT_EXPAND = "Expand Creative Concept"
 CHATBOT_TASK_BATCH_REVIEW = "Review Prompt Batch"
+CHATBOT_TASK_IMAGE_REVIEW = "Review Start Frame Image"
 CHATBOT_TASK_YOUTUBE_SCRIPT = "Write YouTube Voiceover Script"
 CHATBOT_TASK_YOUTUBE_SCENES = "Brainstorm YouTube Visual Scenes"
+# Conversational TTS pace used to convert a duration budget into a word budget
+# for voiceover scripts. VibeVoice averages ~2.2-2.6 words/sec for English.
+YOUTUBE_SPEECH_WORDS_PER_SECOND = 2.4
+# Segments may exceed their word budget by this factor before they are
+# retried or truncated.
+YOUTUBE_SEGMENT_WORD_TOLERANCE = 1.25
 BUNDLED_MODEL_DIR = "bundled_models"
+VIBEVOICE_MODEL_REPO_ID = "microsoft/VibeVoice-1.5B"
+VIBEVOICE_QWEN_TOKENIZER_REPO_ID = "Qwen/Qwen2.5-1.5B"
+VIBEVOICE_LOCAL_MODEL_DIRNAME = "VibeVoice-1.5B"
+VIBEVOICE_QWEN_TOKENIZER_SUBDIR = "qwen_tokenizer"
+VIBEVOICE_QWEN_TOKENIZER_FILES = ["tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt"]
 MODEL_SUBDIRECTORIES = {
     "checkpoint_name": "checkpoints",
     "text_encoder_name": "text_encoders",
@@ -745,6 +772,288 @@ def _draw_neon_rounded_border(canvas, w, h, thickness=6, radius=12, bg="#000000"
         capstyle="round", joinstyle="round",
         tags="neon_border",
     )
+
+
+class ModelDownloaderWizard:
+    def __init__(self, parent, manager):
+        self.parent = parent
+        self.manager = manager
+        
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title("Model Manager & Downloader")
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+        self.dialog.geometry("860x680")
+        self.dialog.minsize(760, 520)
+        
+        self.manager._style_panel(self.dialog, self.manager.colors["bg"])
+        
+        # Detect VRAM & GPU name
+        self.vram_gb = self.manager._detect_gpu_vram_gb()
+        _, self.gpu_name = self.manager._detect_gpu_type()
+        
+        # Perform dynamic audit of all models
+        self.reports = self.manager.audit_all_manifest_models()
+        
+        # Add chatbot models
+        self.chatbot_entries = [
+            {
+                "id": "chatbot_qwen3_7b",
+                "workflow": "chatbot",
+                "workflow_label": "Chatbot LLM",
+                "label": "Qwen3 7B Chatbot (Low VRAM)",
+                "filename": "Qwen_Qwen3-7B-Q4_K_M.gguf",
+                "dest_subdir": "LLM_Models",
+                "download_url": "https://huggingface.co/bartowski/Qwen_Qwen3-7B-GGUF/resolve/main/Qwen_Qwen3-7B-Q4_K_M.gguf?download=true",
+                "size_bytes": 4800000000,
+                "install_method": "download",
+                "sha256": None,
+            },
+            {
+                "id": "chatbot_qwen3_14b",
+                "workflow": "chatbot",
+                "workflow_label": "Chatbot LLM",
+                "label": "Qwen3 14B Chatbot (Standard / High VRAM)",
+                "filename": "Qwen_Qwen3-14B-Q4_K_M.gguf",
+                "dest_subdir": "LLM_Models",
+                "download_url": "https://huggingface.co/bartowski/Qwen_Qwen3-14B-GGUF/resolve/main/Qwen_Qwen3-14B-Q4_K_M.gguf?download=true",
+                "size_bytes": 10200000000,
+                "install_method": "download",
+                "sha256": None,
+            }
+        ]
+        
+        for cb in self.chatbot_entries:
+            resolved = None
+            filename = cb["filename"]
+            if self.manager.chatbot_model_root and os.path.exists(os.path.join(self.manager.chatbot_model_root, filename)):
+                resolved = os.path.join(self.manager.chatbot_model_root, filename)
+            else:
+                for cand in self.manager._get_chatbot_model_root_candidates():
+                    if os.path.exists(os.path.join(cand, filename)):
+                        resolved = os.path.join(cand, filename)
+                        break
+            cb["resolved_path"] = resolved
+            cb["destination_path"] = os.path.join(self.manager.chatbot_model_root or os.path.join(self.manager.app_root_dir, "LLM_Models"), filename)
+            cb["source_path"] = None
+            cb["source_name"] = "Hugging Face"
+            cb["source_page_url"] = "https://huggingface.co/bartowski/Qwen_Qwen3-14B-GGUF"
+            
+        self.all_entries = self.reports + self.chatbot_entries
+        self.selection_vars = {}
+        
+        self._build_ui()
+
+    def _build_ui(self):
+        shell = tk.Frame(self.dialog, padx=18, pady=18)
+        shell.pack(fill=tk.BOTH, expand=True)
+        self.manager._style_panel(shell, self.manager.colors["bg"])
+        
+        # Header Info
+        header_frame = tk.Frame(shell)
+        header_frame.pack(fill=tk.X, pady=(0, 12))
+        self.manager._style_panel(header_frame, self.manager.colors["bg"])
+        
+        title = tk.Label(header_frame, text="Model Manager & Downloader")
+        title.pack(anchor="w")
+        self.manager._style_label(title, "title", self.manager.colors["bg"])
+        
+        vram_text = f"GPU Detected: {self.gpu_name} | VRAM: {self.vram_gb:.1f} GB"
+        vram_lbl = tk.Label(header_frame, text=vram_text)
+        vram_lbl.pack(anchor="w", pady=(2, 4))
+        self.manager._style_label(vram_lbl, "muted", self.manager.colors["bg"])
+        
+        help_desc = "Select the models you want to download. Prompt2MTV has pre-selected the optimal models for your GPU."
+        desc_lbl = tk.Label(header_frame, text=help_desc)
+        desc_lbl.pack(anchor="w")
+        self.manager._style_label(desc_lbl, "body", self.manager.colors["bg"])
+        
+        # Main Checklist Scrollable Area
+        checklist_container = tk.Frame(shell, padx=10, pady=10)
+        checklist_container.pack(fill=tk.BOTH, expand=True, pady=(4, 14))
+        self.manager._style_panel(checklist_container, self.manager.colors["surface"], border=True)
+        
+        canvas = tk.Canvas(checklist_container, borderwidth=0, highlightthickness=0, bg=self.manager.colors["surface"])
+        scrollbar = tk.Scrollbar(checklist_container, orient="vertical", command=canvas.yview)
+        scrollable_frame = tk.Frame(canvas, bg=self.manager.colors["surface"])
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        # Group models by category
+        categories = {
+            "🎬 Video Generation (LTX-Video)": [e for e in self.all_entries if e["workflow"].startswith("video")],
+            "🎵 Music Generation (AceStep)": [e for e in self.all_entries if e["workflow"] == "music"],
+            "🗣 Voice Generation (VibeVoice)": [e for e in self.all_entries if e["workflow"] == "voice"],
+            "🖼 Image Generation (Z-Image)": [e for e in self.all_entries if e["workflow"] == "image"],
+            "🤖 Agentic Chatbot LLM (Qwen3)": [e for e in self.all_entries if e["workflow"] == "chatbot"],
+        }
+        
+        for category_name, entries in categories.items():
+            if not entries:
+                continue
+                
+            # Category Header
+            cat_frame = tk.Frame(scrollable_frame, pady=8, bg=self.manager.colors["surface"])
+            cat_frame.pack(fill=tk.X, anchor="w")
+            
+            cat_lbl = tk.Label(cat_frame, text=category_name, font=("Segoe UI", 10, "bold"), fg=self.manager.colors["text"])
+            cat_lbl.pack(side=tk.LEFT)
+            self.manager._style_label(cat_lbl, "body_strong", self.manager.colors["surface"])
+            
+            sep = tk.Frame(cat_frame, height=1, bg=self.manager.colors["border"])
+            sep.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 0), pady=4)
+            
+            # Category Rows
+            for entry in entries:
+                row = tk.Frame(scrollable_frame, padx=14, pady=4, bg=self.manager.colors["surface"])
+                row.pack(fill=tk.X, anchor="w")
+                
+                entry_id = entry["id"]
+                is_installed = entry["resolved_path"] is not None
+                
+                # Recommendation Check
+                rec = self.manager._get_model_vram_recommendation(entry_id, self.vram_gb)
+                
+                # Checkbutton
+                var = tk.BooleanVar()
+                if is_installed:
+                    var.set(False)
+                else:
+                    var.set(rec["pre_select"])
+                    
+                self.selection_vars[entry_id] = (var, entry)
+                
+                # Bind callback to update the size label dynamically
+                var.trace_add("write", lambda *args: self._update_size_summary())
+                
+                cb_text = entry["label"]
+                if is_installed:
+                    cb_text += " (Already Installed)"
+                    
+                cb = tk.Checkbutton(
+                    row, 
+                    text=cb_text, 
+                    variable=var, 
+                    bg=self.manager.colors["surface"],
+                    activebackground=self.manager.colors["surface"],
+                    fg=self.manager.colors["text"] if not is_installed else "#777777",
+                    selectcolor=self.manager.colors["surface"]
+                )
+                cb.pack(side=tk.LEFT)
+                if is_installed:
+                    cb.config(state=tk.DISABLED)
+                    
+                # Filename and size info
+                size_text = ""
+                if entry.get("size_bytes"):
+                    size_text = f"[{self.manager._format_byte_count(entry['size_bytes'])}]"
+                    
+                info_lbl = tk.Label(row, text=f"  {entry['filename']} {size_text}", font=("Segoe UI", 8), fg="#777777")
+                info_lbl.pack(side=tk.LEFT)
+                self.manager._style_label(info_lbl, "muted", self.manager.colors["surface"])
+                
+                # Badge
+                if not is_installed:
+                    badge_lbl = tk.Label(
+                        row, 
+                        text=f"  {rec['badge']}  ", 
+                        font=("Segoe UI", 8, "bold"), 
+                        fg="white", 
+                        bg=rec["color"],
+                        padx=4,
+                        pady=1
+                    )
+                    badge_lbl.pack(side=tk.RIGHT, padx=6)
+        
+        # Bind Mousewheel scroll
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        
+        # Bottom controls and summary
+        bottom_frame = tk.Frame(shell)
+        bottom_frame.pack(fill=tk.X, pady=(6, 0))
+        self.manager._style_panel(bottom_frame, self.manager.colors["bg"])
+        
+        self.summary_lbl = tk.Label(bottom_frame, text="Selected: 0.0 GB")
+        self.summary_lbl.pack(side=tk.LEFT)
+        self.manager._style_label(self.summary_lbl, "body_strong", self.manager.colors["bg"])
+        
+        # Action Buttons
+        btn_frame = tk.Frame(bottom_frame)
+        btn_frame.pack(side=tk.RIGHT)
+        self.manager._style_panel(btn_frame, self.manager.colors["bg"])
+        
+        close_btn = tk.Button(btn_frame, text="Close", command=self.dialog.destroy)
+        close_btn.pack(side=tk.RIGHT, padx=(8, 0))
+        self.manager._style_button(close_btn, "secondary")
+        
+        self.download_btn = tk.Button(btn_frame, text="Download Selected", command=self._download_selected)
+        self.download_btn.pack(side=tk.RIGHT, padx=(8, 0))
+        self.manager._style_button(self.download_btn, "primary")
+        
+        deselect_btn = tk.Button(btn_frame, text="Clear All", command=self._deselect_all)
+        deselect_btn.pack(side=tk.RIGHT, padx=(8, 0))
+        self.manager._style_button(deselect_btn, "secondary")
+        
+        select_rec_btn = tk.Button(btn_frame, text="Select Recommended", command=self._select_recommended)
+        select_rec_btn.pack(side=tk.RIGHT)
+        self.manager._style_button(select_rec_btn, "secondary")
+        
+        self._update_size_summary()
+        
+        # Center the dialog
+        self.dialog.update_idletasks()
+        x = self.parent.winfo_x() + (self.parent.winfo_width() - self.dialog.winfo_width()) // 2
+        y = self.parent.winfo_y() + (self.parent.winfo_height() - self.dialog.winfo_height()) // 2
+        self.dialog.geometry(f"+{x}+{y}")
+
+    def _update_size_summary(self):
+        total_bytes = 0
+        selected_count = 0
+        for entry_id, (var, entry) in self.selection_vars.items():
+            if var.get() and entry["resolved_path"] is None:
+                total_bytes += entry.get("size_bytes", 0)
+                selected_count += 1
+                
+        self.summary_lbl.config(text=f"Selected: {selected_count} models ({self.manager._format_byte_count(total_bytes)})")
+        if selected_count > 0:
+            self.download_btn.config(state=tk.NORMAL)
+        else:
+            self.download_btn.config(state=tk.DISABLED)
+
+    def _select_recommended(self):
+        for entry_id, (var, entry) in self.selection_vars.items():
+            if entry["resolved_path"] is not None:
+                var.set(False)
+            else:
+                rec = self.manager._get_model_vram_recommendation(entry_id, self.vram_gb)
+                var.set(rec["pre_select"])
+
+    def _deselect_all(self):
+        for var, entry in self.selection_vars.values():
+            var.set(False)
+
+    def _download_selected(self):
+        chosen_ids = []
+        for entry_id, (var, entry) in self.selection_vars.items():
+            if var.get() and entry["resolved_path"] is None:
+                chosen_ids.append(entry_id)
+                
+        if not chosen_ids:
+            return
+            
+        self.dialog.destroy()
+        self.manager.install_missing_models(interactive=True, selected_manifest_ids=chosen_ids)
 
 
 class SplashScreen:
@@ -1233,6 +1542,8 @@ class LTXQueueManager:
         self.resource_root_dir = self._get_resource_root_dir()
         self.user_data_dir = self._get_user_data_dir()
         os.makedirs(self.user_data_dir, exist_ok=True)
+        self.user_voices_dir = os.path.join(self.user_data_dir, "voices")
+        os.makedirs(self.user_voices_dir, exist_ok=True)
         self._configure_theme_system()
         if self.splash:
             self.splash.set_progress(0.20, "Loading settings & theme configuration\u2026")
@@ -1300,6 +1611,7 @@ class LTXQueueManager:
         self.comfyui_console_title = None
         self.comfyui_console_poll_after_id = None
         self.comfyui_console_pending_visibility = None
+        self.comfyui_adopted_pid = None
         self.comfyui_ready = False
         self.comfyui_ready_poll_id = None
         self.comfyui_readiness_history = {"samples": [], "average_seconds": 0.0}
@@ -1336,6 +1648,8 @@ class LTXQueueManager:
         self.chatbot_model_filename = CHATBOT_MODEL_FILENAME
         self.chatbot_model_root = self._get_recommended_chatbot_model_root()
         self.chatbot_model_path = self._get_chatbot_model_path_from_root(self.chatbot_model_root)
+        self.vibevoice_model_root = self.chatbot_model_root
+        self.comfyui_models_root = ""
         self.chatbot_preferred_drive = "M"
         self.chatbot_backend_mode = CHATBOT_BACKEND_MODE_CONNECT
         self.chatbot_model_family = DEFAULT_CHATBOT_MODEL_FAMILY
@@ -1369,6 +1683,8 @@ class LTXQueueManager:
         self.chatbot_generation_in_progress = False
         self.chatbot_pending_request_mode = None
         self.chatbot_download_cancel_requested = False
+        self.vibevoice_download_cancel_requested = False
+        self.comfyui_download_cancel_requested = False
         self.chatbot_setup_prompted_this_session = False
         self.autonomous_active = False
         self.autonomous_state = AUTONOMOUS_STATE_IDLE
@@ -1387,6 +1703,9 @@ class LTXQueueManager:
         self.autonomous_video_prompts = []
         self.autonomous_i2v_prompts = []
         self.autonomous_image_asset_map = {}
+        self.autonomous_voiceovers = []
+        self.autonomous_youtube_script = None
+        self.autonomous_resume_active = False
         self.tutorial_runtime_progress = {}
         self.tutorial_phase_history = self._create_empty_tutorial_phase_history()
         self.eta_active_phase = None
@@ -1423,7 +1742,8 @@ class LTXQueueManager:
         self.image_assets = []
         self.scene_timeline = []
         self.image_prompt_queue = []
-        
+        self.youtube_script_state = self._empty_youtube_script_state()
+
         if self.splash:
             self.splash.set_progress(0.55, "Building the main interface\u2026")
         self.setup_ui()
@@ -1477,6 +1797,8 @@ class LTXQueueManager:
 
     def _get_chatbot_model_root_candidates(self):
         candidates = []
+        if getattr(self, "chatbot_model_root", None):
+            candidates.append(self.chatbot_model_root)
         if self._chatbot_drive_available("M"):
             candidates.append(r"M:\AiStudio\Prompt2MTV\LLM_Models")
         if self._chatbot_drive_available("D"):
@@ -1668,7 +1990,7 @@ class LTXQueueManager:
             completed_process = subprocess.run(
                 [executable_path, "create", preferred_model_id, "-f", modelfile_path],
                 capture_output=True,
-                timeout=max(120, int(timeout_seconds)),
+                timeout=max(600, int(timeout_seconds)),
                 creationflags=creation_flags,
             )
             if completed_process.returncode != 0:
@@ -1731,7 +2053,7 @@ class LTXQueueManager:
         completed_process = subprocess.run(
             [executable_path, "pull", tag],
             capture_output=True,
-            timeout=max(300, int(timeout_seconds)),
+            timeout=max(600, int(timeout_seconds)),
             creationflags=creation_flags,
         )
         if completed_process.returncode != 0:
@@ -1799,6 +2121,7 @@ class LTXQueueManager:
             cwd=os.path.dirname(command[0]),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            env=self._get_clean_env(),
             creationflags=creation_flags,
         )
         self.chatbot_server_managed_by_app = True
@@ -2679,19 +3002,27 @@ class LTXQueueManager:
             if not isinstance(message, dict):
                 continue
             role = str(message.get("role") or "").strip()
-            content = str(message.get("content") or "").strip()
-            if role not in {"system", "user", "assistant"} or not content:
+            content = message.get("content")
+            if role not in {"system", "user", "assistant"} or content is None:
                 continue
-            request_messages.append({"role": role, "content": content})
+            if isinstance(content, (list, dict)):
+                request_messages.append({"role": role, "content": content})
+            else:
+                content_str = str(content).strip()
+                if not content_str:
+                    continue
+                request_messages.append({"role": role, "content": content_str})
 
         if force_non_thinking and request_messages:
             for message_index in range(len(request_messages) - 1, -1, -1):
                 if request_messages[message_index].get("role") != "user":
                     continue
-                request_messages[message_index] = dict(
-                    request_messages[message_index],
-                    content=self._apply_chatbot_non_thinking_suffix(request_messages[message_index].get("content"), force_non_thinking=True, model_id=model_id),
-                )
+                orig_content = request_messages[message_index].get("content")
+                if isinstance(orig_content, str):
+                    request_messages[message_index] = dict(
+                        request_messages[message_index],
+                        content=self._apply_chatbot_non_thinking_suffix(orig_content, force_non_thinking=True, model_id=model_id),
+                    )
                 break
         return request_messages
 
@@ -4074,6 +4405,61 @@ class LTXQueueManager:
                 "user_prompt_template": user_prompt_template,
             }
 
+        if task_label == CHATBOT_TASK_IMAGE_REVIEW:
+            schema_hint = {
+                "task": "image_review",
+                "quality_score": 8,
+                "should_regenerate": False,
+                "reason": "Explain briefly if there are issues like blank white, heavy distortion, or major misalignment.",
+                "defects_list": []
+            }
+            json_schema = {
+                "name": "prompt2mtv_image_review",
+                "schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "task": {"type": "string", "const": "image_review"},
+                        "quality_score": {"type": "integer", "minimum": 1, "maximum": 10},
+                        "should_regenerate": {"type": "boolean"},
+                        "reason": {"type": "string"},
+                        "defects_list": {
+                            "type": "array",
+                            "items": {"type": "string"}
+                        }
+                    },
+                    "required": ["task", "quality_score", "should_regenerate", "reason", "defects_list"]
+                }
+            }
+            user_prompt_template = (
+                "Task: review the generated image start frame and assess its visual quality and alignment with the scene description.\n\n"
+                "Scene description:\n__BRIEFING_TEXT__\n\n"
+                "Please check the provided image carefully for visual coherence, details, and defects (e.g. solid white/blank frame, major artifacts).\n\n"
+                "Produce exactly this JSON schema:\n"
+                f"{json.dumps(schema_hint, indent=2)}\n\n"
+                "REVIEW GUIDELINES:\n"
+                "- If the image is a blank white image, solid black, or solid color, you MUST set should_regenerate to true, quality_score to 1, and add 'blank image' to defects_list.\n"
+                "- Rate quality_score 1-10 (10 being perfect, 1 being completely broken/blank).\n"
+                "- Set should_regenerate to true if the score is below the minimum threshold (e.g., below 6) or if it has major defects.\n"
+                "- Avoid markdown and avoid prose outside JSON.\n"
+            )
+            return {
+                "label": CHATBOT_TASK_IMAGE_REVIEW,
+                "output_task": "image_review",
+                "required_fields": ["task", "quality_score", "should_regenerate", "reason", "defects_list"],
+                "non_empty_fields": ["task", "reason"],
+                "max_tokens": 4096,
+                "json_schema": json_schema,
+                "allow_thinking": True,
+                "system_prompt": (
+                    "You are a strict, objective visual quality assurance assistant. "
+                    "You analyze generated image start frames to ensure they are visually coherent, of high quality, "
+                    "and match the scene description. "
+                    "Return only a JSON object with no markdown fences, no prose outside JSON, and no extra keys."
+                ),
+                "user_prompt_template": user_prompt_template,
+            }
+
         if task_label == CHATBOT_TASK_YOUTUBE_SCRIPT:
             schema_hint = {
                 "task": "youtube_script",
@@ -4126,6 +4512,7 @@ class LTXQueueManager:
                 "- Structure the script paragraph by paragraph. Each paragraph is a segment.\n"
                 "- For each segment, provide the exact voiceover text, the core topic, and a brief visual theme hint (e.g. 'moody workshop', 'futuristic space deck').\n"
                 "- Keep the segments logically ordered to build a compelling narrative.\n"
+                "- If the briefing specifies a pacing or word-count budget, treat it as a hard limit on each segment's voiceover_text.\n"
                 "- Avoid markdown and avoid prose outside JSON.\n"
             )
             return {
@@ -4364,6 +4751,29 @@ class LTXQueueManager:
             validated_output["scenes"] = validated_scenes
             return validated_output
 
+        # ── Image Review has boolean and array fields — handle specially ──
+        if output_task == "image_review":
+            validated_output = {}
+            validated_output["task"] = "image_review"
+            try:
+                validated_output["quality_score"] = int(parsed_output.get("quality_score") or 5)
+            except (TypeError, ValueError):
+                validated_output["quality_score"] = 5
+            should_regen = parsed_output.get("should_regenerate")
+            if isinstance(should_regen, str):
+                validated_output["should_regenerate"] = should_regen.lower() in ("true", "1", "yes")
+            else:
+                validated_output["should_regenerate"] = bool(should_regen)
+            validated_output["reason"] = get_field_any(parsed_output, ["reason", "explanation", "details", "comments"], "No reason provided.")
+            defects = parsed_output.get("defects_list") or parsed_output.get("defects") or []
+            if not isinstance(defects, list):
+                if isinstance(defects, str) and defects.strip():
+                    defects = [defects.strip()]
+                else:
+                    defects = []
+            validated_output["defects_list"] = [str(d).strip() for d in defects if d]
+            return validated_output
+
         # ── Batch review has an array field (weak_scenes) — handle specially ──
         if output_task == "batch_review":
             validated_output = {}
@@ -4515,7 +4925,7 @@ class LTXQueueManager:
         )
         return response_payload
 
-    def _build_chatbot_completion_payload_variants(self, task_config, briefing_text, model_id, keep_alive=None):
+    def _build_chatbot_completion_payload_variants(self, task_config, briefing_text, model_id, keep_alive=None, image_path=None):
         # Determine thinking mode: allow_thinking in task config AND quality preset must both be true,
         # BUT the global "default to non-thinking" user setting can override and suppress thinking entirely.
         task_allows_thinking = task_config.get("allow_thinking", False) and getattr(self, "autonomous_quality_thinking", True)
@@ -4523,10 +4933,31 @@ class LTXQueueManager:
         # If the user has globally enabled non-thinking, respect it even for tasks that allow thinking.
         effective_thinking = task_allows_thinking and not force_non_thinking
 
+        user_content = task_config["user_prompt_template"].replace("__BRIEFING_TEXT__", briefing_text.strip())
+        if image_path and os.path.exists(image_path):
+            try:
+                import base64
+                with open(image_path, "rb") as img_file:
+                    b64_data = base64.b64encode(img_file.read()).decode("utf-8")
+                ext = os.path.splitext(image_path)[1].lower()
+                mime_type = "image/png" if ext == ".png" else "image/jpeg"
+                user_msg_content = [
+                    {"type": "text", "text": user_content},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime_type};base64,{b64_data}"}
+                    }
+                ]
+            except Exception as vision_exc:
+                print(f"[Vision Request Builder] Failed to encode image {image_path}: {vision_exc}")
+                user_msg_content = user_content
+        else:
+            user_msg_content = user_content
+
         base_messages = self._build_chatbot_request_messages(
             [
                 {"role": "system", "content": task_config["system_prompt"]},
-                {"role": "user", "content": task_config["user_prompt_template"].replace("__BRIEFING_TEXT__", briefing_text.strip())},
+                {"role": "user", "content": user_msg_content},
             ],
             model_id=model_id,
             force_non_thinking=force_non_thinking,
@@ -4569,7 +5000,7 @@ class LTXQueueManager:
             non_think_messages = self._build_chatbot_request_messages(
                 [
                     {"role": "system", "content": task_config["system_prompt"]},
-                    {"role": "user", "content": task_config["user_prompt_template"].replace("__BRIEFING_TEXT__", briefing_text.strip())},
+                    {"role": "user", "content": user_msg_content},
                 ],
                 model_id=model_id,
                 force_non_thinking=True,
@@ -4585,15 +5016,42 @@ class LTXQueueManager:
 
         return variants
 
-    def _request_chatbot_structured_output(self, task_name, briefing_text, keep_alive=None):
+    def _request_chatbot_structured_output(self, task_name, briefing_text, keep_alive=None, image_path=None):
+        if task_name == CHATBOT_TASK_IMAGE_REVIEW and image_path and os.path.exists(image_path):
+            try:
+                from PIL import Image, ImageStat
+                with Image.open(image_path) as img:
+                    stat = ImageStat.Stat(img)
+                    max_std = max(stat.stddev) if stat.stddev else 0.0
+                    # Standard deviation < 2.0 indicates a solid color/blank image
+                    if max_std < 2.0:
+                        self.log_debug("IMAGE_QA_PROGRAMMATIC_REJECTION", path=image_path, stddev=stat.stddev)
+                        self.update_status(f"[QA Programmatic] Reordering regeneration: blank image detected (stddev={max_std:.2f})", "red")
+                        return {
+                            "task": "image_review",
+                            "quality_score": 1,
+                            "should_regenerate": True,
+                            "reason": f"Programmatic QA check: The image is a solid/blank color frame (max stddev={max_std:.2f} < 2.0).",
+                            "defects_list": ["blank image"]
+                        }
+            except Exception as stat_exc:
+                print(f"[QA Programmatic Check] Error analyzing image {image_path}: {stat_exc}")
+
         task_config = self._get_chatbot_task_config(task_name)
         task_timeout = task_config.get("timeout")
         timeout_seconds = max(15, int(task_timeout or self.chatbot_request_timeout or DEFAULT_CHATBOT_REQUEST_TIMEOUT))
         model_id = self._resolve_chatbot_generation_model_id(timeout_seconds=min(timeout_seconds, 10))
+
+        if task_name == CHATBOT_TASK_IMAGE_REVIEW:
+            is_vision = any(kw in model_id.lower() for kw in ["vision", "llava", "minicpm", "mplug", "cogvlm", "qwen2-vl", "qwen2.5-vl"])
+            if not is_vision:
+                self.update_status(f"[Warning] Chatbot model '{model_id}' lacks vision. QA will run programmatically for blank frames only.", "orange")
+                print(f"[QA Warning] The current model '{model_id}' is a text-only model. Visual QA requires a multimodal model (e.g. Llama-3.2-Vision or Llava).")
+
         response_payload = None
         last_error = None
         validated_output = None
-        payload_variants = self._build_chatbot_completion_payload_variants(task_config, briefing_text, model_id, keep_alive=keep_alive)
+        payload_variants = self._build_chatbot_completion_payload_variants(task_config, briefing_text, model_id, keep_alive=keep_alive, image_path=image_path)
 
         self.log_debug(
             "CHATBOT_STRUCTURED_REQUEST",
@@ -4837,21 +5295,11 @@ class LTXQueueManager:
             messagebox.showwarning("Chatbot", "No script segments found.")
             return
 
-        normalized_timeline = []
-        for index, seg in enumerate(segments, start=1):
-            if not isinstance(seg, dict):
-                continue
-            voiceover_text = str(seg.get("voiceover_text") or "").strip()
-            topic = str(seg.get("topic") or "").strip()
-            segment_number = int(seg.get("segment_number") or index)
-            
-            entry = self._create_scene_entry(segment_number, mode=SCENE_MODE_I2V, prompt=topic)
-            entry["voiceover"] = voiceover_text
-            normalized_timeline.append(entry)
-
-        self.scene_timeline = self._normalize_scene_timeline(normalized_timeline)
-        if hasattr(self, "scene_scrollable_frame"):
-            self._rebuild_scene_timeline_from_state(self.scene_timeline)
+        applied = self._apply_script_segments_to_timeline(segments)
+        if not applied:
+            messagebox.showwarning("Chatbot", "No usable script segments found.")
+            return
+        self._store_youtube_script(self.chatbot_last_result, source="auto", user_edited=False)
 
         self._record_chatbot_artifact_apply(
             target_type="scene_timeline",
@@ -4863,6 +5311,396 @@ class LTXQueueManager:
         if hasattr(self, "notebook") and hasattr(self, "video_tab"):
             self.notebook.select(self.video_tab)
         messagebox.showinfo("Chatbot", f"Applied {len(segments)} script segments to the timeline. Next, switch to visual scenes mode to generate visual prompts.")
+
+    def _apply_script_segments_to_timeline(self, segments):
+        """Replace the scene timeline with entries built from script segments.
+        Returns the number of scenes created."""
+        normalized_timeline = []
+        for index, seg in enumerate(segments, start=1):
+            if not isinstance(seg, dict):
+                continue
+            voiceover_text = str(seg.get("voiceover_text") or "").strip()
+            topic = str(seg.get("topic") or "").strip()
+            try:
+                segment_number = int(seg.get("segment_number") or index)
+            except (TypeError, ValueError):
+                segment_number = index
+
+            entry = self._create_scene_entry(segment_number, mode=SCENE_MODE_I2V, prompt=topic)
+            entry["voiceover"] = voiceover_text
+            normalized_timeline.append(entry)
+
+        if not normalized_timeline:
+            return 0
+
+        self.scene_timeline = self._normalize_scene_timeline(normalized_timeline)
+        if hasattr(self, "scene_scrollable_frame"):
+            self._rebuild_scene_timeline_from_state(self.scene_timeline)
+        return len(normalized_timeline)
+
+    # ── Script Writer tab ────────────────────────────────────────────────
+
+    def setup_script_tab(self):
+        tab = self.script_tab
+        self._style_panel(tab, self.colors["bg"])
+
+        header = tk.Frame(tab, padx=18, pady=12)
+        self._style_panel(header, self.colors["bg"])
+        header.pack(fill=tk.X)
+
+        title_lbl = tk.Label(header, text="✍️  Script Writer")
+        self._style_label(title_lbl, "title", self.colors["bg"])
+        title_lbl.pack(anchor="w")
+
+        copy_lbl = tk.Label(
+            header,
+            text=(
+                "Review the auto-generated voiceover script, edit it, or write your own from scratch. "
+                "Once you edit or write a script here, Autonomous YouTube mode uses it instead of writing its own."
+            ),
+            wraplength=980,
+            justify=tk.LEFT,
+        )
+        self._style_label(copy_lbl, "muted", self.colors["bg"])
+        copy_lbl.pack(anchor="w", pady=(2, 0))
+
+        toolbar = tk.Frame(tab, padx=18)
+        self._style_panel(toolbar, self.colors["bg"])
+        toolbar.pack(fill=tk.X, pady=(0, 10))
+
+        self.script_generate_btn = tk.Button(toolbar, text="🤖  Generate Script", command=self._handle_script_tab_generate)
+        self._style_button(self.script_generate_btn, "accent", compact=True)
+        self.script_generate_btn.pack(side=tk.LEFT)
+
+        self.script_add_segment_btn = tk.Button(toolbar, text="➕  Add Segment", command=self._handle_script_tab_add_segment)
+        self._style_button(self.script_add_segment_btn, "secondary", compact=True)
+        self.script_add_segment_btn.pack(side=tk.LEFT, padx=(8, 0))
+
+        self.script_apply_btn = tk.Button(toolbar, text="🎬  Apply to Timeline", command=self._handle_script_tab_apply_to_timeline)
+        self._style_button(self.script_apply_btn, "primary", compact=True)
+        self.script_apply_btn.pack(side=tk.LEFT, padx=(8, 0))
+
+        self.script_clear_btn = tk.Button(toolbar, text="🗑  Clear Script", command=self._handle_script_tab_clear)
+        self._style_button(self.script_clear_btn, "danger", compact=True)
+        self.script_clear_btn.pack(side=tk.LEFT, padx=(8, 0))
+
+        self.script_source_label = tk.Label(toolbar, text="No script yet.", anchor="e")
+        self._style_label(self.script_source_label, "muted", self.colors["bg"])
+        self.script_source_label.pack(side=tk.RIGHT)
+
+        budget_row = tk.Frame(tab, padx=18)
+        self._style_panel(budget_row, self.colors["bg"])
+        budget_row.pack(fill=tk.X, pady=(0, 8))
+        self.script_budget_label = tk.Label(budget_row, text="", anchor="w", justify=tk.LEFT)
+        self._style_label(self.script_budget_label, "body_strong", self.colors["bg"])
+        self.script_budget_label.pack(anchor="w")
+
+        meta_row = tk.Frame(tab, padx=18)
+        self._style_panel(meta_row, self.colors["bg"])
+        meta_row.pack(fill=tk.X, pady=(0, 8))
+        title_field_lbl = tk.Label(meta_row, text="Video Title")
+        self._style_label(title_field_lbl, "muted", self.colors["bg"])
+        title_field_lbl.pack(side=tk.LEFT)
+        self.script_title_var = tk.StringVar()
+        self.script_title_entry = tk.Entry(meta_row, textvariable=self.script_title_var)
+        self._style_text_input(self.script_title_entry)
+        self.script_title_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        self.script_title_entry.bind("<KeyRelease>", lambda _e: self._handle_script_meta_edit())
+
+        list_shell = tk.Frame(tab, padx=18)
+        self._style_panel(list_shell, self.colors["bg"])
+        list_shell.pack(fill=tk.BOTH, expand=True, pady=(0, 14))
+
+        self.script_canvas = tk.Canvas(list_shell, bd=0, highlightthickness=0, bg=self.colors["bg"])
+        self.script_scrollbar = tk.Scrollbar(list_shell, orient="vertical", command=self.script_canvas.yview)
+        self.script_segments_frame = tk.Frame(self.script_canvas, bg=self.colors["bg"])
+        self.script_canvas_window = self.script_canvas.create_window((0, 0), window=self.script_segments_frame, anchor="nw")
+        self.script_canvas.configure(yscrollcommand=self.script_scrollbar.set)
+        self.script_segments_frame.bind(
+            "<Configure>",
+            lambda _e: self.script_canvas.configure(scrollregion=self.script_canvas.bbox("all"))
+        )
+        self.script_canvas.bind(
+            "<Configure>",
+            lambda e: self.script_canvas.itemconfig(self.script_canvas_window, width=e.width)
+        )
+        self.script_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.script_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.script_segment_frames = []
+        self._script_save_after_id = None
+
+        if hasattr(self, "youtube_autonomous_duration_var"):
+            self.youtube_autonomous_duration_var.trace_add("write", lambda *_a: self._update_script_tab_summary())
+
+        self._refresh_script_tab_from_state()
+
+    def _refresh_script_tab_visibility(self):
+        if not hasattr(self, "script_tab") or not hasattr(self, "notebook"):
+            return
+        try:
+            if getattr(self, "project_mode", "mtv") == "youtube":
+                # add() restores a hidden tab; insert() pins it after Chatbot.
+                self.notebook.add(self.script_tab, text="Script Writer")
+                self.notebook.insert(1, self.script_tab)
+            else:
+                self.notebook.hide(self.script_tab)
+        except tk.TclError:
+            pass
+
+    def _refresh_script_tab_from_state(self):
+        if not hasattr(self, "script_segments_frame"):
+            return
+        state = getattr(self, "youtube_script_state", None) or self._empty_youtube_script_state()
+
+        if hasattr(self, "script_title_var"):
+            self.script_title_var.set(state.get("title", ""))
+
+        for frame in self.script_segment_frames:
+            frame.destroy()
+        self.script_segment_frames = []
+
+        for idx, seg in enumerate(state.get("segments") or []):
+            if isinstance(seg, dict):
+                self._build_script_segment_card(idx, seg)
+
+        self._update_script_tab_summary()
+        self._update_script_source_label()
+
+    def _build_script_segment_card(self, index, seg):
+        card = tk.Frame(self.script_segments_frame, padx=12, pady=10)
+        self._style_panel(card, self.colors["card"], border=True)
+        card.pack(fill=tk.X, pady=(0, 8))
+        card.script_index = index
+
+        head = tk.Frame(card, bg=self.colors["card"])
+        head.pack(fill=tk.X)
+        num_lbl = tk.Label(head, text=f"Segment {seg.get('segment_number', index + 1)}")
+        self._style_label(num_lbl, "body_strong", self.colors["card"])
+        num_lbl.pack(side=tk.LEFT)
+
+        card.metrics_label = tk.Label(head, text="")
+        self._style_label(card.metrics_label, "muted", self.colors["card"])
+        card.metrics_label.pack(side=tk.LEFT, padx=(10, 0))
+
+        del_btn = tk.Button(head, text="✕", command=lambda i=index: self._handle_script_tab_delete_segment(i))
+        self._style_button(del_btn, "ghost", compact=True)
+        del_btn.pack(side=tk.RIGHT)
+
+        topic_row = tk.Frame(card, bg=self.colors["card"])
+        topic_row.pack(fill=tk.X, pady=(6, 0))
+        topic_lbl = tk.Label(topic_row, text="Topic")
+        self._style_label(topic_lbl, "muted", self.colors["card"])
+        topic_lbl.pack(side=tk.LEFT)
+        card.topic_var = tk.StringVar(value=str(seg.get("topic") or ""))
+        topic_entry = tk.Entry(topic_row, textvariable=card.topic_var)
+        self._style_text_input(topic_entry)
+        topic_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        topic_entry.bind("<KeyRelease>", lambda _e, c=card: self._handle_script_segment_edit(c))
+
+        card.vo_text = tk.Text(card, height=3, wrap=tk.WORD)
+        self._style_text_input(card.vo_text, multiline=True)
+        card.vo_text.pack(fill=tk.X, pady=(6, 0))
+        card.vo_text.insert("1.0", str(seg.get("voiceover_text") or ""))
+        card.vo_text.bind("<KeyRelease>", lambda _e, c=card: self._handle_script_segment_edit(c))
+
+        self.script_segment_frames.append(card)
+        self._update_script_segment_metrics(card)
+
+    def _get_youtube_target_duration(self):
+        try:
+            return max(0, int(self.youtube_autonomous_duration_var.get()))
+        except (ValueError, tk.TclError, AttributeError):
+            return 0
+
+    def _update_script_segment_metrics(self, card):
+        segments = (self.youtube_script_state or {}).get("segments") or []
+        if card.script_index >= len(segments):
+            return
+        words = self._count_voiceover_words(segments[card.script_index].get("voiceover_text"))
+        est = words / YOUTUBE_SPEECH_WORDS_PER_SECOND if words else 0.0
+        card.metrics_label.config(text=f"{words} words · ~{est:.1f}s spoken")
+
+    def _update_script_tab_summary(self):
+        if not hasattr(self, "script_budget_label"):
+            return
+        segments = (self.youtube_script_state or {}).get("segments") or []
+        if not segments:
+            self.script_budget_label.config(
+                text="No script segments yet. Generate a script or add segments manually.",
+                fg=self.colors["text_muted"],
+            )
+            return
+        total_words = sum(
+            self._count_voiceover_words(s.get("voiceover_text")) for s in segments if isinstance(s, dict)
+        )
+        est_speech = total_words / YOUTUBE_SPEECH_WORDS_PER_SECOND if total_words else 0.0
+        target = self._get_youtube_target_duration()
+        text = f"{len(segments)} segments · {total_words} words · ~{est_speech:.0f}s of narration"
+        fg = self.colors["text"]
+        if target > 0:
+            text += f" · target video length {target}s"
+            if est_speech > target * 1.15:
+                fg = self.colors["danger"]
+                text += "   ⚠ narration exceeds the target length"
+            elif est_speech > target:
+                fg = self.colors["accent"]
+            else:
+                fg = self.colors["success"]
+        self.script_budget_label.config(text=text, fg=fg)
+
+    def _update_script_source_label(self):
+        if not hasattr(self, "script_source_label"):
+            return
+        state = getattr(self, "youtube_script_state", None) or {}
+        if not (state.get("segments") or state.get("title")):
+            self.script_source_label.config(text="No script yet.")
+        elif state.get("user_edited"):
+            self.script_source_label.config(text="✍️ User script — autonomous mode will use this")
+        elif state.get("source") == "auto":
+            self.script_source_label.config(text="🤖 Auto-generated — edit to take ownership")
+        else:
+            self.script_source_label.config(text="Script loaded.")
+
+    def _handle_script_meta_edit(self):
+        self.youtube_script_state["title"] = self.script_title_var.get().strip()
+        self._mark_script_user_edited()
+
+    def _handle_script_segment_edit(self, card):
+        segments = self.youtube_script_state.get("segments") or []
+        if card.script_index >= len(segments):
+            return
+        seg = segments[card.script_index]
+        seg["topic"] = card.topic_var.get().strip()
+        seg["voiceover_text"] = card.vo_text.get("1.0", tk.END).strip()
+        self._mark_script_user_edited()
+        self._update_script_segment_metrics(card)
+        self._update_script_tab_summary()
+
+    def _mark_script_user_edited(self):
+        state = self.youtube_script_state
+        state["user_edited"] = True
+        if not state.get("source"):
+            state["source"] = "user"
+        self._update_script_source_label()
+        self._schedule_script_state_save()
+
+    def _schedule_script_state_save(self):
+        if getattr(self, "project_state_restore_in_progress", False) or not getattr(self, "current_project_dir", None):
+            return
+        if getattr(self, "_script_save_after_id", None):
+            try:
+                self.root.after_cancel(self._script_save_after_id)
+            except (tk.TclError, ValueError):
+                pass
+        self._script_save_after_id = self.root.after(1500, self._commit_script_state_save)
+
+    def _commit_script_state_save(self):
+        self._script_save_after_id = None
+        if getattr(self, "current_project_dir", None):
+            self.save_project_state()
+
+    def _handle_script_tab_add_segment(self):
+        segments = self.youtube_script_state.setdefault("segments", [])
+        segments.append({
+            "segment_number": len(segments) + 1,
+            "voiceover_text": "",
+            "topic": "",
+            "visual_theme_hint": "",
+        })
+        self._mark_script_user_edited()
+        self._refresh_script_tab_from_state()
+
+    def _handle_script_tab_delete_segment(self, index):
+        segments = self.youtube_script_state.get("segments") or []
+        if index >= len(segments):
+            return
+        del segments[index]
+        for i, seg in enumerate(segments, start=1):
+            seg["segment_number"] = i
+        self._mark_script_user_edited()
+        self._refresh_script_tab_from_state()
+
+    def _handle_script_tab_clear(self):
+        state = self.youtube_script_state
+        if state.get("segments") or state.get("title"):
+            if not messagebox.askyesno("Script Writer", "Clear the entire script? This cannot be undone."):
+                return
+        self.youtube_script_state = self._empty_youtube_script_state()
+        self._schedule_script_state_save()
+        self._refresh_script_tab_from_state()
+
+    def _handle_script_tab_generate(self):
+        if self.youtube_script_state.get("user_edited") and self.youtube_script_state.get("segments"):
+            if not messagebox.askyesno("Script Writer", "Generating a new script will overwrite your edited script. Continue?"):
+                return
+
+        brief = ""
+        if hasattr(self, "youtube_autonomous_brief_text"):
+            brief = self.youtube_autonomous_brief_text.get("1.0", tk.END).strip()
+        if not brief:
+            brief = simpledialog.askstring(
+                "Script Writer",
+                "Describe the video: topic, key talking points, tone.",
+                parent=self.root,
+            )
+            brief = (brief or "").strip()
+        if not brief:
+            return
+
+        target_dur = self._get_youtube_target_duration() or 120
+        scene_count, actual_duration, _spc = self._calculate_autonomous_scene_count(target_dur)
+
+        self.script_generate_btn.config(state=tk.DISABLED, text="🤖  Writing...")
+        self.update_status("Generating YouTube script...", "blue")
+
+        def on_done():
+            self.script_generate_btn.config(state=tk.NORMAL, text="🤖  Generate Script")
+            self.update_status("YouTube script generated.", "green")
+            self._schedule_script_state_save()
+
+        def on_fail(err):
+            self.script_generate_btn.config(state=tk.NORMAL, text="🤖  Generate Script")
+            self.update_status("Script generation failed.", "red")
+            messagebox.showerror("Script Writer", f"Script generation failed:\n\n{err}")
+
+        def worker():
+            try:
+                self._autonomous_plan_youtube_script(brief, scene_count=scene_count, target_duration=actual_duration)
+                self.root.after(0, on_done)
+            except Exception as exc:
+                err = str(exc)
+                self.root.after(0, lambda e=err: on_fail(e))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _handle_script_tab_apply_to_timeline(self):
+        segments = [
+            s for s in (self.youtube_script_state.get("segments") or [])
+            if isinstance(s, dict) and str(s.get("voiceover_text") or "").strip()
+        ]
+        if not segments:
+            messagebox.showwarning("Script Writer", "There are no script segments with voiceover text to apply.")
+            return
+
+        has_timeline_content = any(
+            str(sc.get("prompt_text") or "").strip() or str(sc.get("voiceover") or "").strip()
+            for sc in self.scene_timeline if isinstance(sc, dict)
+        )
+        if has_timeline_content:
+            if not messagebox.askyesno("Script Writer", "Applying the script will replace the current scene timeline. Continue?"):
+                return
+
+        applied = self._apply_script_segments_to_timeline(segments)
+        if not applied:
+            messagebox.showwarning("Script Writer", "No usable script segments found.")
+            return
+
+        self._schedule_script_state_save()
+        self.update_status(f"Applied {applied} script segments to the timeline.", "green")
+        if hasattr(self, "notebook") and hasattr(self, "video_tab"):
+            self.notebook.select(self.video_tab)
+        messagebox.showinfo("Script Writer", f"Applied {applied} script segments to the timeline.")
 
     def _browse_python_exe(self):
         filename = filedialog.askopenfilename(
@@ -4887,6 +5725,540 @@ class LTXQueueManager:
         # Fallback to default path
         return path
 
+    def _get_clean_env(self, python_exe=None):
+        env = os.environ.copy()
+        for var in ["PYTHONPATH", "PYTHONHOME"]:
+            env.pop(var, None)
+        # User site-packages (%APPDATA%\Python\PythonXY) can shadow the target
+        # environment's packages with incompatible versions, so disable them.
+        env["PYTHONNOUSERSITE"] = "1"
+
+        if python_exe and os.path.exists(python_exe):
+            env_dir = os.path.dirname(os.path.abspath(python_exe))
+            if os.path.basename(env_dir).lower() == "scripts":
+                env_dir = os.path.dirname(env_dir)
+            
+            extra_paths = [
+                env_dir,
+                os.path.join(env_dir, "Scripts"),
+                os.path.join(env_dir, "Library", "bin"),
+                os.path.join(env_dir, "Library", "usr", "bin"),
+                os.path.join(env_dir, "Library", "mingw-w64", "bin"),
+                os.path.join(env_dir, "bin")
+            ]
+            valid_extras = [p for p in extra_paths if os.path.isdir(p)]
+            if valid_extras:
+                current_path = env.get("PATH", "")
+                new_path = os.pathsep.join(valid_extras)
+                if current_path:
+                    new_path = new_path + os.pathsep + current_path
+                env["PATH"] = new_path
+        return env
+
+    def _get_vibevoice_local_model_dirs(self):
+        candidates = []
+        if getattr(self, "vibevoice_model_root", None):
+            self._append_unique_path(candidates, self.vibevoice_model_root)
+        for root in self._get_chatbot_model_root_candidates():
+            self._append_unique_path(candidates, root)
+        return [
+            os.path.join(root, VIBEVOICE_LOCAL_MODEL_DIRNAME)
+            for root in candidates
+        ]
+
+    def _vibevoice_local_model_ready(self, model_dir):
+        if not model_dir or not os.path.isdir(model_dir):
+            return False
+        required = [
+            "config.json",
+            "preprocessor_config.json",
+            os.path.join(VIBEVOICE_QWEN_TOKENIZER_SUBDIR, "tokenizer.json"),
+            os.path.join(VIBEVOICE_QWEN_TOKENIZER_SUBDIR, "tokenizer_config.json"),
+        ]
+        for rel_path in required:
+            if not os.path.isfile(os.path.join(model_dir, rel_path)):
+                return False
+        index_path = os.path.join(model_dir, "model.safetensors.index.json")
+        if os.path.isfile(index_path):
+            try:
+                with open(index_path, "r", encoding="utf-8") as f:
+                    shard_names = set(json.load(f).get("weight_map", {}).values())
+            except Exception:
+                return False
+            if not shard_names:
+                return False
+            return all(os.path.isfile(os.path.join(model_dir, shard)) for shard in shard_names)
+        return os.path.isfile(os.path.join(model_dir, "model.safetensors"))
+
+    def _get_vibevoice_model_path(self):
+        for model_dir in self._get_vibevoice_local_model_dirs():
+            if self._vibevoice_local_model_ready(model_dir):
+                return model_dir
+        return VIBEVOICE_MODEL_REPO_ID
+
+    def _find_hf_snapshot_dir(self, repo_id):
+        hf_home = os.environ.get("HF_HOME") or os.path.join(os.path.expanduser("~"), ".cache", "huggingface")
+        hub_dir = (
+            os.environ.get("HF_HUB_CACHE")
+            or os.environ.get("HUGGINGFACE_HUB_CACHE")
+            or os.path.join(hf_home, "hub")
+        )
+        repo_dir = os.path.join(hub_dir, "models--" + repo_id.replace("/", "--"))
+        snapshots_dir = os.path.join(repo_dir, "snapshots")
+        if not os.path.isdir(snapshots_dir):
+            return None
+        candidates = []
+        ref_path = os.path.join(repo_dir, "refs", "main")
+        try:
+            with open(ref_path, "r", encoding="utf-8") as f:
+                candidates.append(os.path.join(snapshots_dir, f.read().strip()))
+        except Exception:
+            pass
+        try:
+            candidates.extend(
+                os.path.join(snapshots_dir, name) for name in sorted(os.listdir(snapshots_dir))
+            )
+        except Exception:
+            pass
+        for candidate in candidates:
+            if os.path.isdir(candidate) and os.listdir(candidate):
+                return candidate
+        return None
+
+    def _copy_model_files(self, source_dir, target_dir, filenames=None):
+        copied_any = False
+        for name in sorted(os.listdir(source_dir)):
+            if filenames is not None and name not in filenames:
+                continue
+            source_path = os.path.join(source_dir, name)
+            if not os.path.isfile(source_path):
+                continue
+            target_path = os.path.join(target_dir, name)
+            try:
+                if os.path.isfile(target_path) and os.path.getsize(target_path) == os.path.getsize(source_path):
+                    continue
+                shutil.copyfile(source_path, target_path)
+                copied_any = True
+            except Exception as copy_exc:
+                print(f"[VIBEVOICE] Failed to copy {source_path} -> {target_path}: {copy_exc}")
+                raise
+        return copied_any
+
+    def _download_hf_repo_via_python(self, python_exe, repo_id, target_dir, allow_patterns=None):
+        if not python_exe or not os.path.exists(python_exe):
+            return False
+        code = (
+            "from huggingface_hub import snapshot_download\n"
+            f"snapshot_download(repo_id={repo_id!r}, local_dir={target_dir!r}, allow_patterns={allow_patterns!r})\n"
+        )
+        try:
+            result = subprocess.run(
+                [python_exe, "-c", code],
+                env=self._get_clean_env(python_exe),
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=3600,
+            )
+        except Exception as exc:
+            print(f"[VIBEVOICE] Download of {repo_id} failed to launch: {exc}")
+            return False
+        if result.returncode != 0:
+            print(f"[VIBEVOICE] Download of {repo_id} failed:\n{(result.stderr or '')[-2000:]}")
+            return False
+        return True
+
+    def _create_vibevoice_download_dialog(self, file_index, total_files):
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"Downloading VibeVoice Model ({file_index}/{total_files})")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.geometry("620x240")
+        dialog.minsize(560, 220)
+        self._style_panel(dialog, self.colors["bg"])
+
+        shell = tk.Frame(dialog, padx=20, pady=18)
+        shell.pack(fill=tk.BOTH, expand=True)
+        self._style_panel(shell, self.colors["bg"])
+
+        title_label = tk.Label(shell, text="Downloading VibeVoice Model")
+        title_label.pack(anchor="w")
+        self._style_label(title_label, "title", self.colors["bg"])
+
+        summary_var = tk.StringVar(value="Preparing to download VibeVoice files...")
+        summary_label = tk.Label(shell, textvariable=summary_var, justify=tk.LEFT, anchor="w", wraplength=560)
+        summary_label.pack(fill=tk.X, pady=(8, 6))
+        self._style_label(summary_label, "body", self.colors["bg"])
+
+        detail_var = tk.StringVar(value="Waiting for download to start...")
+        detail_label = tk.Label(shell, textvariable=detail_var, justify=tk.LEFT, anchor="w", wraplength=560)
+        detail_label.pack(fill=tk.X, pady=(0, 10))
+        self._style_label(detail_label, "muted", self.colors["bg"])
+
+        progress_bar = ttk.Progressbar(shell, mode="determinate", maximum=100)
+        progress_bar.pack(fill=tk.X)
+
+        progress_var = tk.StringVar(value="0%")
+        progress_label = tk.Label(shell, textvariable=progress_var, anchor="e")
+        progress_label.pack(fill=tk.X, pady=(6, 10))
+        self._style_label(progress_label, "small", self.colors["bg"])
+
+        footer = tk.Frame(shell)
+        footer.pack(fill=tk.X, pady=(8, 0))
+        self._style_panel(footer, self.colors["bg"])
+
+        cancel_button = tk.Button(footer, text="Cancel", command=lambda: setattr(self, "vibevoice_download_cancel_requested", True))
+        cancel_button.pack(side=tk.RIGHT)
+        self._style_button(cancel_button, "secondary", compact=True)
+
+        dialog.protocol("WM_DELETE_WINDOW", lambda: setattr(self, "vibevoice_download_cancel_requested", True))
+        return {
+            "dialog": dialog,
+            "summary_var": summary_var,
+            "detail_var": detail_var,
+            "progress_var": progress_var,
+            "progress_bar": progress_bar,
+            "indeterminate": False,
+        }
+
+    def _update_vibevoice_download_dialog(self, dialog_state, filename, file_index, total_files, downloaded_bytes=None, total_bytes=None, resumed=False):
+        if not dialog_state:
+            return
+
+        dialog = dialog_state.get("dialog")
+        if not dialog or not dialog.winfo_exists():
+            return
+
+        dialog.title(f"Downloading VibeVoice Model ({file_index}/{total_files})")
+        dialog_state["summary_var"].set(f"Downloading {filename} ({file_index} of {total_files})")
+        if total_bytes is None:
+            detail_text = f"{self._format_byte_count(downloaded_bytes)} downloaded from Hugging Face"
+            if not dialog_state["indeterminate"]:
+                dialog_state["progress_bar"].configure(mode="indeterminate")
+                dialog_state["progress_bar"].start(12)
+                dialog_state["indeterminate"] = True
+            dialog_state["progress_var"].set("Downloading...")
+        else:
+            if dialog_state["indeterminate"]:
+                dialog_state["progress_bar"].stop()
+                dialog_state["progress_bar"].configure(mode="determinate")
+                dialog_state["indeterminate"] = False
+
+            completion_ratio = 0 if total_bytes <= 0 else min(1.0, downloaded_bytes / total_bytes)
+            dialog_state["progress_bar"]["value"] = completion_ratio * 100
+            dialog_state["progress_var"].set(f"{completion_ratio * 100:.1f}%")
+            detail_text = f"{self._format_byte_count(downloaded_bytes)} of {self._format_byte_count(total_bytes)} downloaded"
+
+        if resumed:
+            detail_text = f"{detail_text} | resuming partial download"
+
+        dialog_state["detail_var"].set(detail_text)
+        try:
+            dialog.update()
+        except tk.TclError:
+            pass
+
+    def _close_vibevoice_download_dialog(self, dialog_state):
+        if not dialog_state:
+            return
+        dialog = dialog_state.get("dialog")
+        try:
+            if dialog_state.get("indeterminate"):
+                dialog_state["progress_bar"].stop()
+            if dialog and dialog.winfo_exists():
+                dialog.destroy()
+        except tk.TclError:
+            pass
+
+    def _download_vibevoice_model_files_direct(self, target_dir, status_callback=None):
+        def _report(text):
+            print(f"[VIBEVOICE] {text}")
+            if status_callback:
+                try:
+                    status_callback(text)
+                except Exception:
+                    pass
+
+        # Ensure index file is downloaded to read dynamically
+        index_filename = "model.safetensors.index.json"
+        index_path = os.path.join(target_dir, index_filename)
+        index_url = f"https://huggingface.co/{VIBEVOICE_MODEL_REPO_ID}/resolve/main/{index_filename}"
+        
+        has_index = False
+        try:
+            if not os.path.exists(index_path) or os.path.getsize(index_path) == 0:
+                _report("Fetching model.safetensors.index.json to resolve weight shards...")
+                download_file(index_url, index_path)
+            has_index = True
+        except Exception as e:
+            print(f"[VIBEVOICE] model.safetensors.index.json check failed: {e}")
+
+        # Build list of VibeVoice files
+        vibevoice_files = ["config.json", "preprocessor_config.json"]
+        if has_index:
+            vibevoice_files.append(index_filename)
+            try:
+                with open(index_path, "r", encoding="utf-8") as f:
+                    shards = sorted(list(set(json.load(f).get("weight_map", {}).values())))
+                    vibevoice_files.extend(shards)
+            except Exception as e:
+                print(f"[VIBEVOICE] Failed to parse model.safetensors.index.json: {e}")
+                vibevoice_files.extend([
+                    "model-00001-of-00003.safetensors",
+                    "model-00002-of-00003.safetensors",
+                    "model-00003-of-00003.safetensors",
+                ])
+        else:
+            vibevoice_files.append("model.safetensors")
+
+        # Compile files_to_download
+        files_to_download = []
+        for f in vibevoice_files:
+            files_to_download.append({
+                "repo_id": VIBEVOICE_MODEL_REPO_ID,
+                "filename": f,
+                "dest_path": os.path.join(target_dir, f)
+            })
+
+        # Tokenizer files
+        tokenizer_dir = os.path.join(target_dir, VIBEVOICE_QWEN_TOKENIZER_SUBDIR)
+        os.makedirs(tokenizer_dir, exist_ok=True)
+        for f in VIBEVOICE_QWEN_TOKENIZER_FILES:
+            files_to_download.append({
+                "repo_id": VIBEVOICE_QWEN_TOKENIZER_REPO_ID,
+                "filename": f,
+                "dest_path": os.path.join(tokenizer_dir, f)
+            })
+
+        # Filter out files that are already completed
+        pending_files = []
+        approx_size = 0
+        for item in files_to_download:
+            dest_path = item["dest_path"]
+            if os.path.exists(dest_path):
+                size = os.path.getsize(dest_path)
+                if size > 0:
+                    is_large = "safetensors" in dest_path
+                    if is_large and size < 100 * 1024 * 1024:
+                        pending_files.append(item)
+                        approx_size += (1.8 * 1024 * 1024 * 1024 - size)
+                    else:
+                        continue
+            pending_files.append(item)
+            if "safetensors" in item["filename"]:
+                approx_size += 1.8 * 1024 * 1024 * 1024
+            elif "tokenizer.json" in item["filename"]:
+                approx_size += 10 * 1024 * 1024
+
+        if not pending_files:
+            _report("All VibeVoice model files are already present.")
+            return True
+
+        # Ask user for confirmation
+        total_files = len(pending_files)
+        message = (
+            f"Prompt2MTV needs to download the VibeVoice text-to-speech models ({total_files} files, approx. {self._format_byte_count(approx_size)}).\n\n"
+            f"Destination: {target_dir}\n\n"
+            "This is a one-time download. Continue?"
+        )
+        if not messagebox.askyesno("Download VibeVoice Model", message):
+            self.update_status("VibeVoice model download cancelled.", "orange")
+            return False
+
+        # Create progress dialog
+        self.vibevoice_download_cancel_requested = False
+        dialog_state = self._create_vibevoice_download_dialog(1, total_files)
+
+        current_dest_path = None
+        try:
+            for idx, item in enumerate(pending_files, 1):
+                if getattr(self, "vibevoice_download_cancel_requested", False):
+                    raise DownloadCancelledError()
+
+                filename = item["filename"]
+                repo_id = item["repo_id"]
+                dest_path = item["dest_path"]
+                current_dest_path = dest_path
+                url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
+
+                # Update dialog
+                self._update_vibevoice_download_dialog(dialog_state, filename, idx, total_files, downloaded_bytes=0, total_bytes=None)
+
+                # Download file
+                download_file(
+                    url,
+                    dest_path,
+                    progress_callback=lambda downloaded, total, resumed, fn=filename, idx=idx: self._update_vibevoice_download_dialog(
+                        dialog_state, fn, idx, total_files, downloaded, total, resumed
+                    ),
+                    cancel_check=lambda: getattr(self, "vibevoice_download_cancel_requested", False),
+                )
+        except DownloadCancelledError:
+            self._close_vibevoice_download_dialog(dialog_state)
+            self.update_status("VibeVoice model download cancelled.", "orange")
+            if current_dest_path:
+                for cleanup in (current_dest_path, f"{current_dest_path}.partial"):
+                    if os.path.exists(cleanup):
+                        try:
+                            os.remove(cleanup)
+                        except OSError:
+                            pass
+            return False
+        except Exception as exc:
+            self._close_vibevoice_download_dialog(dialog_state)
+            if current_dest_path:
+                for cleanup in (current_dest_path, f"{current_dest_path}.partial"):
+                    if os.path.exists(cleanup):
+                        try:
+                            os.remove(cleanup)
+                        except OSError:
+                            pass
+            if messagebox.askyesno("Download Error", f"Failed to download VibeVoice models:\n{exc}\n\nWould you like to retry?"):
+                return self._download_vibevoice_model_files_direct(target_dir, status_callback)
+            self.update_status("Failed to download VibeVoice models.", "red")
+            return False
+
+        self._close_vibevoice_download_dialog(dialog_state)
+        self.update_status("VibeVoice models downloaded successfully.", "green")
+        return True
+
+    def _localize_vibevoice_model(self, status_callback=None):
+        """Materialize the VibeVoice model + Qwen tokenizer as a plain local folder.
+
+        Synthesis subprocesses then load everything by path, so a flaky network
+        or an unreachable HF cache drive can no longer break the pipeline."""
+        def _report(text):
+            print(f"[VIBEVOICE] {text}")
+            if status_callback:
+                try:
+                    status_callback(text)
+                except Exception:
+                    pass
+
+        target_dir = None
+        for candidate in self._get_vibevoice_local_model_dirs():
+            try:
+                os.makedirs(candidate, exist_ok=True)
+                target_dir = candidate
+                break
+            except Exception:
+                continue
+        if not target_dir:
+            return None
+
+        # Check if already fully ready
+        if self._vibevoice_local_model_ready(target_dir):
+            return target_dir
+
+        # Try to copy from Hugging Face snapshot cache first if available
+        model_snapshot = self._find_hf_snapshot_dir(VIBEVOICE_MODEL_REPO_ID)
+        if model_snapshot:
+            _report("Copying VibeVoice model from HuggingFace cache...")
+            try:
+                self._copy_model_files(model_snapshot, target_dir)
+            except Exception:
+                pass
+
+        tokenizer_dir = os.path.join(target_dir, VIBEVOICE_QWEN_TOKENIZER_SUBDIR)
+        os.makedirs(tokenizer_dir, exist_ok=True)
+        tokenizer_snapshot = self._find_hf_snapshot_dir(VIBEVOICE_QWEN_TOKENIZER_REPO_ID)
+        if tokenizer_snapshot and os.path.isfile(os.path.join(tokenizer_snapshot, "tokenizer.json")):
+            _report("Copying Qwen tokenizer from HuggingFace cache...")
+            try:
+                self._copy_model_files(tokenizer_snapshot, tokenizer_dir, filenames=set(VIBEVOICE_QWEN_TOKENIZER_FILES))
+            except Exception:
+                pass
+
+        # If still not ready, download missing files directly
+        if not self._vibevoice_local_model_ready(target_dir):
+            _report("Downloading VibeVoice models from Hugging Face...")
+            if not self._download_vibevoice_model_files_direct(target_dir, status_callback):
+                return None
+
+        # Point the processor at the local tokenizer so it never falls back to
+        # resolving "Qwen/Qwen2.5-1.5B" through the hub at synthesis time.
+        preprocessor_path = os.path.join(target_dir, "preprocessor_config.json")
+        preprocessor_config = {"speech_tok_compress_ratio": 3200, "db_normalize": True}
+        if os.path.isfile(preprocessor_path):
+            try:
+                with open(preprocessor_path, "r", encoding="utf-8") as f:
+                    preprocessor_config = json.load(f)
+            except Exception:
+                pass
+        if preprocessor_config.get("language_model_pretrained_name") != tokenizer_dir:
+            preprocessor_config["language_model_pretrained_name"] = tokenizer_dir
+            with open(preprocessor_path, "w", encoding="utf-8") as f:
+                json.dump(preprocessor_config, f, indent=2)
+
+        if self._vibevoice_local_model_ready(target_dir):
+            _report("VibeVoice local model ready.")
+            return target_dir
+        return None
+
+    def _ensure_vibevoice_model_ready(self, status_callback=None):
+        model_path = self._get_vibevoice_model_path()
+        if os.path.isdir(model_path):
+            return model_path
+        try:
+            localized = self._localize_vibevoice_model(status_callback=status_callback)
+        except Exception as exc:
+            print(f"[VIBEVOICE] Model localization failed: {exc}")
+            localized = None
+        return localized or VIBEVOICE_MODEL_REPO_ID
+
+    def _get_vibevoice_env(self, python_exe, model_path=None):
+        env = self._get_clean_env(python_exe)
+        # Resolve the vibevoice package from the app's own VibeVoice tree so an
+        # editable install pointing at a dev checkout can never shadow it.
+        vibevoice_dir = self._get_vibevoice_dir()
+        if os.path.isdir(os.path.join(vibevoice_dir, "vibevoice")):
+            env["PYTHONPATH"] = vibevoice_dir
+        if model_path and os.path.isdir(model_path):
+            # Fully local model: forbid hub lookups so transient network or
+            # cache-drive failures cannot break synthesis mid-pipeline.
+            env["HF_HUB_OFFLINE"] = "1"
+        return env
+
+    def _run_vibevoice_inference(self, txt_path, output_dir, device, python_exe=None, retries=1, status_callback=None, low_priority=False):
+        python_exe = python_exe or self.vibevoice_python_var.get()
+        vibevoice_dir = self._get_vibevoice_dir()
+        model_path = self._ensure_vibevoice_model_ready(status_callback=status_callback)
+        cmd = [
+            python_exe,
+            os.path.join(vibevoice_dir, "demo", "inference_from_file.py"),
+            "--model_path", model_path,
+            "--txt_path", txt_path,
+            "--speaker_names", self.vibevoice_speaker_var.get(),
+            "--output_dir", output_dir,
+            "--device", device,
+        ]
+        env = self._get_vibevoice_env(python_exe, model_path)
+        creationflags = subprocess.CREATE_NO_WINDOW
+        if low_priority:
+            # Background CPU synthesis must not starve ComfyUI/Ollama of CPU
+            # while they render images concurrently.
+            creationflags |= subprocess.BELOW_NORMAL_PRIORITY_CLASS
+        result = None
+        for attempt in range(1, retries + 2):
+            print(f"[VIBEVOICE] Running cmd (attempt {attempt}): {' '.join(cmd)}")
+            result = subprocess.run(
+                cmd,
+                cwd=vibevoice_dir,
+                env=env,
+                creationflags=creationflags,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 0:
+                return result
+            print(
+                f"[VIBEVOICE] Attempt {attempt} failed (exit code {result.returncode}). "
+                f"Stderr tail:\n{(result.stderr or '')[-2000:]}"
+            )
+        return result
+
     def _is_vibevoice_cuda_available(self):
         python_exe = self.vibevoice_python_var.get()
         if not python_exe or not os.path.exists(python_exe):
@@ -4894,7 +6266,7 @@ class LTXQueueManager:
         try:
             import subprocess
             cmd = [python_exe, "-c", "import torch; print(torch.cuda.is_available())"]
-            res = subprocess.run(cmd, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=5)
+            res = subprocess.run(cmd, capture_output=True, text=True, env=self._get_clean_env(python_exe), creationflags=subprocess.CREATE_NO_WINDOW, timeout=5)
             if res.returncode == 0 and res.stdout.strip().lower() == "true":
                 return True
         except Exception:
@@ -4905,15 +6277,19 @@ class LTXQueueManager:
         vibevoice_dir = self._get_vibevoice_dir()
         voices_dir = os.path.join(vibevoice_dir, "demo", "voices")
         speakers = []
-        if os.path.exists(voices_dir):
-            try:
-                for f in os.listdir(voices_dir):
-                    if f.startswith("en-") and f.endswith("_voice.wav"):
-                        speaker = f[3:-10]
-                        if speaker not in speakers:
-                            speakers.append(speaker)
-            except Exception as e:
-                print(f"[DEBUG] Error listing voices directory: {e}")
+        
+        # Scan from both the packaged/installed read-only voices_dir and the user-writable voices_dir
+        for target_dir in [voices_dir, getattr(self, "user_voices_dir", None)]:
+            if target_dir and os.path.exists(target_dir):
+                try:
+                    for f in os.listdir(target_dir):
+                        if f.startswith("en-") and f.endswith("_voice.wav"):
+                            speaker = f[3:-10]
+                            if speaker not in speakers:
+                                speakers.append(speaker)
+                except Exception as e:
+                    print(f"[DEBUG] Error listing voices directory {target_dir}: {e}")
+                    
         if "user" not in speakers:
             speakers.append("user")
         return sorted(speakers)
@@ -4948,7 +6324,8 @@ class LTXQueueManager:
             vibevoice_dir=vibevoice_dir,
             python_exe=self.vibevoice_python_var.get(),
             active_speaker=self.vibevoice_speaker_var.get().strip() or "user",
-            on_success_callback=on_success
+            on_success_callback=on_success,
+            model_path=self._ensure_vibevoice_model_ready()
         )
 
     def _on_project_mode_changed_gui(self, _event=None):
@@ -5047,6 +6424,8 @@ class LTXQueueManager:
                 self.autonomous_youtube_section["container"].grid_forget()
                 self.autonomous_section["container"].grid(row=0, column=0, sticky="ew", pady=(0, 12))
 
+        self._refresh_script_tab_visibility()
+
     def _handle_scene_voiceover_edit(self, frame):
         vo_text = frame.voiceover_text.get("1.0", tk.END).strip()
         for sc in self.scene_timeline:
@@ -5071,6 +6450,10 @@ class LTXQueueManager:
         if not speaker:
             speaker = "user"
         voice_file = os.path.normpath(os.path.join(vibevoice_dir, "demo", "voices", f"en-{speaker}_voice.wav"))
+        user_voice_file = os.path.normpath(os.path.join(self.user_voices_dir, f"en-{speaker}_voice.wav")) if hasattr(self, "user_voices_dir") else ""
+        if not os.path.exists(voice_file) and user_voice_file and os.path.exists(user_voice_file):
+            voice_file = user_voice_file
+            
         if not os.path.exists(voice_file):
             ans = messagebox.askyesno(
                 "Voice Recording Required",
@@ -5096,6 +6479,15 @@ class LTXQueueManager:
                 temp_dir = os.path.join(vo_dir, "temp")
                 os.makedirs(temp_dir, exist_ok=True)
 
+                self.root.after(0, lambda: self.timeline_status_label.config(text="Freeing ComfyUI VRAM..."))
+                self._free_comfyui_vram()
+
+                self._ensure_vibevoice_model_ready(
+                    status_callback=lambda text: self.root.after(
+                        0, lambda t=text: self.timeline_status_label.config(text=t)
+                    )
+                )
+
                 for idx, sc in enumerate(self.scene_timeline, start=1):
                     vo_text = str(sc.get("voiceover", "")).strip()
                     if not vo_text:
@@ -5108,35 +6500,14 @@ class LTXQueueManager:
                     with open(temp_txt_path, "w", encoding="utf-8") as f:
                         f.write(f"Speaker 1: {vo_text}\n")
 
-                    python_exe = self.vibevoice_python_var.get()
-                    vibevoice_dir = self._get_vibevoice_dir()
-                    
                     device = "cuda" if self._is_vibevoice_cuda_available() else "cpu"
-                    
-                    cmd = [
-                        python_exe,
-                        os.path.join(vibevoice_dir, "demo", "inference_from_file.py"),
-                        "--model_path", "microsoft/VibeVoice-1.5b",
-                        "--txt_path", temp_txt_path,
-                        "--speaker_names", self.vibevoice_speaker_var.get(),
-                        "--output_dir", vo_dir,
-                        "--device", device
-                    ]
-                    
-                    print(f"[VIBEVOICE] Running cmd: {' '.join(cmd)}")
+
                     self.root.after(0, lambda i=idx: self.timeline_status_label.config(
                         text=f"VibeVoice: Synthesizing segment {i}/{len(self.scene_timeline)}..."
                     ))
 
-                    result = subprocess.run(
-                        cmd,
-                        cwd=vibevoice_dir,
-                        creationflags=subprocess.CREATE_NO_WINDOW,
-                        capture_output=True,
-                        text=True,
-                        check=False
-                    )
-                    
+                    result = self._run_vibevoice_inference(temp_txt_path, vo_dir, device)
+
                     if result.returncode != 0:
                         print(f"[VIBEVOICE] Error stdout:\n{result.stdout}\n[VIBEVOICE] Error stderr:\n{result.stderr}")
                         raise RuntimeError(f"VibeVoice synthesis failed for segment {idx}. Stderr:\n{result.stderr}")
@@ -7909,6 +9280,548 @@ class LTXQueueManager:
                 return value
         return None
 
+    def _detect_gpu_type(self):
+        gpu_names = []
+        # Try PowerShell Get-CimInstance
+        try:
+            cmd = ["powershell", "-NoProfile", "-Command", "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name"]
+            res = subprocess.run(cmd, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=8)
+            if res.returncode == 0:
+                gpu_names = [line.strip() for line in res.stdout.splitlines() if line.strip()]
+        except Exception:
+            pass
+
+        if not gpu_names:
+            # Try wmic as fallback
+            try:
+                cmd = ["wmic", "path", "win32_VideoController", "get", "Name"]
+                res = subprocess.run(cmd, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=8)
+                if res.returncode == 0:
+                    gpu_names = [line.strip() for line in res.stdout.splitlines()[1:] if line.strip()]
+            except Exception:
+                pass
+
+        # Classify
+        for name in gpu_names:
+            name_lower = name.lower()
+            if "rtx" in name_lower or "quadro rtx" in name_lower or "tesla" in name_lower or "a100" in name_lower or "h100" in name_lower or "b100" in name_lower or "b200" in name_lower:
+                return "nvidia_rtx", name
+            elif "gtx" in name_lower or "geforce" in name_lower or "nvidia" in name_lower:
+                return "nvidia_legacy", name
+            elif "amd" in name_lower or "radeon" in name_lower:
+                return "amd", name
+            elif "intel" in name_lower or "arc" in name_lower or "uhd" in name_lower or "iris" in name_lower:
+                return "intel", name
+
+        if gpu_names:
+            return "generic", gpu_names[0]
+        return "cpu", "CPU Only"
+
+    def _detect_gpu_vram_gb(self):
+        try:
+            # Try PowerShell CimInstance
+            ps_cmd = ["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_VideoController | Measure-Object -Property AdapterRAM -Maximum).Maximum"]
+            proc = subprocess.run(ps_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=5)
+            if proc.returncode == 0 and proc.stdout.strip():
+                ram_bytes = int(float(proc.stdout.strip()))
+                return ram_bytes / (1024 * 1024 * 1024)
+        except Exception:
+            pass
+
+        try:
+            # Try wmic fallback
+            proc = subprocess.run(["wmic", "path", "win32_VideoController", "get", "AdapterRAM"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=5)
+            if proc.returncode == 0:
+                vals = []
+                for line in proc.stdout.splitlines():
+                    line = line.strip()
+                    if line and line.isdigit():
+                        vals.append(int(line))
+                if vals:
+                    return max(vals) / (1024 * 1024 * 1024)
+        except Exception:
+            pass
+
+        return 8.0
+
+    def _ensure_7za_extractor(self, temp_dir):
+        # Check environment path
+        for path_dir in os.environ.get("PATH", "").split(os.pathsep):
+            for filename in ("7z.exe", "7za.exe"):
+                full_p = os.path.join(path_dir, filename)
+                if os.path.isfile(full_p):
+                    return full_p
+
+        # Check standard 7-Zip installation directories
+        for standard_p in (
+            r"C:\Program Files\7-Zip\7z.exe",
+            r"C:\Program Files (x86)\7-Zip\7z.exe"
+        ):
+            if os.path.isfile(standard_p):
+                return standard_p
+
+        # Check if already downloaded locally
+        local_7za = os.path.join(temp_dir, "7za.exe")
+        if os.path.isfile(local_7za):
+            return local_7za
+
+        print("[COMFYUI DOWNLOAD] 7za.exe not found on system. Fetching portable extractor from NuGet...")
+        zip_url = "https://www.nuget.org/api/v2/package/7-Zip.CommandLine/18.1.0"
+        zip_path = os.path.join(temp_dir, "7zip.zip")
+        
+        import urllib.request
+        import zipfile
+        try:
+            urllib.request.urlretrieve(zip_url, zip_path)
+            with zipfile.ZipFile(zip_path, "r") as z:
+                for info in z.infolist():
+                    if info.filename == "tools/7za.exe":
+                        with z.open(info) as src, open(local_7za, "wb") as dest:
+                            dest.write(src.read())
+                        break
+        finally:
+            if os.path.exists(zip_path):
+                try:
+                    os.remove(zip_path)
+                except OSError:
+                    pass
+        
+        if os.path.isfile(local_7za):
+            return local_7za
+        raise RuntimeError("Failed to resolve or download 7za.exe extractor.")
+
+    def _prompt_download_comfyui(self):
+        # 1. Detect GPU
+        gpu_key, gpu_name = self._detect_gpu_type()
+        
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Download & Install ComfyUI Portable")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.geometry("650x320")
+        dialog.minsize(600, 300)
+        self._style_panel(dialog, self.colors["bg"])
+
+        shell = tk.Frame(dialog, padx=20, pady=18)
+        shell.pack(fill=tk.BOTH, expand=True)
+        self._style_panel(shell, self.colors["bg"])
+
+        title_label = tk.Label(shell, text="Download & Install ComfyUI Portable")
+        title_label.pack(anchor="w")
+        self._style_label(title_label, "title", self.colors["bg"])
+
+        desc_text = (
+            "Prompt2MTV requires ComfyUI to generate videos. We can automatically download "
+            "and configure the official ComfyUI Windows Portable package for you."
+        )
+        desc_label = tk.Label(shell, text=desc_text, justify=tk.LEFT, anchor="w", wraplength=600)
+        desc_label.pack(fill=tk.X, pady=(8, 12))
+        self._style_label(desc_label, "body", self.colors["bg"])
+
+        # Detected GPU label
+        gpu_text = f"Detected GPU: {gpu_name}"
+        gpu_label = tk.Label(shell, text=gpu_text, anchor="w")
+        gpu_label.pack(fill=tk.X, pady=(0, 10))
+        self._style_label(gpu_label, "body", self.colors["bg"])
+
+        # GPU version selection frame
+        select_frame = tk.Frame(shell)
+        select_frame.pack(fill=tk.X, pady=(0, 10))
+        self._style_panel(select_frame, self.colors["bg"])
+
+        ver_lbl = tk.Label(select_frame, text="ComfyUI Version:", width=18, anchor="w")
+        ver_lbl.pack(side=tk.LEFT)
+        self._style_label(ver_lbl, "body", self.colors["bg"])
+
+        options_map = {
+            "NVIDIA RTX Series (Recommended for RTX 20/30/40/50+)": "nvidia_rtx",
+            "NVIDIA GTX Series 10 & Older (GTX 1080, 1060, 970, etc.)": "nvidia_legacy",
+            "AMD Radeon Series": "amd",
+            "Intel Arc / Integrated Graphics": "intel",
+            "CPU Only / Fallback": "cpu"
+        }
+        options_list = list(options_map.keys())
+        
+        # Determine recommended option based on detection
+        recommended_option = options_list[4] # default cpu
+        if gpu_key == "nvidia_rtx":
+            recommended_option = options_list[0]
+        elif gpu_key == "nvidia_legacy":
+            recommended_option = options_list[1]
+        elif gpu_key == "amd":
+            recommended_option = options_list[2]
+        elif gpu_key == "intel":
+            recommended_option = options_list[3]
+
+        ver_combo = ttk.Combobox(select_frame, values=options_list, state="readonly", width=50)
+        ver_combo.set(recommended_option)
+        ver_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # Dest folder frame
+        dest_frame = tk.Frame(shell)
+        dest_frame.pack(fill=tk.X, pady=(0, 20))
+        self._style_panel(dest_frame, self.colors["bg"])
+
+        dest_lbl = tk.Label(dest_frame, text="Install Directory:", width=18, anchor="w")
+        dest_lbl.pack(side=tk.LEFT)
+        self._style_label(dest_lbl, "body", self.colors["bg"])
+
+        default_root = "D:\\" if os.path.exists("D:\\") else "C:\\"
+        default_dest = os.path.join(default_root, "ComfyUI_Portable")
+        
+        dest_var = tk.StringVar(value=default_dest)
+        dest_entry = tk.Entry(dest_frame, textvariable=dest_var)
+        dest_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        self._style_entry(dest_entry)
+
+        def browse_dest():
+            selected = filedialog.askdirectory(title="Select Install Directory", initialdir=default_root)
+            if selected:
+                # Append ComfyUI_Portable subfolder name to select path for better layout
+                selected_norm = os.path.normpath(selected)
+                if not selected_norm.endswith("ComfyUI_Portable"):
+                    selected_norm = os.path.join(selected_norm, "ComfyUI_Portable")
+                dest_var.set(selected_norm)
+
+        browse_btn = tk.Button(dest_frame, text="Browse...", command=browse_dest)
+        browse_btn.pack(side=tk.LEFT)
+        self._style_button(browse_btn, "secondary", compact=True)
+
+        # Buttons frame
+        footer = tk.Frame(shell)
+        footer.pack(fill=tk.X, side=tk.BOTTOM)
+        self._style_panel(footer, self.colors["bg"])
+
+        install_success = [False]
+
+        def on_install():
+            selected_key = options_map[ver_combo.get()]
+            target_dir = os.path.normpath(dest_var.get())
+            dialog.destroy()
+            
+            # Start download & extraction runner
+            if self._download_and_extract_comfyui_run(selected_key, target_dir):
+                install_success[0] = True
+
+        cancel_btn = tk.Button(footer, text="Cancel", command=dialog.destroy)
+        cancel_btn.pack(side=tk.RIGHT)
+        self._style_button(cancel_btn, "secondary", compact=True)
+
+        install_btn = tk.Button(footer, text="Download & Install", command=on_install)
+        install_btn.pack(side=tk.RIGHT, padx=(0, 10))
+        self._style_button(install_btn, "primary", compact=True)
+
+        dialog.wait_window()
+        return install_success[0]
+
+    def _download_and_extract_comfyui_run(self, gpu_key, target_dir):
+        import shutil
+        import time
+        # 1. Resolve URL
+        url = COMFYUI_URLS.get(gpu_key, COMFYUI_URLS["cpu"])
+        filename = url.split("/")[-1]
+        
+        # 2. Check disk space (require 10 GB free space)
+        parent_dir = os.path.dirname(target_dir)
+        os.makedirs(parent_dir, exist_ok=True)
+        try:
+            free_bytes = shutil.disk_usage(parent_dir).free
+            required_bytes = 10 * 1024 * 1024 * 1024 # 10 GB
+            if free_bytes < required_bytes:
+                message = (
+                    "Prompt2MTV does not have enough free disk space on target drive to install ComfyUI.\n\n"
+                    f"Required: {self._format_byte_count(required_bytes)}\n"
+                    f"Available: {self._format_byte_count(free_bytes)}"
+                )
+                messagebox.showerror("Disk Space Error", message)
+                return False
+        except Exception:
+            pass
+
+        # 3. Create temp directory for downloading
+        temp_dir = os.path.join(parent_dir, "comfyui_download_temp")
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        archive_path = os.path.join(temp_dir, filename)
+
+        # 4. Resolve 7za extractor
+        try:
+            extractor_path = self._ensure_7za_extractor(temp_dir)
+        except Exception as exc:
+            messagebox.showerror("Extractor Error", f"Failed to download portable 7za.exe extractor:\n{exc}")
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return False
+
+        # 5. Download ComfyUI Portable 7z archive
+        self.comfyui_download_cancel_requested = False
+        dialog_state = self._create_comfyui_download_dialog(filename)
+        
+        try:
+            download_file(
+                url,
+                archive_path,
+                progress_callback=lambda downloaded, total, resumed: self._update_comfyui_download_dialog(
+                    dialog_state, filename, downloaded, total, resumed
+                ),
+                cancel_check=lambda: getattr(self, "comfyui_download_cancel_requested", False),
+            )
+        except DownloadCancelledError:
+            self._close_comfyui_download_dialog(dialog_state)
+            self.update_status("ComfyUI download cancelled.", "orange")
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return False
+        except Exception as exc:
+            self._close_comfyui_download_dialog(dialog_state)
+            messagebox.showerror("Download Error", f"Failed to download ComfyUI archive:\n{exc}")
+            self.update_status("Failed to download ComfyUI.", "red")
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return False
+
+        # Close download progress
+        self._close_comfyui_download_dialog(dialog_state)
+
+        # 6. Extract Archive using 7za.exe
+        extract_dialog = self._create_comfyui_extract_dialog(filename, target_dir)
+        
+        cmd = [
+            extractor_path,
+            "x",
+            archive_path,
+            f"-o{parent_dir}", 
+            "-y"
+        ]
+        
+        print(f"[COMFYUI DOWNLOAD] Extracting command: {' '.join(cmd)}")
+        
+        success = False
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            
+            while process.poll() is None:
+                extract_dialog["dialog"].update()
+                time.sleep(0.1)
+                
+            stdout, stderr = process.communicate()
+            if process.returncode == 0:
+                success = True
+            else:
+                print(f"[COMFYUI DOWNLOAD] Extraction failed with code {process.returncode}:\n{stderr.decode('utf-8', errors='ignore')}")
+        except Exception as exc:
+            print(f"[COMFYUI DOWNLOAD] Extraction exception: {exc}")
+        finally:
+            self._close_comfyui_extract_dialog(extract_dialog)
+
+        # Cleanup temp directory
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+        if not success:
+            messagebox.showerror("Installation Error", "Failed to extract ComfyUI archive. The download might be corrupted.")
+            return False
+
+        # 7. Configure app paths automatically
+        extracted_folder = None
+        for name in os.listdir(parent_dir):
+            full_p = os.path.join(parent_dir, name)
+            if os.path.isdir(full_p) and name.lower().startswith("comfyui_windows_portable"):
+                extracted_folder = full_p
+                break
+                
+        if not extracted_folder:
+            extracted_folder = target_dir
+
+        if os.path.exists(extracted_folder):
+            # Locate launcher script
+            launcher_filename = "run_nvidia_gpu.bat"
+            if gpu_key == "amd":
+                launcher_filename = "run_amd.bat"
+            elif gpu_key == "cpu":
+                launcher_filename = "run_cpu.bat"
+                
+            launcher_path = os.path.join(extracted_folder, launcher_filename)
+            if not os.path.isfile(launcher_path):
+                found_bats = [f for f in os.listdir(extracted_folder) if f.endswith(".bat")]
+                if found_bats:
+                    launcher_path = os.path.join(extracted_folder, found_bats[0])
+                else:
+                    launcher_path = os.path.join(extracted_folder, "run_cpu.bat")
+
+            # Update settings
+            self.comfyui_root = self._normalize_path(extracted_folder)
+            self.comfyui_launcher_path = self._normalize_path(launcher_path)
+            self.model_search_roots = self._resolve_model_search_roots(self.model_search_roots, self.comfyui_root)
+            self.save_global_settings()
+            
+            # Refresh GUI inputs if Settings Window is open
+            if hasattr(self, "comfyui_root_var"):
+                self.comfyui_root_var.set(self.comfyui_root)
+            if hasattr(self, "comfyui_launcher_var"):
+                self.comfyui_launcher_var.set(self.comfyui_launcher_path)
+                
+            messagebox.showinfo(
+                "Installation Complete",
+                "ComfyUI Portable has been successfully downloaded, extracted, and configured!\n\n"
+                f"Root: {self.comfyui_root}\n"
+                f"Launcher: {self.comfyui_launcher_path}"
+            )
+            self.update_status("ComfyUI configured successfully.", "green")
+            self._update_comfyui_banner("ready")
+            return True
+            
+        messagebox.showerror("Installation Error", "Could not locate extracted ComfyUI folder.")
+        return False
+
+    def _create_comfyui_download_dialog(self, filename):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Downloading ComfyUI Portable")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.geometry("620x240")
+        dialog.minsize(560, 220)
+        self._style_panel(dialog, self.colors["bg"])
+
+        shell = tk.Frame(dialog, padx=20, pady=18)
+        shell.pack(fill=tk.BOTH, expand=True)
+        self._style_panel(shell, self.colors["bg"])
+
+        title_label = tk.Label(shell, text="Downloading ComfyUI Portable")
+        title_label.pack(anchor="w")
+        self._style_label(title_label, "title", self.colors["bg"])
+
+        summary_var = tk.StringVar(value=f"Preparing to download {filename}...")
+        summary_label = tk.Label(shell, textvariable=summary_var, justify=tk.LEFT, anchor="w", wraplength=560)
+        summary_label.pack(fill=tk.X, pady=(8, 6))
+        self._style_label(summary_label, "body", self.colors["bg"])
+
+        detail_var = tk.StringVar(value="Waiting for download to start...")
+        detail_label = tk.Label(shell, textvariable=detail_var, justify=tk.LEFT, anchor="w", wraplength=560)
+        detail_label.pack(fill=tk.X, pady=(0, 10))
+        self._style_label(detail_label, "muted", self.colors["bg"])
+
+        progress_bar = ttk.Progressbar(shell, mode="determinate", maximum=100)
+        progress_bar.pack(fill=tk.X)
+
+        progress_var = tk.StringVar(value="0%")
+        progress_label = tk.Label(shell, textvariable=progress_var, anchor="e")
+        progress_label.pack(fill=tk.X, pady=(6, 10))
+        self._style_label(progress_label, "small", self.colors["bg"])
+
+        footer = tk.Frame(shell)
+        footer.pack(fill=tk.X, pady=(8, 0))
+        self._style_panel(footer, self.colors["bg"])
+
+        cancel_button = tk.Button(footer, text="Cancel", command=lambda: setattr(self, "comfyui_download_cancel_requested", True))
+        cancel_button.pack(side=tk.RIGHT)
+        self._style_button(cancel_button, "secondary", compact=True)
+
+        dialog.protocol("WM_DELETE_WINDOW", lambda: setattr(self, "comfyui_download_cancel_requested", True))
+        return {
+            "dialog": dialog,
+            "summary_var": summary_var,
+            "detail_var": detail_var,
+            "progress_var": progress_var,
+            "progress_bar": progress_bar,
+            "indeterminate": False,
+        }
+
+    def _update_comfyui_download_dialog(self, dialog_state, filename, downloaded_bytes=None, total_bytes=None, resumed=False):
+        if not dialog_state:
+            return
+
+        dialog = dialog_state.get("dialog")
+        if not dialog or not dialog.winfo_exists():
+            return
+
+        dialog_state["summary_var"].set(f"Downloading {filename}")
+        if total_bytes is None:
+            detail_text = f"{self._format_byte_count(downloaded_bytes)} downloaded from GitHub"
+            if not dialog_state["indeterminate"]:
+                dialog_state["progress_bar"].configure(mode="indeterminate")
+                dialog_state["progress_bar"].start(12)
+                dialog_state["indeterminate"] = True
+            dialog_state["progress_var"].set("Downloading...")
+        else:
+            if dialog_state["indeterminate"]:
+                dialog_state["progress_bar"].stop()
+                dialog_state["progress_bar"].configure(mode="determinate")
+                dialog_state["indeterminate"] = False
+
+            completion_ratio = 0 if total_bytes <= 0 else min(1.0, downloaded_bytes / total_bytes)
+            dialog_state["progress_bar"]["value"] = completion_ratio * 100
+            dialog_state["progress_var"].set(f"{completion_ratio * 100:.1f}%")
+            detail_text = f"{self._format_byte_count(downloaded_bytes)} of {self._format_byte_count(total_bytes)} downloaded"
+
+        if resumed:
+            detail_text = f"{detail_text} | resuming partial download"
+
+        dialog_state["detail_var"].set(detail_text)
+        try:
+            dialog.update()
+        except tk.TclError:
+            pass
+
+    def _close_comfyui_download_dialog(self, dialog_state):
+        if not dialog_state:
+            return
+        dialog = dialog_state.get("dialog")
+        try:
+            if dialog_state.get("indeterminate"):
+                dialog_state["progress_bar"].stop()
+            if dialog and dialog.winfo_exists():
+                dialog.destroy()
+        except tk.TclError:
+            pass
+
+    def _create_comfyui_extract_dialog(self, filename, target_dir):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Extracting ComfyUI Portable")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.geometry("560x180")
+        dialog.resizable(False, False)
+        self._style_panel(dialog, self.colors["bg"])
+
+        shell = tk.Frame(dialog, padx=20, pady=18)
+        shell.pack(fill=tk.BOTH, expand=True)
+        self._style_panel(shell, self.colors["bg"])
+
+        title_label = tk.Label(shell, text="Extracting ComfyUI Portable")
+        title_label.pack(anchor="w")
+        self._style_label(title_label, "title", self.colors["bg"])
+
+        summary_label = tk.Label(shell, text=f"Decompressing archive:\n{filename}", justify=tk.LEFT, anchor="w", wraplength=520)
+        summary_label.pack(fill=tk.X, pady=(8, 6))
+        self._style_label(summary_label, "body", self.colors["bg"])
+
+        progress_bar = ttk.Progressbar(shell, mode="indeterminate")
+        progress_bar.pack(fill=tk.X, pady=(10, 10))
+        progress_bar.start(12)
+
+        try:
+            dialog.update()
+        except tk.TclError:
+            pass
+
+        return {
+            "dialog": dialog,
+            "progress_bar": progress_bar
+        }
+
+    def _close_comfyui_extract_dialog(self, dialog_state):
+        if not dialog_state:
+            return
+        dialog = dialog_state.get("dialog")
+        try:
+            dialog_state["progress_bar"].stop()
+            if dialog and dialog.winfo_exists():
+                dialog.destroy()
+        except tk.TclError:
+            pass
+
     def _get_candidate_comfyui_roots(self, preferred_root=None):
         candidates = []
         self._append_unique_path(candidates, preferred_root)
@@ -8029,6 +9942,37 @@ class LTXQueueManager:
         )
         return hwnd
 
+    def _adopt_running_comfyui_console(self):
+        """Bind to a ComfyUI instance this app object did not launch (left over
+        from a previous session or started externally): recover its console
+        window and owning PID so the terminal toggle and the stale-instance
+        kill in _stop_comfyui_process keep working after HTTP stops answering."""
+        self.comfyui_console_hwnd = None
+        self.comfyui_console_visible = False
+        self.comfyui_console_title = None
+        self.comfyui_console_pending_visibility = None
+        self.comfyui_adopted_pid = None
+        if sys.platform != "win32":
+            return
+        hwnd = self._recover_app_owned_comfyui_console()
+        if not hwnd:
+            return
+        console_pid = ctypes.c_ulong()
+        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(console_pid))
+        if console_pid.value and console_pid.value != os.getpid():
+            self.comfyui_adopted_pid = int(console_pid.value)
+        try:
+            user32 = ctypes.windll.user32
+            self.comfyui_console_visible = bool(user32.IsWindowVisible(hwnd) and not user32.IsIconic(hwnd))
+        except Exception:
+            pass
+        self.log_debug(
+            "COMFYUI_CONSOLE_ADOPTED",
+            hwnd=hwnd,
+            pid=self.comfyui_adopted_pid,
+            console_title=self.comfyui_console_title
+        )
+
     def _cancel_comfyui_console_poll(self):
         if not self.comfyui_console_poll_after_id:
             return
@@ -8133,12 +10077,15 @@ class LTXQueueManager:
                     pid=self.comfyui_process.pid,
                     console_title=self.comfyui_console_title
                 )
-        elif self._is_comfyui_running():
-            self.comfyui_console_hwnd = self._recover_app_owned_comfyui_console()
         else:
-            self.comfyui_console_hwnd = None
-            self.comfyui_console_title = None
-            self.comfyui_console_pending_visibility = None
+            # Attempt recovery even when the HTTP probe would fail: a wedged
+            # ComfyUI stops answering /system_stats but its console window
+            # (carrying our title prefix) survives — and that window is exactly
+            # what the Help-menu toggle needs to reach in that state.
+            self.comfyui_console_hwnd = self._recover_app_owned_comfyui_console()
+            if not self.comfyui_console_hwnd:
+                self.comfyui_console_title = None
+                self.comfyui_console_pending_visibility = None
         return self.comfyui_console_hwnd
 
     def _set_comfyui_terminal_visibility(self, visible, retry_on_missing=True):
@@ -8178,7 +10125,7 @@ class LTXQueueManager:
     def _refresh_comfyui_terminal_button(self):
         process_running = bool(self.comfyui_process and self.comfyui_process.poll() is None)
         console_available = bool(process_running)
-        if sys.platform == "win32" and not console_available and self._is_comfyui_running():
+        if sys.platform == "win32" and not console_available:
             console_available = bool(self._resolve_comfyui_console_window())
 
         if not console_available:
@@ -8390,6 +10337,8 @@ class LTXQueueManager:
 
     def _resolve_model_search_roots(self, saved_roots=None, comfyui_root=None):
         configured_roots = []
+        if getattr(self, "comfyui_models_root", None):
+            self._append_unique_path(configured_roots, self.comfyui_models_root)
         if isinstance(saved_roots, list):
             for saved_root in saved_roots:
                 self._append_unique_path(configured_roots, saved_root)
@@ -8587,6 +10536,8 @@ class LTXQueueManager:
 
     def _get_preferred_model_root(self, create_if_missing=False):
         candidate_roots = []
+        if getattr(self, "comfyui_models_root", None):
+            self._append_unique_path(candidate_roots, self.comfyui_models_root)
         normalized_comfyui_root = self._normalize_path(self.comfyui_root)
 
         if normalized_comfyui_root:
@@ -8981,18 +10932,180 @@ class LTXQueueManager:
         dialog.wait_window()
         return result["ids"]
 
-    def install_missing_models(self, interactive=True, model_audit=None):
-        include_variant_ids = None
-        if interactive and model_audit is None:
-            include_variant_ids = self._ask_music_variant_choice()
-            if include_variant_ids is not None and not include_variant_ids:
-                self.update_status("Model installation cancelled.", "orange")
-                return False
+    def audit_all_manifest_models(self):
+        self._load_model_manifest()
+        reports = []
+        manifest_notes = []
+        for entry in self.model_manifest.get("models", []):
+            entry_id = str(entry.get("id", "")).strip() or "unknown_model"
+            workflow_key = str(entry.get("workflow", "")).strip().lower()
+            label = str(entry.get("label", entry_id)).strip() or entry_id
+            dest_subdir = str(entry.get("dest_subdir", "")).strip().replace("/", os.sep).replace("\\", os.sep)
+            filename, entry_notes = self._resolve_manifest_entry_filename(entry)
+            manifest_notes.extend(entry_notes)
+            
+            if not workflow_key or not filename or not dest_subdir:
+                continue
+                
+            resolved_path = self._find_model_file(filename)
+            local_source_path = None
+            download_url = None
+            install_method = None
+            if not resolved_path:
+                local_source_path = self._resolve_manifest_local_source(entry, filename)
+                download_url = self._resolve_manifest_download_url(entry)
+                if local_source_path:
+                    install_method = "copy"
+                elif download_url:
+                    install_method = "download"
+                    
+            destination_root = self._get_preferred_model_root(create_if_missing=False)
+            destination_path = os.path.join(destination_root, dest_subdir, filename) if destination_root else None
+            
+            reports.append({
+                "id": entry_id,
+                "workflow": workflow_key,
+                "workflow_label": self._get_workflow_label_for_models(workflow_key),
+                "label": label,
+                "filename": filename,
+                "dest_subdir": dest_subdir,
+                "resolved_path": resolved_path,
+                "destination_path": destination_path,
+                "source_path": local_source_path,
+                "source_name": self._get_manifest_source_name(entry),
+                "source_page_url": self._get_manifest_source_page_url(entry),
+                "size_bytes": self._get_manifest_size_bytes(entry),
+                "sha256": self._get_manifest_sha256(entry),
+                "download_url": download_url,
+                "install_method": install_method,
+                "variant_group": entry.get("variant_group"),
+                "preset": entry.get("preset"),
+            })
+        return reports
 
-        audit = model_audit or self.audit_required_models(include_variant_ids=include_variant_ids)
-        missing_reports = audit.get("missing", [])
-        installable_reports = audit.get("installable_missing", [])
-        known_total_bytes, unknown_size_count = self._estimate_download_sizes(installable_reports)
+    def _get_model_vram_recommendation(self, model_id, vram_gb):
+        if model_id == "video_checkpoint":
+            if vram_gb >= 20.0:
+                return {"badge": "Recommended (High Quality)", "color": "#2e7d32", "pre_select": True}
+            else:
+                return {"badge": "Heavy (Requires >=20GB VRAM)", "color": "#d84315", "pre_select": False}
+        elif model_id == "video_gguf_unet_q4":
+            if 16.0 <= vram_gb < 20.0:
+                return {"badge": "Recommended (Balanced Dev)", "color": "#2e7d32", "pre_select": True}
+            else:
+                return {"badge": "Dev Tier (Requires 16-24GB VRAM)", "color": "#555555", "pre_select": False}
+        elif model_id == "video_gguf_unet_q3":
+            if 12.0 <= vram_gb < 16.0:
+                return {"badge": "Recommended (Fast Dev)", "color": "#2e7d32", "pre_select": True}
+            else:
+                return {"badge": "Dev Tier (Requires 12-16GB VRAM)", "color": "#555555", "pre_select": False}
+        elif model_id == "video_gguf_distilled_unet_q4":
+            if 12.0 <= vram_gb < 16.0:
+                return {"badge": "Recommended (Balanced Distilled)", "color": "#2e7d32", "pre_select": True}
+            else:
+                return {"badge": "Distilled Tier (Requires 12-20GB VRAM)", "color": "#555555", "pre_select": False}
+        elif model_id == "video_gguf_distilled_unet_q3":
+            if 10.0 <= vram_gb < 12.0:
+                return {"badge": "Recommended (Fast Distilled)", "color": "#2e7d32", "pre_select": True}
+            else:
+                return {"badge": "Distilled Tier (Requires 10-16GB VRAM)", "color": "#555555", "pre_select": False}
+        elif model_id == "video_gguf_distilled_unet_q2":
+            if vram_gb < 10.0:
+                return {"badge": "Recommended (Fastest Distilled)", "color": "#2e7d32", "pre_select": True}
+            else:
+                return {"badge": "Distilled Tier (Requires 8-12GB VRAM)", "color": "#555555", "pre_select": False}
+        elif model_id in ("music_unet_xl_turbo", "music_unet_xl_sft"):
+            if vram_gb >= 12.0:
+                is_sft = model_id == "music_unet_xl_sft"
+                return {"badge": "XL Quality", "color": "#0288d1" if is_sft else "#2e7d32", "pre_select": not is_sft}
+            else:
+                return {"badge": "XL (Requires >=12GB VRAM)", "color": "#d84315", "pre_select": False}
+        elif model_id == "music_unet_turbo":
+            if vram_gb < 12.0:
+                return {"badge": "Recommended (Standard)", "color": "#2e7d32", "pre_select": True}
+            else:
+                return {"badge": "Standard Quality", "color": "#555555", "pre_select": False}
+        elif model_id == "chatbot_qwen3_14b":
+            if vram_gb >= 12.0:
+                return {"badge": "Recommended (Standard)", "color": "#2e7d32", "pre_select": True}
+            else:
+                return {"badge": "14B (Requires >=12GB VRAM)", "color": "#d84315", "pre_select": False}
+        elif model_id == "chatbot_qwen3_7b":
+            if vram_gb < 12.0:
+                return {"badge": "Recommended (Low VRAM)", "color": "#2e7d32", "pre_select": True}
+            else:
+                return {"badge": "7B (For Low VRAM)", "color": "#555555", "pre_select": False}
+                
+        is_helper = model_id in (
+            "video_text_encoder", "video_upscaler", "video_gguf_vae", "video_gguf_connectors_dev", "video_gguf_audio_vae_dev",
+            "video_gguf_connectors_distilled", "video_gguf_audio_vae_distilled", "video_gguf_vae_distilled",
+            "music_clip_primary", "music_clip_secondary", "music_vae", "vibevoice_tts_model",
+            "image_text_encoder", "image_unet_turbo", "image_vae"
+        )
+        if is_helper:
+            if vram_gb < 12.0:
+                is_distilled_helper = model_id in (
+                    "video_gguf_vae_distilled", "video_gguf_connectors_distilled", "video_gguf_audio_vae_distilled", "video_text_encoder", "video_upscaler"
+                )
+                is_music_helper = model_id in ("music_clip_primary", "music_vae")
+                is_voice_image_helper = model_id in ("vibevoice_tts_model", "image_text_encoder", "image_unet_turbo", "image_vae")
+                if is_distilled_helper or is_music_helper or is_voice_image_helper:
+                    return {"badge": "Required Helper", "color": "#0288d1", "pre_select": True}
+            else:
+                is_dev_helper = model_id in (
+                    "video_gguf_vae", "video_gguf_connectors_dev", "video_gguf_audio_vae_dev", "video_text_encoder", "video_upscaler"
+                )
+                is_music_helper = model_id in ("music_clip_primary", "music_clip_secondary", "music_vae")
+                is_voice_image_helper = model_id in ("vibevoice_tts_model", "image_text_encoder", "image_unet_turbo", "image_vae")
+                if is_dev_helper or is_music_helper or is_voice_image_helper:
+                    return {"badge": "Required Helper", "color": "#0288d1", "pre_select": True}
+                    
+        return {"badge": "Optional", "color": "#777777", "pre_select": False}
+
+    def show_model_downloader_wizard(self):
+        ModelDownloaderWizard(self.root, self)
+
+    def install_missing_models(self, interactive=True, model_audit=None, selected_manifest_ids=None):
+        if selected_manifest_ids is not None:
+            all_reports = self.audit_all_manifest_models()
+            chatbot_entries = [
+                {
+                    "id": "chatbot_qwen3_7b",
+                    "workflow": "chatbot",
+                    "workflow_label": "Chatbot LLM",
+                    "label": "Qwen3 7B Chatbot (Low VRAM)",
+                    "filename": "Qwen_Qwen3-7B-Q4_K_M.gguf",
+                    "dest_subdir": "LLM_Models",
+                    "download_url": "https://huggingface.co/bartowski/Qwen_Qwen3-7B-GGUF/resolve/main/Qwen_Qwen3-7B-Q4_K_M.gguf?download=true",
+                    "size_bytes": 4800000000,
+                    "install_method": "download",
+                },
+                {
+                    "id": "chatbot_qwen3_14b",
+                    "workflow": "chatbot",
+                    "workflow_label": "Chatbot LLM",
+                    "label": "Qwen3 14B Chatbot (Standard / High VRAM)",
+                    "filename": "Qwen_Qwen3-14B-Q4_K_M.gguf",
+                    "dest_subdir": "LLM_Models",
+                    "download_url": "https://huggingface.co/bartowski/Qwen_Qwen3-14B-GGUF/resolve/main/Qwen_Qwen3-14B-Q4_K_M.gguf?download=true",
+                    "size_bytes": 10200000000,
+                    "install_method": "download",
+                }
+            ]
+            all_audits = all_reports + chatbot_entries
+            installable_reports = [r for r in all_audits if r["id"] in selected_manifest_ids and r["install_method"]]
+            missing_reports = installable_reports
+            known_total_bytes, unknown_size_count = self._estimate_download_sizes(installable_reports)
+        else:
+            include_variant_ids = None
+            if interactive and model_audit is None:
+                self.show_model_downloader_wizard()
+                return True
+
+            audit = model_audit or self.audit_required_models(include_variant_ids=include_variant_ids)
+            missing_reports = audit.get("missing", [])
+            installable_reports = audit.get("installable_missing", [])
+            known_total_bytes, unknown_size_count = self._estimate_download_sizes(installable_reports)
 
         if not missing_reports:
             self._update_model_install_controls(audit)
@@ -9067,11 +11180,15 @@ class LTXQueueManager:
             dialog_state = self._create_model_download_dialog(len(installable_reports))
 
         for index, report in enumerate(installable_reports, start=1):
-            dest_dir = os.path.normpath(os.path.join(destination_root, report["dest_subdir"]))
-            if not dest_dir.startswith(os.path.normpath(destination_root)):
-                failed_reports.append((report, "dest_subdir escapes the model root directory"))
-                continue
-            dest_path = os.path.join(dest_dir, report["filename"])
+            if report["workflow"] == "chatbot":
+                dest_dir = self.chatbot_model_root or os.path.normpath(os.path.join(self.app_root_dir, "LLM_Models"))
+                dest_path = os.path.join(dest_dir, report["filename"])
+            else:
+                dest_dir = os.path.normpath(os.path.join(destination_root, report["dest_subdir"]))
+                if not dest_dir.startswith(os.path.normpath(destination_root)):
+                    failed_reports.append((report, "dest_subdir escapes the model root directory"))
+                    continue
+                dest_path = os.path.join(dest_dir, report["filename"])
             self.update_status(
                 f"Installing model {index}/{len(installable_reports)}: {report['filename']}",
                 "blue"
@@ -9110,6 +11227,18 @@ class LTXQueueManager:
                         )
 
                 installed_reports.append(report)
+                
+                # Chatbot configuration updater
+                if report["id"] == "chatbot_qwen3_7b":
+                    self.chatbot_model_filename = "Qwen_Qwen3-7B-Q4_K_M.gguf"
+                    self.chatbot_model_url = "https://huggingface.co/bartowski/Qwen_Qwen3-7B-GGUF/resolve/main/Qwen_Qwen3-7B-Q4_K_M.gguf?download=true"
+                    self.chatbot_model_path = dest_path
+                    self.save_global_settings()
+                elif report["id"] == "chatbot_qwen3_14b":
+                    self.chatbot_model_filename = "Qwen_Qwen3-14B-Q4_K_M.gguf"
+                    self.chatbot_model_url = "https://huggingface.co/bartowski/Qwen_Qwen3-14B-GGUF/resolve/main/Qwen_Qwen3-14B-Q4_K_M.gguf?download=true"
+                    self.chatbot_model_path = dest_path
+                    self.save_global_settings()
             except DownloadCancelledError:
                 cancelled_install = True
                 break
@@ -9177,13 +11306,153 @@ class LTXQueueManager:
             return os.path.exists(FFMPEG_PATH)
         return shutil.which(FFMPEG_PATH) is not None
 
-    def _is_comfyui_running(self):
+    def _is_comfyui_running(self, timeout=0.3, retries=0):
+        """Probe ComfyUI's HTTP API.
+
+        Pass a longer timeout (and retries) when the answer decides whether to
+        relaunch: a busy or swapping server can miss the default 0.3 s window
+        while still being alive."""
+        for attempt in range(retries + 1):
+            try:
+                req = urllib.request.Request("http://127.0.0.1:8188/system_stats")
+                urllib.request.urlopen(req, timeout=timeout)
+                return True
+            except Exception:
+                if attempt < retries:
+                    time.sleep(1.0)
+        return False
+
+    def _is_port_8188_bound(self, timeout=1.0):
+        """True if something is accepting TCP connections on 127.0.0.1:8188."""
         try:
-            req = urllib.request.Request("http://127.0.0.1:8188/system_stats")
-            urllib.request.urlopen(req, timeout=0.3)
-            return True
-        except Exception:
+            with socket.create_connection(("127.0.0.1", 8188), timeout=timeout):
+                return True
+        except OSError:
             return False
+
+    def _find_pids_listening_on_8188_native(self):
+        """Read the OS TCP table in-process via iphlpapi.GetExtendedTcpTable.
+
+        Spawns no subprocess, so it cannot stall on a thrashing machine
+        (netstat has been observed to exceed 15 s under memory pressure).
+        Returns None when the API is unavailable so callers can fall back."""
+        if sys.platform != "win32":
+            return None
+
+        class MIB_TCPROW_OWNER_PID(ctypes.Structure):
+            _fields_ = [
+                ("dwState", ctypes.c_ulong),
+                ("dwLocalAddr", ctypes.c_ulong),
+                ("dwLocalPort", ctypes.c_ulong),
+                ("dwRemoteAddr", ctypes.c_ulong),
+                ("dwRemotePort", ctypes.c_ulong),
+                ("dwOwningPid", ctypes.c_ulong),
+            ]
+
+        AF_INET = 2
+        TCP_TABLE_OWNER_PID_LISTENER = 3
+        try:
+            iphlpapi = ctypes.windll.iphlpapi
+            size = ctypes.c_ulong(0)
+            iphlpapi.GetExtendedTcpTable(None, ctypes.byref(size), False, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0)
+            table_buffer = ctypes.create_string_buffer(size.value)
+            if iphlpapi.GetExtendedTcpTable(table_buffer, ctypes.byref(size), False, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0) != 0:
+                return None
+            num_entries = ctypes.cast(table_buffer, ctypes.POINTER(ctypes.c_ulong)).contents.value
+            rows = ctypes.cast(
+                ctypes.byref(table_buffer, ctypes.sizeof(ctypes.c_ulong)),
+                ctypes.POINTER(MIB_TCPROW_OWNER_PID * num_entries),
+            ).contents
+            pids = set()
+            for row in rows:
+                if socket.ntohs(row.dwLocalPort & 0xFFFF) != 8188:
+                    continue
+                pid = int(row.dwOwningPid)
+                if pid > 0 and pid != os.getpid():
+                    pids.add(pid)
+            return pids
+        except Exception as exc:
+            self.log_debug("COMFYUI_PORT_SCAN_NATIVE_FAILED", error=str(exc))
+            return None
+
+    def _find_pids_listening_on_8188(self):
+        native_pids = self._find_pids_listening_on_8188_native()
+        if native_pids is not None:
+            return native_pids
+        pids = set()
+        try:
+            result = subprocess.run(
+                ["netstat", "-ano", "-p", "TCP"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            for line in (result.stdout or "").splitlines():
+                parts = line.split()
+                if len(parts) >= 5 and parts[0].upper() == "TCP" and parts[1].endswith(":8188") and parts[3].upper() == "LISTENING":
+                    try:
+                        pid = int(parts[4])
+                    except ValueError:
+                        continue
+                    if pid > 0 and pid != os.getpid():
+                        pids.add(pid)
+        except Exception as exc:
+            self.log_debug("COMFYUI_PORT_SCAN_FAILED", error=str(exc))
+        return pids
+
+    def _stop_comfyui_process(self, reason=""):
+        """Force-stop ComfyUI: the tracked launcher tree plus whatever owns
+        port 8188. A wedged instance can stop answering HTTP while keeping the
+        socket bound, which makes any relaunch die at bind (WinError 10048).
+        Returns True once port 8188 is free."""
+        kill_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        pids = set()
+        proc = getattr(self, "comfyui_process", None)
+        if proc is not None and proc.poll() is None:
+            pids.add(proc.pid)
+        pids |= self._find_pids_listening_on_8188()
+        adopted_pid = getattr(self, "comfyui_adopted_pid", None)
+        if adopted_pid:
+            pids.add(adopted_pid)
+        if not pids and sys.platform == "win32":
+            # Last resort: a console launched by a previous app session still
+            # carries our window title even when the port scan finds nothing.
+            hwnd = self._find_window_handle_for_title(self.comfyui_console_title)
+            if not hwnd:
+                hwnd = self._find_window_handle_for_title_prefix(self._get_comfyui_console_title_prefix())
+            if hwnd:
+                console_pid = ctypes.c_ulong()
+                ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(console_pid))
+                if console_pid.value and console_pid.value != os.getpid():
+                    pids.add(int(console_pid.value))
+                    self.log_debug("COMFYUI_KILL_VIA_CONSOLE_WINDOW", hwnd=hwnd, pid=int(console_pid.value))
+        for pid in sorted(pids):
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    creationflags=kill_flags,
+                )
+            except Exception as exc:
+                self.log_debug("COMFYUI_KILL_FAILED", pid=pid, error=str(exc))
+        self.comfyui_ready = False
+        self.comfyui_process = None
+        self.comfyui_adopted_pid = None
+        self.comfyui_console_hwnd = None
+        self.comfyui_console_visible = False
+        self.comfyui_console_title = None
+        self.comfyui_console_pending_visibility = None
+        self.root.after(0, self._cancel_comfyui_console_poll)
+        self.root.after(0, self._refresh_comfyui_terminal_button)
+        deadline = time.time() + 30
+        while time.time() < deadline and self._is_port_8188_bound():
+            time.sleep(1)
+        port_free = not self._is_port_8188_bound()
+        self.log_debug("COMFYUI_STOPPED", reason=reason, pids=sorted(pids), port_free=port_free)
+        return port_free
 
     def _sync_runtime_paths(self, settings):
         self.base_output_dir = self._normalize_path(settings.get("output_root")) or self.base_output_dir or self._get_default_output_dir()
@@ -9241,7 +11510,7 @@ class LTXQueueManager:
         if selected_path:
             tk_var.set(self._normalize_path(selected_path) or "")
 
-    def _apply_runtime_path_settings(self, comfyui_root, launcher_path, output_root, model_roots, remember_section_open_states=None):
+    def _apply_runtime_path_settings(self, comfyui_root, launcher_path, output_root, model_roots, remember_section_open_states=None, vibevoice_model_root=None, comfyui_models_root=None):
         resolved_root = self._normalize_path(comfyui_root)
         resolved_output_root = self._normalize_path(output_root) or self._get_default_output_dir()
         resolved_model_roots = self._resolve_model_search_roots(model_roots, resolved_root)
@@ -9253,6 +11522,10 @@ class LTXQueueManager:
         self.model_search_roots = resolved_model_roots
         if remember_section_open_states is not None:
             self.remember_section_open_states = bool(remember_section_open_states)
+        if vibevoice_model_root is not None:
+            self.vibevoice_model_root = self._normalize_path(vibevoice_model_root)
+        if comfyui_models_root is not None:
+            self.comfyui_models_root = self._normalize_path(comfyui_models_root)
 
         self.save_global_settings()
         self.refresh_video_model_choices()
@@ -9293,6 +11566,10 @@ class LTXQueueManager:
         comfyui_root_var = tk.StringVar(value=self.comfyui_root or "")
         launcher_var = tk.StringVar(value=self.comfyui_launcher_path or "")
         output_root_var = tk.StringVar(value=self.base_output_dir or self._get_default_output_dir())
+        vibevoice_model_root_var = tk.StringVar(value=self.vibevoice_model_root or "")
+        comfyui_models_root_var = tk.StringVar(value=self.comfyui_models_root or "")
+        self.vibevoice_model_root_var = vibevoice_model_root_var
+        self.comfyui_models_root_var = comfyui_models_root_var
 
         row_index = 0
 
@@ -9326,10 +11603,34 @@ class LTXQueueManager:
                 comfyui_root_var.get() or self.app_root_dir
             )
         )
+        self.comfyui_root_var = comfyui_root_var
+        self.comfyui_launcher_var = launcher_var
+
+        def run_comfyui_download():
+            self._prompt_download_comfyui()
+
+        download_lbl = tk.Label(form, text="Install helper")
+        download_lbl.grid(row=row_index, column=0, sticky="nw", padx=(0, 12), pady=(0, 10))
+        self._style_label(download_lbl, "body_strong", self.colors["surface"])
+
+        download_btn = tk.Button(form, text="Download & Configure ComfyUI Portable...", command=run_comfyui_download)
+        download_btn.grid(row=row_index, column=1, columnspan=2, sticky="w", pady=(0, 10))
+        self._style_button(download_btn, "primary", compact=True)
+        row_index += 1
         add_path_row(
             "Output folder",
             output_root_var,
             lambda: self._browse_directory_into_var(output_root_var, "Select Prompt2MTV Output Folder", self.base_output_dir or self.app_root_dir)
+        )
+        add_path_row(
+            "VibeVoice models root",
+            vibevoice_model_root_var,
+            lambda: self._browse_directory_into_var(vibevoice_model_root_var, "Select VibeVoice & LLM Models Folder", vibevoice_model_root_var.get() or self.app_root_dir)
+        )
+        add_path_row(
+            "ComfyUI models root",
+            comfyui_models_root_var,
+            lambda: self._browse_directory_into_var(comfyui_models_root_var, "Select Custom ComfyUI Models Folder", comfyui_models_root_var.get() or self.app_root_dir)
         )
 
         model_roots_label = tk.Label(form, text="Model search roots")
@@ -9408,6 +11709,8 @@ class LTXQueueManager:
                     output_root_var.get(),
                     parsed_model_roots,
                     remember_section_open_states=remember_sections_var.get(),
+                    vibevoice_model_root=vibevoice_model_root_var.get(),
+                    comfyui_models_root=comfyui_models_root_var.get(),
                 )
             except Exception as exc:
                 messagebox.showerror("Runtime Paths", f"Failed to save runtime paths:\n{exc}", parent=dialog)
@@ -9533,7 +11836,7 @@ class LTXQueueManager:
         if model_audit.get("missing"):
             if model_audit.get("installable_missing"):
                 warnings.append(
-                    f"Required workflow models are missing ({len(model_audit['missing'])}). Use Project > Install Missing Models to download them into your ComfyUI model folders automatically."
+                    f"Required workflow models are missing ({len(model_audit['missing'])}). Use Project > Model Manager... to download them into your ComfyUI model folders automatically."
                 )
             else:
                 warnings.append(
@@ -9556,7 +11859,7 @@ class LTXQueueManager:
                 dialog_title = "First Launch Guidance" if self.is_first_launch else "Startup Preflight"
                 messagebox.showwarning(dialog_title, preflight_text)
                 if self.is_first_launch and model_audit.get("installable_missing"):
-                    self.install_missing_models(interactive=True, model_audit=model_audit)
+                    self.show_model_downloader_wizard()
         else:
             ready_text = self._compose_startup_preflight_text([], [], model_audit)
             self._set_video_preflight_summary(ready_text, "Ready", "green")
@@ -11029,10 +13332,7 @@ class LTXQueueManager:
             self._update_comfyui_banner("ready", "✅ ComfyUI already running")
             self._fire_comfyui_pending_callback()
             self.comfyui_process = None
-            self.comfyui_console_hwnd = None
-            self.comfyui_console_visible = False
-            self.comfyui_console_title = None
-            self.comfyui_console_pending_visibility = None
+            self._adopt_running_comfyui_console()
             self._refresh_comfyui_terminal_button()
             return
 
@@ -11055,12 +13355,14 @@ class LTXQueueManager:
                     launcher_command,
                     creationflags=subprocess.CREATE_NEW_CONSOLE,
                     cwd=os.path.dirname(bat_path),
+                    env=self._get_clean_env(),
                     startupinfo=startupinfo,
                 )
                 self.comfyui_console_hwnd = None
                 self.comfyui_console_visible = False
                 self.comfyui_console_title = console_title
                 self.comfyui_console_pending_visibility = False
+                self.comfyui_adopted_pid = None
                 self.log_debug(
                     "COMFYUI_LAUNCH_REQUESTED",
                     pid=self.comfyui_process.pid,
@@ -11075,6 +13377,7 @@ class LTXQueueManager:
                 self.update_status(f"Error launching ComfyUI: {e}", "red")
                 self._update_comfyui_banner("error", f"⚠ Error launching ComfyUI: {e}")
                 self.comfyui_process = None
+                self.comfyui_adopted_pid = None
                 self.comfyui_console_hwnd = None
                 self.comfyui_console_visible = False
                 self.comfyui_console_title = None
@@ -11321,11 +13624,17 @@ class LTXQueueManager:
             callback()
             return
         if not self.comfyui_launcher_path:
-            messagebox.showwarning(
-                "ComfyUI Not Configured",
-                "No ComfyUI launcher is configured.\n"
-                "Use Project \u2192 Configure Runtime Paths.",
+            confirm = messagebox.askyesno(
+                "ComfyUI Not Found",
+                "Prompt2MTV could not find a configured ComfyUI installation on your system.\n\n"
+                "Would you like to automatically download and configure the official ComfyUI Windows Portable version now?"
             )
+            if confirm:
+                if self._prompt_download_comfyui():
+                    if self.comfyui_launcher_path:
+                        self._comfyui_pending_callback = callback
+                        self.launch_comfyui()
+                        self._start_comfyui_readiness_poll()
             return
         # Store callback; it will be fired by _fire_comfyui_pending_callback once ready
         self._comfyui_pending_callback = callback
@@ -11350,9 +13659,8 @@ class LTXQueueManager:
         self.project_menu.add_command(label="Open Project", command=self.open_project)
         self.project_menu.add_command(label="Rename Current Project", command=self.rename_current_project)
         self.project_menu.add_command(label="Configure Runtime Paths", command=self.configure_runtime_paths)
-        self.project_menu.add_command(label="Install Missing Models", command=self.install_missing_models)
+        self.project_menu.add_command(label="Model Manager...", command=self.show_model_downloader_wizard)
         self.project_menu.add_command(label="Advanced Chatbot Runtime Settings", command=self.configure_chatbot_runtime)
-        self.project_menu.add_command(label="Download Chatbot Model", command=self.prompt_and_download_chatbot_model)
         self.project_menu.add_separator()
         self.project_menu.add_command(label="Exit", command=self.on_closing)
 
@@ -11419,6 +13727,10 @@ class LTXQueueManager:
         # Tab 1: Chatbot
         self.chatbot_tab = tk.Frame(self.notebook)
         self.notebook.add(self.chatbot_tab, text="Chatbot")
+
+        # Tab 1.5: Script Writer (YouTube mode only; hidden in MTV mode)
+        self.script_tab = tk.Frame(self.notebook)
+        self.notebook.add(self.script_tab, text="Script Writer")
 
         # Tab 2: Image Phase
         self.image_tab = tk.Frame(self.notebook)
@@ -11896,6 +14208,9 @@ class LTXQueueManager:
         if self.splash: self.splash.tick()
         self.setup_chatbot_tab()
         if self.splash: self.splash.tick()
+        self.setup_script_tab()
+        self._refresh_script_tab_visibility()
+        if self.splash: self.splash.tick()
         self._apply_static_theme()
         self._enable_drag_and_drop()
         # Re-apply image settings now that the image tab exists
@@ -12233,33 +14548,91 @@ class LTXQueueManager:
 
     # ── helpers (unchanged from original) ────────────────────────────────
 
+    def _ffmpeg_media_duration(self, path):
+        """Return media duration in seconds using ffprobe when available,
+        otherwise by parsing `ffmpeg -i` output (imageio-ffmpeg ships no ffprobe).
+        Returns None when the duration cannot be determined."""
+        ffmpeg_dir = os.path.dirname(FFMPEG_PATH)
+        ffmpeg_name = os.path.basename(FFMPEG_PATH)
+        ffprobe_name = ffmpeg_name.replace("ffmpeg", "ffprobe")
+        ffprobe_path = os.path.join(ffmpeg_dir, ffprobe_name) if ffmpeg_dir else ffprobe_name
+        if not os.path.exists(ffprobe_path):
+            ffprobe_path = shutil.which("ffprobe")
+        if ffprobe_path:
+            try:
+                probe_cmd = [
+                    ffprobe_path, "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    path,
+                ]
+                result = subprocess.run(
+                    probe_cmd, capture_output=True, text=True, timeout=30,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                return float(result.stdout.strip())
+            except Exception:
+                pass
+        try:
+            result = subprocess.run(
+                [FFMPEG_PATH, "-hide_banner", "-i", path],
+                capture_output=True, text=True, timeout=30,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            match = re.search(r"Duration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)", result.stderr or "")
+            if match:
+                hours, minutes, seconds = match.groups()
+                return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+        except Exception:
+            pass
+        return None
+
+    def _video_appears_uniform(self, path, sample_count=3):
+        """Return True when sampled frames of the video are a solid color
+        (e.g. an all-black render from broken conditioning). Mirrors the
+        stddev-based blank check used for generated images."""
+        try:
+            from PIL import Image, ImageStat
+            duration = self._ffmpeg_media_duration(path)
+            if not duration or duration <= 0:
+                return False
+            offsets = [duration * (i + 1) / (sample_count + 1) for i in range(sample_count)]
+            for offset in offsets:
+                frame_path = os.path.join(tempfile.gettempdir(), f"p2mtv_qa_frame_{uuid.uuid4().hex}.png")
+                try:
+                    result = subprocess.run(
+                        [FFMPEG_PATH, "-y", "-v", "error", "-ss", f"{offset:.3f}", "-i", path,
+                         "-frames:v", "1", frame_path],
+                        capture_output=True, text=True, timeout=60,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                    )
+                    if result.returncode != 0 or not os.path.exists(frame_path):
+                        return False
+                    with Image.open(frame_path) as img:
+                        stat = ImageStat.Stat(img.convert("RGB"))
+                        if max(stat.stddev) >= 2.0:
+                            return False
+                finally:
+                    try:
+                        if os.path.exists(frame_path):
+                            os.remove(frame_path)
+                    except OSError:
+                        pass
+            return True
+        except Exception as exc:
+            print(f"[QA] Uniform-video check failed for {path}: {exc}")
+            return False
+
     def _probe_clip_duration(self, path):
         """Return duration of a video clip in seconds (float), cached by path."""
         norm = os.path.normcase(os.path.abspath(path))
         if norm in self._timeline_clip_durations:
             return self._timeline_clip_durations[norm]
-        try:
-            ffmpeg_dir = os.path.dirname(FFMPEG_PATH)
-            ffmpeg_name = os.path.basename(FFMPEG_PATH)
-            ffprobe_name = ffmpeg_name.replace("ffmpeg", "ffprobe")
-            ffprobe_path = os.path.join(ffmpeg_dir, ffprobe_name) if ffmpeg_dir else ffprobe_name
-            if not os.path.exists(ffprobe_path):
-                ffprobe_path = shutil.which("ffprobe") or "ffprobe"
-            probe_cmd = [
-                ffprobe_path, "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                path,
-            ]
-            result = subprocess.run(
-                probe_cmd, capture_output=True, text=True, timeout=30,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-            dur = float(result.stdout.strip())
-            self._timeline_clip_durations[norm] = dur
-            return dur
-        except Exception:
+        dur = self._ffmpeg_media_duration(path)
+        if dur is None:
             return 5.0
+        self._timeline_clip_durations[norm] = dur
+        return dur
 
     def _get_timeline_ordered_scenes(self):
         """Return ordered list of scene dicts for the timeline canvas."""
@@ -15024,7 +17397,7 @@ class LTXQueueManager:
 
                 if not has_trims and not has_xfade and self.project_mode != "youtube":
                     # ── Fast path: stream-copy concat ──────────────────────
-                    list_file = f"timeline_concat_{timestamp}.txt"
+                    list_file = os.path.join(tempfile.gettempdir(), f"timeline_concat_{timestamp}.txt")
                     try:
                         with open(list_file, "w", encoding="utf-8") as f:
                             for sc in valid_scenes:
@@ -16106,7 +18479,7 @@ class LTXQueueManager:
         auto_left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 15))
         self._style_panel(auto_left_col, auto_body.cget("bg"))
 
-        auto_right_col = tk.Frame(auto_body, width=340)
+        auto_right_col = tk.Frame(auto_body, width=380)
         auto_right_col.pack(side=tk.RIGHT, fill=tk.BOTH, padx=(15, 0))
         auto_right_col.pack_propagate(False)
         self._style_panel(auto_right_col, auto_body.cget("bg"))
@@ -16243,11 +18616,18 @@ class LTXQueueManager:
         self._style_button(self.autonomous_start_btn, "primary")
 
         self.autonomous_cancel_btn = tk.Button(
-            auto_btn_row, text="Cancel",
+            auto_btn_row, text="⏸  Pause",
             command=self._cancel_autonomous_pipeline, state=tk.DISABLED,
         )
         self.autonomous_cancel_btn.pack(side=tk.LEFT)
         self._style_button(self.autonomous_cancel_btn, "danger")
+
+        self.autonomous_startover_btn = tk.Button(
+            auto_btn_row, text="🗑  Start Over",
+            command=self._autonomous_start_over,
+        )
+        self.autonomous_startover_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self._style_button(self.autonomous_startover_btn, "secondary")
 
         auto_progress_frame = tk.Frame(auto_right_col)
         auto_progress_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
@@ -16295,7 +18675,7 @@ class LTXQueueManager:
         yt_auto_left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 15))
         self._style_panel(yt_auto_left_col, yt_auto_body.cget("bg"))
 
-        yt_auto_right_col = tk.Frame(yt_auto_body, width=340)
+        yt_auto_right_col = tk.Frame(yt_auto_body, width=380)
         yt_auto_right_col.pack(side=tk.RIGHT, fill=tk.BOTH, padx=(15, 0))
         yt_auto_right_col.pack_propagate(False)
         self._style_panel(yt_auto_right_col, yt_auto_body.cget("bg"))
@@ -16520,11 +18900,18 @@ class LTXQueueManager:
         self._style_button(self.youtube_autonomous_start_btn, "primary")
 
         self.youtube_autonomous_cancel_btn = tk.Button(
-            yt_auto_btn_row, text="Cancel",
+            yt_auto_btn_row, text="⏸  Pause",
             command=self._cancel_autonomous_pipeline, state=tk.DISABLED,
         )
         self.youtube_autonomous_cancel_btn.pack(side=tk.LEFT)
         self._style_button(self.youtube_autonomous_cancel_btn, "danger")
+
+        self.youtube_autonomous_startover_btn = tk.Button(
+            yt_auto_btn_row, text="🗑  Start Over",
+            command=self._autonomous_start_over,
+        )
+        self.youtube_autonomous_startover_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self._style_button(self.youtube_autonomous_startover_btn, "secondary")
 
         yt_auto_progress_frame = tk.Frame(yt_auto_right_col)
         yt_auto_progress_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
@@ -17285,7 +19672,7 @@ class LTXQueueManager:
             cmd = [uv_exe, "run", "--no-sync", "acestep-api", "--host", "127.0.0.1", "--port", "8001"]
 
         try:
-            env = os.environ.copy()
+            env = self._get_clean_env()
             env["ACESTEP_INIT_LLM"] = "false"
             env["CHECK_UPDATE"] = "false"
             env["ACESTEP_NO_INIT"] = "true"
@@ -19732,28 +22119,8 @@ class LTXQueueManager:
                 with open(temp_txt_path, "w", encoding="utf-8") as f:
                     f.write(f"Speaker 1: {vo_text}\n")
                 
-                python_exe = self.vibevoice_python_var.get()
-                vibevoice_dir = self._get_vibevoice_dir()
                 device = "cpu"  # Keep on CPU to avoid ComfyUI VRAM collision
-                
-                cmd = [
-                    python_exe,
-                    os.path.join(vibevoice_dir, "demo", "inference_from_file.py"),
-                    "--model_path", "microsoft/VibeVoice-1.5b",
-                    "--txt_path", temp_txt_path,
-                    "--speaker_names", self.vibevoice_speaker_var.get(),
-                    "--output_dir", vo_dir,
-                    "--device", device
-                ]
-                print(f"[Autonomous] Running synchronous VibeVoice cmd: {' '.join(cmd)}")
-                res = subprocess.run(
-                    cmd,
-                    cwd=vibevoice_dir,
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                    capture_output=True,
-                    text=True,
-                    check=False
-                )
+                res = self._run_vibevoice_inference(temp_txt_path, vo_dir, device)
                 if res.returncode == 0:
                     txt_filename = os.path.splitext(temp_txt_name)[0]
                     expected_wav_path = os.path.normpath(os.path.join(vo_dir, f"{txt_filename}_generated.wav"))
@@ -20427,6 +22794,10 @@ class LTXQueueManager:
         self.image_prompt_queue = []
         self.image_assets = []
         self.scene_timeline = []
+        self.youtube_script_state = self._empty_youtube_script_state()
+        refresh_script_tab = getattr(self, "_refresh_script_tab_from_state", None)
+        if callable(refresh_script_tab):
+            refresh_script_tab()
         self.selected_videos.clear()
         self._update_video_selection_summary()
         
@@ -20474,6 +22845,8 @@ class LTXQueueManager:
             "chatbot_model_filename": self.chatbot_model_filename,
             "chatbot_model_root": self.chatbot_model_root,
             "chatbot_model_path": self.chatbot_model_path,
+            "vibevoice_model_root": self.vibevoice_model_root_var.get() if hasattr(self, "vibevoice_model_root_var") else self.vibevoice_model_root,
+            "comfyui_models_root": self.comfyui_models_root_var.get() if hasattr(self, "comfyui_models_root_var") else self.comfyui_models_root,
             "chatbot_preferred_drive": self.chatbot_preferred_drive,
             "chatbot_backend_mode": self.chatbot_backend_mode,
             "chatbot_server_url": self.chatbot_server_url,
@@ -20510,9 +22883,53 @@ class LTXQueueManager:
         except Exception as e:
             print(f"Error saving global settings: {e}")
 
+    def _migrate_old_app_paths(self, settings):
+        new_root = self.app_root_dir
+        updated_any = False
+        
+        path_keys = [
+            "comfyui_root",
+            "comfyui_launcher_path",
+            "base_output_dir",
+            "vibevoice_model_root",
+            "comfyui_models_root",
+            "chatbot_model_root",
+            "chatbot_model_path",
+            "vibevoice_python"
+        ]
+        
+        for key in path_keys:
+            val = settings.get(key)
+            if not val:
+                continue
+                
+            val_norm = os.path.normpath(val)
+            if os.path.exists(val_norm):
+                continue
+                
+            parts = val_norm.split(os.sep)
+            if "Prompt2MTV" in parts:
+                idx = parts.index("Prompt2MTV")
+                rel_parts = parts[idx + 1:]
+                if rel_parts:
+                    candidate = os.path.normpath(os.path.join(new_root, *rel_parts))
+                    if os.path.exists(candidate):
+                        settings[key] = candidate
+                        updated_any = True
+                        print(f"[PATH MIGRATION] Migrated config key '{key}': '{val}' -> '{candidate}'")
+                        
+        if updated_any:
+            try:
+                os.makedirs(os.path.dirname(self.global_settings_file), exist_ok=True)
+                with open(self.global_settings_file, 'w', encoding='utf-8') as f:
+                    json.dump(settings, f, indent=4)
+            except Exception as e:
+                print(f"Error saving migrated settings: {e}")
+
     def load_global_settings(self):
         try:
             settings, loaded_from = self._read_global_settings_payload()
+            self._migrate_old_app_paths(settings)
             self.is_first_launch = loaded_from is None
             self._sync_runtime_paths(settings)
             
@@ -20537,7 +22954,19 @@ class LTXQueueManager:
             )
 
             # Restore video model preset and workflow type
-            saved_preset = settings.get("video_model_preset", DEFAULT_VIDEO_MODEL_PRESET)
+            saved_preset = settings.get("video_model_preset")
+            if not saved_preset:
+                vram_gb = self._detect_gpu_vram_gb()
+                if vram_gb < 12.0:
+                    saved_preset = "gguf_q2_distilled_fastest"
+                elif vram_gb < 16.0:
+                    saved_preset = "gguf_q3_distilled_fast"
+                elif vram_gb < 20.0:
+                    saved_preset = "gguf_q4_distilled_balanced"
+                else:
+                    saved_preset = "fp8_quality"
+                chatbot_settings_dirty = True
+
             if saved_preset in VIDEO_MODEL_PRESETS:
                 self.active_video_model_preset = saved_preset
                 self._set_selected_video_model_preset_key(saved_preset)
@@ -20563,10 +22992,25 @@ class LTXQueueManager:
             self.global_image_settings_defaults = settings.get("image_settings", {})
             self.remember_section_open_states = bool(settings.get("remember_section_open_states", False))
             self._apply_saved_image_settings(self.global_image_settings_defaults)
-            self.chatbot_model_url = str(settings.get("chatbot_model_url", CHATBOT_MODEL_URL)).strip() or CHATBOT_MODEL_URL
-            self.chatbot_model_filename = str(settings.get("chatbot_model_filename", CHATBOT_MODEL_FILENAME)).strip() or CHATBOT_MODEL_FILENAME
+
+            raw_model_url = settings.get("chatbot_model_url")
+            raw_model_filename = settings.get("chatbot_model_filename")
+            if not raw_model_url or not raw_model_filename:
+                vram_gb = self._detect_gpu_vram_gb()
+                if vram_gb < 12.0:
+                    self.chatbot_model_filename = "Qwen_Qwen3-7B-Q4_K_M.gguf"
+                    self.chatbot_model_url = "https://huggingface.co/bartowski/Qwen_Qwen3-7B-GGUF/resolve/main/Qwen_Qwen3-7B-Q4_K_M.gguf?download=true"
+                else:
+                    self.chatbot_model_filename = "Qwen_Qwen3-14B-Q4_K_M.gguf"
+                    self.chatbot_model_url = "https://huggingface.co/bartowski/Qwen_Qwen3-14B-GGUF/resolve/main/Qwen_Qwen3-14B-Q4_K_M.gguf?download=true"
+                chatbot_settings_dirty = True
+            else:
+                self.chatbot_model_url = str(raw_model_url).strip()
+                self.chatbot_model_filename = str(raw_model_filename).strip()
             self.chatbot_model_root = self._normalize_path(settings.get("chatbot_model_root")) or self._get_recommended_chatbot_model_root()
             self.chatbot_model_path = self._normalize_path(settings.get("chatbot_model_path")) or self._get_chatbot_model_path_from_root(self.chatbot_model_root)
+            self.vibevoice_model_root = self._normalize_path(settings.get("vibevoice_model_root")) or self.chatbot_model_root
+            self.comfyui_models_root = self._normalize_path(settings.get("comfyui_models_root")) or ""
             self.chatbot_preferred_drive = str(settings.get("chatbot_preferred_drive", "M")).strip().upper().rstrip(":") or "M"
             saved_backend_mode = str(settings.get("chatbot_backend_mode", CHATBOT_BACKEND_MODE_CONNECT)).strip().lower()
             self.chatbot_backend_mode = saved_backend_mode if saved_backend_mode in {CHATBOT_BACKEND_MODE_CONNECT, CHATBOT_BACKEND_MODE_MANAGED, CHATBOT_BACKEND_MODE_OLLAMA} else CHATBOT_BACKEND_MODE_CONNECT
@@ -20631,6 +23075,30 @@ class LTXQueueManager:
             self.load_tutorial_phase_history()
             self._load_comfyui_readiness_history()
 
+            # YouTube Creator Mode Settings State Sync
+            if hasattr(self, "vibevoice_speaker_var"):
+                self.vibevoice_speaker_var.set(self.vibevoice_speaker)
+            if hasattr(self, "vibevoice_python_var"):
+                self.vibevoice_python_var.set(self.vibevoice_python)
+            if hasattr(self, "vibevoice_model_root_var"):
+                self.vibevoice_model_root_var.set(self.vibevoice_model_root)
+            if hasattr(self, "comfyui_models_root_var"):
+                self.comfyui_models_root_var.set(self.comfyui_models_root)
+            if hasattr(self, "ducking_threshold_var"):
+                self.ducking_threshold_var.set(self.ducking_threshold)
+            if hasattr(self, "ducking_ratio_var"):
+                self.ducking_ratio_var.set(self.ducking_ratio)
+            if hasattr(self, "ducking_attack_var"):
+                self.ducking_attack_var.set(self.ducking_attack)
+            if hasattr(self, "ducking_release_var"):
+                self.ducking_release_var.set(self.ducking_release)
+            if hasattr(self, "ducking_bg_volume_var"):
+                self.ducking_bg_volume_var.set(self.ducking_bg_volume)
+            if hasattr(self, "ducking_intro_delay_var"):
+                self.ducking_intro_delay_var.set(self.ducking_intro_delay)
+            if hasattr(self, "visual_pacing_var"):
+                self.visual_pacing_var.set(self.visual_pacing)
+
             if hasattr(self, "project_mode_combo_var"):
                 self.project_mode_combo_var.set("Music Video (MTV)" if self.project_mode == "mtv" else "YouTube Video (Creator)")
             if hasattr(self, "youtube_settings_frame"):
@@ -20673,6 +23141,8 @@ class LTXQueueManager:
             self.chatbot_model_filename = CHATBOT_MODEL_FILENAME
             self.chatbot_model_root = self._get_recommended_chatbot_model_root()
             self.chatbot_model_path = self._get_chatbot_model_path_from_root(self.chatbot_model_root)
+            self.vibevoice_model_root = self.chatbot_model_root
+            self.comfyui_models_root = ""
             self.chatbot_preferred_drive = "M"
             self.chatbot_backend_mode = CHATBOT_BACKEND_MODE_CONNECT
             self.chatbot_server_url = self._get_default_chatbot_server_url(CHATBOT_BACKEND_MODE_CONNECT)
@@ -21108,6 +23578,47 @@ class LTXQueueManager:
                 pass
             self.eta_tick_id = None
 
+    @staticmethod
+    def _empty_youtube_script_state():
+        return {"title": "", "intro": "", "segments": [], "source": "", "user_edited": False}
+
+    def _normalize_youtube_script_state(self, raw):
+        state = self._empty_youtube_script_state()
+        if not isinstance(raw, dict):
+            return state
+        state["title"] = str(raw.get("title") or "").strip()
+        state["intro"] = str(raw.get("intro") or "").strip()
+        state["source"] = str(raw.get("source") or "").strip()
+        state["user_edited"] = bool(raw.get("user_edited"))
+        segments = raw.get("segments")
+        if isinstance(segments, list):
+            for idx, seg in enumerate(segments, start=1):
+                if not isinstance(seg, dict):
+                    continue
+                try:
+                    segment_number = int(seg.get("segment_number") or idx)
+                except (TypeError, ValueError):
+                    segment_number = idx
+                state["segments"].append({
+                    "segment_number": segment_number,
+                    "voiceover_text": str(seg.get("voiceover_text") or "").strip(),
+                    "topic": str(seg.get("topic") or "").strip(),
+                    "visual_theme_hint": str(seg.get("visual_theme_hint") or "").strip(),
+                })
+        return state
+
+    def _store_youtube_script(self, script_result, source, user_edited=False):
+        """Record the project's YouTube script (auto-generated or user-written)
+        so it persists with the project and is visible in the Script tab."""
+        normalized = self._normalize_youtube_script_state(script_result)
+        normalized["source"] = source
+        normalized["user_edited"] = bool(user_edited)
+        self.youtube_script_state = normalized
+        refresh = getattr(self, "_refresh_script_tab_from_state", None)
+        if callable(refresh):
+            self.root.after(0, refresh)
+        return normalized
+
     def save_project_state(self):
         if not self.current_project_dir or self.project_state_restore_in_progress:
             return
@@ -21155,6 +23666,7 @@ class LTXQueueManager:
             "autonomous_brief": self.autonomous_brief_text.get("1.0", tk.END).strip() if hasattr(self, "autonomous_brief_text") else getattr(self, "autonomous_creative_brief", ""),
             "youtube_autonomous_brief": self.youtube_autonomous_brief_text.get("1.0", tk.END).strip() if hasattr(self, "youtube_autonomous_brief_text") else "",
             "youtube_autonomous_duration": self.youtube_autonomous_duration_var.get() if hasattr(self, "youtube_autonomous_duration_var") else "120",
+            "youtube_script": copy.deepcopy(self.youtube_script_state) if isinstance(getattr(self, "youtube_script_state", None), dict) else self._empty_youtube_script_state(),
             "autonomous_aspect_ratio": self.autonomous_aspect_ratio_var.get() if hasattr(self, "autonomous_aspect_ratio_var") else "16:9 (1280×720)",
             "youtube_autonomous_aspect_ratio": self.youtube_autonomous_aspect_ratio_var.get() if hasattr(self, "youtube_autonomous_aspect_ratio_var") else "16:9 (1280×720)",
             "autonomous_quality_preset": self.autonomous_quality_preset_var.get() if hasattr(self, "autonomous_quality_preset_var") else "Balanced",
@@ -21264,6 +23776,11 @@ class LTXQueueManager:
                 if hasattr(self, "youtube_autonomous_brief_text"):
                     self.youtube_autonomous_brief_text.delete("1.0", tk.END)
                     self.youtube_autonomous_brief_text.insert("1.0", state.get("youtube_autonomous_brief", ""))
+
+                self.youtube_script_state = self._normalize_youtube_script_state(state.get("youtube_script"))
+                refresh_script_tab = getattr(self, "_refresh_script_tab_from_state", None)
+                if callable(refresh_script_tab):
+                    refresh_script_tab()
                     
                 if hasattr(self, "youtube_autonomous_duration_var") and "youtube_autonomous_duration" in state:
                     self.youtube_autonomous_duration_var.set(state.get("youtube_autonomous_duration"))
@@ -21322,6 +23839,7 @@ class LTXQueueManager:
             print(f"Error loading project state: {e}")
         finally:
             self.project_state_restore_in_progress = False
+        self._autonomous_refresh_resume_hint()
 
     def _set_gallery_filter(self, mode):
         self.gallery_filter_mode = mode
@@ -22299,7 +24817,7 @@ class LTXQueueManager:
         )
         self.update_status("Stitching videos...", "blue")
         timestamp = int(time.time())
-        list_file = f"concat_{timestamp}.txt"
+        list_file = os.path.join(tempfile.gettempdir(), f"concat_{timestamp}.txt")
         
         try:
             with open(list_file, 'w', encoding='utf-8') as f:
@@ -22673,6 +25191,10 @@ class LTXQueueManager:
 
     def _get_prompt_preview_from_workflow(self, workflow):
         prompt_preview = self._get_workflow_role_value(workflow, "prompt", default="")
+        if prompt_preview:
+            return prompt_preview
+        i2v_profile = self._get_active_i2v_profile()
+        prompt_preview = self._get_workflow_role_value_from_roles(workflow, i2v_profile.get("roles", {}), "prompt", default="")
         if prompt_preview:
             return prompt_preview
         return self._get_workflow_role_value_from_roles(workflow, IMAGE_WORKFLOW_PROFILE["roles"], "prompt", default="")
@@ -23479,9 +26001,494 @@ class LTXQueueManager:
         if hasattr(self, "youtube_autonomous_estimate_label"):
             self.youtube_autonomous_estimate_label.config(text=f"{scene_count} scenes × ~{sps:.1f}s = ~{actual_dur:.0f}s total video")
 
+    # ── Autonomous pipeline resume manifest ──────────────────────────────
+    # The manifest checkpoints an autonomous run to disk so an interrupted
+    # pipeline (crash, power loss, cancel, failure) can resume where it left
+    # off instead of re-generating hours of content.
+
+    def _autonomous_manifest_path(self):
+        if not self.current_project_dir:
+            return None
+        return os.path.join(self.current_project_dir, AUTONOMOUS_MANIFEST_FILENAME)
+
+    def _autonomous_inputs_fingerprint(self, brief=None, target_duration=None):
+        """Hash of the inputs that shape generated artifacts. A changed
+        fingerprint means a previous run's plan and artifacts no longer match
+        what the user is asking for, so resume must not be offered."""
+        if brief is None:
+            brief = getattr(self, "autonomous_creative_brief", "")
+        if target_duration is None:
+            target_duration = getattr(self, "autonomous_target_duration", 0)
+        width, height = self._get_resolution_from_aspect_ratio()
+        payload = "|".join([
+            str(getattr(self, "project_mode", "mtv")),
+            str(brief or "").strip(),
+            str(target_duration),
+            f"{width}x{height}",
+        ])
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+    def _save_autonomous_manifest(self, status="running", error=""):
+        """Checkpoint the autonomous run. Safe to call from the worker thread:
+        file IO plus attribute reads only, no Tk access. Written atomically so
+        a crash mid-write cannot corrupt an earlier good checkpoint."""
+        path = self._autonomous_manifest_path()
+        if not path:
+            return
+        image_asset_map = getattr(self, "autonomous_image_asset_map", {}) or {}
+        # Also store the asset file paths: if the app dies before the asset
+        # registry reaches project_data.json, resume can rebuild the registry
+        # entries from these paths instead of re-rendering every image.
+        image_asset_paths = {}
+        for index, asset_id in image_asset_map.items():
+            asset = self._get_image_asset_by_id(asset_id)
+            if asset and asset.get("project_path"):
+                image_asset_paths[str(index)] = asset.get("project_path")
+        manifest = {
+            "schema_version": AUTONOMOUS_MANIFEST_SCHEMA_VERSION,
+            "status": status,
+            "error": str(error or "")[:500],
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "project_mode": getattr(self, "project_mode", "mtv"),
+            "fingerprint": self._autonomous_inputs_fingerprint(),
+            "creative_brief": getattr(self, "autonomous_creative_brief", ""),
+            "target_duration": getattr(self, "autonomous_target_duration", 0),
+            "actual_duration": getattr(self, "autonomous_actual_duration", 0),
+            "scene_count": getattr(self, "autonomous_scene_count", 0),
+            "completed_phases": sorted(self.autonomous_completed_phases),
+            "expanded_concept": getattr(self, "autonomous_expanded_concept", ""),
+            "concept_result": getattr(self, "autonomous_concept_result", None),
+            "scene_outline": getattr(self, "autonomous_scene_outline", []) or [],
+            "image_prompts": getattr(self, "autonomous_image_prompts", []) or [],
+            "video_prompts": getattr(self, "autonomous_video_prompts", []) or [],
+            "i2v_prompts": getattr(self, "autonomous_i2v_prompts", []) or [],
+            "voiceovers": getattr(self, "autonomous_voiceovers", []) or [],
+            "youtube_script": getattr(self, "autonomous_youtube_script", None),
+            "music_tags": getattr(self, "autonomous_music_tags", ""),
+            "music_lyrics": getattr(self, "autonomous_music_lyrics", ""),
+            "image_asset_map": {str(k): v for k, v in image_asset_map.items()},
+            "image_asset_paths": image_asset_paths,
+            "rendered_scene_paths": getattr(self, "autonomous_rendered_scene_paths", []) or [],
+            "stitched_path": getattr(self, "selected_video_for_music", None),
+            "music_path": getattr(self, "current_generated_audio", None),
+            "final_path": getattr(self, "current_final_video", None),
+        }
+        try:
+            tmp_path = f"{path}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f, indent=2)
+            os.replace(tmp_path, path)
+        except Exception as exc:
+            self.log_debug("AUTONOMOUS_MANIFEST_SAVE_FAILED", error=str(exc))
+
+    def _load_autonomous_manifest(self):
+        path = self._autonomous_manifest_path()
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+        except Exception as exc:
+            self.log_debug("AUTONOMOUS_MANIFEST_LOAD_FAILED", error=str(exc))
+            return None
+        if not isinstance(manifest, dict):
+            return None
+        if manifest.get("schema_version") != AUTONOMOUS_MANIFEST_SCHEMA_VERSION:
+            self.log_debug("AUTONOMOUS_MANIFEST_SCHEMA_MISMATCH", found=manifest.get("schema_version"))
+            return None
+        return manifest
+
+    def _clear_autonomous_manifest(self):
+        path = self._autonomous_manifest_path()
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError as exc:
+                self.log_debug("AUTONOMOUS_MANIFEST_CLEAR_FAILED", error=str(exc))
+
+    def _validate_autonomous_manifest(self, manifest):
+        """Reconcile the manifest's claimed progress with what actually exists
+        on disk and in the restored project state. Returns (completed, notes):
+        the set of phases safe to skip on resume, and human-readable notes for
+        anything that had to be demoted. Because the pipeline is linear, every
+        phase after the first missing/demoted one is demoted with it — later
+        phases consume the earlier phases' outputs."""
+        claimed = set(manifest.get("completed_phases") or [])
+        notes = []
+        try:
+            scene_count = int(manifest.get("scene_count") or 0)
+        except (TypeError, ValueError):
+            scene_count = 0
+
+        if AUTONOMOUS_STATE_EXPANDING_CONCEPT in claimed and not str(manifest.get("expanded_concept") or "").strip():
+            claimed.discard(AUTONOMOUS_STATE_EXPANDING_CONCEPT)
+            notes.append("expanded concept missing")
+
+        def planning_ok():
+            image_prompts = [p for p in (manifest.get("image_prompts") or []) if str(p).strip()]
+            video_prompts = [p for p in (manifest.get("video_prompts") or []) if str(p).strip()]
+            outline = manifest.get("scene_outline") or []
+            if not image_prompts or not video_prompts or not outline:
+                return False
+            if manifest.get("project_mode") == "youtube" and not (manifest.get("voiceovers") or []):
+                return False
+            return True
+
+        def images_ok():
+            asset_map = getattr(self, "autonomous_image_asset_map", None)
+            if not asset_map:
+                asset_map = manifest.get("image_asset_map") or {}
+            if not asset_map or (scene_count and len(asset_map) < scene_count):
+                return False
+            for asset_id in asset_map.values():
+                asset = self._get_image_asset_by_id(asset_id)
+                if not asset or not os.path.exists(asset.get("project_path", "")):
+                    return False
+            return True
+
+        def timeline_ok():
+            return bool(self.scene_timeline)
+
+        def rendering_ok():
+            timeline = self.scene_timeline or []
+            if not timeline:
+                return False
+            seen = set()
+            for entry in timeline:
+                output_path = entry.get("output_path") or ""
+                if entry.get("render_status") != "ready" or not output_path or not os.path.exists(output_path):
+                    return False
+                output_key = os.path.normpath(output_path).lower()
+                if output_key in seen:
+                    # Two scenes claiming one clip means a mis-attributed
+                    # download from the interrupted run — must re-render.
+                    return False
+                seen.add(output_key)
+            return True
+
+        def file_ok(key):
+            path = manifest.get(key)
+            if not path:
+                if key == "stitched_path":
+                    path = getattr(self, "selected_video_for_music", None)
+                elif key == "music_path":
+                    path = getattr(self, "current_generated_audio", None)
+                elif key == "final_path":
+                    path = getattr(self, "current_final_video", None)
+            return bool(path) and os.path.exists(path)
+
+        checks = [
+            (AUTONOMOUS_STATE_PLANNING_SCENES, planning_ok, "planned prompts missing"),
+            (AUTONOMOUS_STATE_PLANNING_SONG, planning_ok, "planned prompts missing"),
+            (AUTONOMOUS_STATE_GENERATING_IMAGES, images_ok, "generated images missing"),
+            (AUTONOMOUS_STATE_BUILDING_TIMELINE, timeline_ok, "scene timeline missing"),
+            (AUTONOMOUS_STATE_RENDERING, rendering_ok, "rendered scenes missing or incomplete"),
+            (AUTONOMOUS_STATE_STITCHING, lambda: file_ok("stitched_path"), "stitched video missing"),
+            (AUTONOMOUS_STATE_GENERATING_MUSIC, lambda: file_ok("music_path"), "generated music missing"),
+            (AUTONOMOUS_STATE_MERGING, lambda: file_ok("final_path"), "final video missing"),
+        ]
+        demote_rest = False
+        for phase, check, reason in checks:
+            if demote_rest:
+                claimed.discard(phase)
+                continue
+            
+            phase_valid = check()
+            if phase_valid:
+                claimed.add(phase)
+            else:
+                if phase in claimed:
+                    claimed.discard(phase)
+                    notes.append(reason)
+                demote_rest = True
+
+        # Voiceovers: only skippable when every narrated scene kept its audio.
+        voiceovers_intact = bool(self.scene_timeline)
+        for entry in self.scene_timeline or []:
+            if str(entry.get("voiceover") or "").strip():
+                vo_path = entry.get("voiceover_audio_path") or ""
+                if not vo_path or not os.path.exists(vo_path):
+                    voiceovers_intact = False
+                    break
+        if not demote_rest and voiceovers_intact:
+            claimed.add(AUTONOMOUS_VOICEOVERS_DONE)
+        else:
+            if AUTONOMOUS_VOICEOVERS_DONE in claimed:
+                claimed.discard(AUTONOMOUS_VOICEOVERS_DONE)
+                if not voiceovers_intact:
+                    notes.append("voiceover audio missing")
+
+        return claimed, notes
+
+    def _restore_autonomous_state_from_manifest(self, manifest):
+        """Load a previous run's planning outputs and progress into memory so
+        the pipeline thread can skip already-completed work. Returns notes
+        about any phases demoted because their artifacts vanished."""
+        self.autonomous_expanded_concept = str(manifest.get("expanded_concept") or "")
+        if isinstance(manifest.get("concept_result"), dict):
+            self.autonomous_concept_result = manifest.get("concept_result")
+        self.autonomous_scene_outline = manifest.get("scene_outline") or []
+        self.autonomous_image_prompts = manifest.get("image_prompts") or []
+        self.autonomous_video_prompts = manifest.get("video_prompts") or []
+        self.autonomous_i2v_prompts = manifest.get("i2v_prompts") or []
+        self.autonomous_voiceovers = manifest.get("voiceovers") or []
+        if manifest.get("youtube_script"):
+            self.autonomous_youtube_script = manifest.get("youtube_script")
+        self.autonomous_music_tags = str(manifest.get("music_tags") or "")
+        self.autonomous_music_lyrics = str(manifest.get("music_lyrics") or "")
+        try:
+            saved_count = int(manifest.get("scene_count") or 0)
+        except (TypeError, ValueError):
+            saved_count = 0
+        if saved_count > 0:
+            self.autonomous_scene_count = saved_count
+        try:
+            saved_actual = float(manifest.get("actual_duration") or 0)
+        except (TypeError, ValueError):
+            saved_actual = 0.0
+        if saved_actual > 0:
+            self.autonomous_actual_duration = saved_actual
+
+        # Rebuild the image asset map, repairing registry entries from the
+        # stored file paths when the registry itself was lost to a crash.
+        asset_map = {}
+        for key, value in (manifest.get("image_asset_map") or {}).items():
+            try:
+                asset_map[int(key)] = value
+            except (TypeError, ValueError):
+                continue
+        for key, image_path in (manifest.get("image_asset_paths") or {}).items():
+            try:
+                index = int(key)
+            except (TypeError, ValueError):
+                continue
+            asset = self._get_image_asset_by_id(asset_map.get(index))
+            if asset and os.path.exists(asset.get("project_path", "")):
+                continue
+            if image_path and os.path.exists(image_path):
+                repaired = self._upsert_image_asset(image_path, source="generated")
+                if repaired:
+                    asset_map[index] = repaired.get("asset_id")
+
+        # Auto-discover any missing image assets from self.image_assets if the manifest map is incomplete
+        if self.current_project_dir:
+            project_token = self._sanitize_output_token(os.path.basename(self.current_project_dir), fallback="project")
+        else:
+            project_token = "project"
+        for index in range(1, saved_count + 1):
+            if index not in asset_map:
+                for asset in self.image_assets:
+                    if not asset or not os.path.exists(asset.get("project_path", "")):
+                        continue
+                    filename = os.path.basename(asset.get("project_path", ""))
+                    if not filename.startswith("z-image_"):
+                        continue
+                    match_token = f"z-image_{project_token}_{index:02d}_"
+                    fallback_token = f"z-image_project_{index:02d}_"
+                    generic_token = f"_{index:02d}_"
+                    if match_token in filename or fallback_token in filename or generic_token in filename:
+                        asset_map[index] = asset.get("asset_id")
+                        break
+
+        self.autonomous_image_asset_map = asset_map
+
+        # Repair duplicate output claims: when a run is interrupted mid-render,
+        # scenes whose download never completed can all point at the newest
+        # clip that did land (the "newest rendered media" heuristic
+        # mis-attributes it). Only the first claimant keeps the clip; the rest
+        # are demoted to pending so they re-render instead of duplicating a
+        # clip in the stitched video.
+        seen_outputs = set()
+        repaired_dupes = 0
+        for entry in self.scene_timeline or []:
+            output_key = os.path.normpath(entry.get("output_path") or "").lower()
+            if not output_key or output_key == ".":
+                continue
+            if output_key in seen_outputs:
+                entry["output_path"] = None
+                entry["render_status"] = "pending"
+                repaired_dupes += 1
+            else:
+                seen_outputs.add(output_key)
+        if repaired_dupes:
+            self.log_debug("AUTONOMOUS_RESUME_DUPLICATE_CLIPS_DEMOTED", count=repaired_dupes)
+
+        completed, notes = self._validate_autonomous_manifest(manifest)
+        self.autonomous_completed_phases = completed
+        self.autonomous_resume_active = True
+
+        # Rendered clip paths in timeline order (consumed by the stitcher).
+        rendered = []
+        for entry in self.scene_timeline or []:
+            output_path = entry.get("output_path") or ""
+            if entry.get("render_status") == "ready" and output_path and os.path.exists(output_path):
+                rendered.append(output_path)
+        self.autonomous_rendered_scene_paths = rendered
+
+        if AUTONOMOUS_STATE_STITCHING in completed:
+            self.selected_video_for_music = manifest.get("stitched_path") or getattr(self, "selected_video_for_music", None)
+        if AUTONOMOUS_STATE_GENERATING_MUSIC in completed:
+            self.current_generated_audio = manifest.get("music_path") or getattr(self, "current_generated_audio", None)
+
+        self.log_debug(
+            "AUTONOMOUS_RESUME",
+            completed_phases=",".join(sorted(completed)) or "none",
+            demoted="; ".join(notes) or "none",
+            rendered_clips=len(rendered),
+        )
+        return notes
+
+    def _describe_manifest_progress(self, manifest):
+        completed = set(manifest.get("completed_phases") or [])
+        done_labels = [AUTONOMOUS_PHASE_LABELS.get(p, p) for p in AUTONOMOUS_PHASE_ORDER if p in completed]
+        if done_labels:
+            summary = f"{len(done_labels)} of {len(AUTONOMOUS_PHASE_ORDER)} phases finished (last: {done_labels[-1]})"
+        else:
+            summary = "no phases finished yet"
+        when = str(manifest.get("updated_at") or "").replace("T", " ")
+        return f"{summary}, interrupted {when}" if when else summary
+
+    def _autonomous_refresh_resume_hint(self):
+        """Surface an interrupted autonomous run in the panel status labels
+        and update start button text when a project is loaded or state changes."""
+        manifest = self._load_autonomous_manifest()
+        has_resumable = manifest and manifest.get("status") in AUTONOMOUS_RESUMABLE_STATUSES
+        
+        # Determine button labels
+        start_text = "▶  Resume Generation" if has_resumable else "🚀  Start Generation"
+        yt_start_text = "▶  Resume Creation" if has_resumable else "🚀  Start Creation"
+        
+        if hasattr(self, "autonomous_start_btn"):
+            self.autonomous_start_btn.config(text=start_text)
+        if hasattr(self, "youtube_autonomous_start_btn"):
+            self.youtube_autonomous_start_btn.config(text=yt_start_text)
+            
+        if not has_resumable:
+            resume_hint_prefix = "Previous run was interrupted"
+            if hasattr(self, "autonomous_status_label"):
+                try:
+                    current_text = self.autonomous_status_label.cget("text")
+                    if current_text.startswith(resume_hint_prefix):
+                        self.autonomous_status_label.config(text="Ready. Enter brief and click Start.")
+                except Exception:
+                    pass
+            if hasattr(self, "youtube_autonomous_status_label"):
+                try:
+                    current_text = self.youtube_autonomous_status_label.cget("text")
+                    if current_text.startswith(resume_hint_prefix):
+                        self.youtube_autonomous_status_label.config(text="Ready. Enter brief and click Start.")
+                except Exception:
+                    pass
+            return
+
+        hint = "Previous run was interrupted — press Resume to continue, or Start Over to reset."
+        if hasattr(self, "autonomous_status_label"):
+            self.autonomous_status_label.config(text=hint)
+        if hasattr(self, "youtube_autonomous_status_label"):
+            self.youtube_autonomous_status_label.config(text=hint)
+        self.log_debug(
+            "AUTONOMOUS_RESUME_AVAILABLE",
+            status=manifest.get("status"),
+            updated_at=manifest.get("updated_at"),
+        )
+
+    def _autonomous_start_over(self, interactive=True):
+        """Delete every artifact of the previous autonomous run in the current
+        project (generated images, scenes, voiceovers, stitched/final videos,
+        generated music) so the next run starts from scratch. Keeps the brief,
+        the YouTube script, and imported media. Returns True once cleared."""
+        if getattr(self, "autonomous_active", False):
+            messagebox.showwarning("Autonomous Mode", "The pipeline is currently running. Cancel it before starting over.")
+            return False
+        project_dir = self.current_project_dir
+        if not project_dir:
+            messagebox.showwarning("Autonomous Mode", "No project is open.")
+            return False
+
+        def collect(directory, prefixes=None, recursive=False):
+            found = []
+            if not directory or not os.path.isdir(directory):
+                return found
+            if recursive:
+                for walk_root, _dirs, files in os.walk(directory):
+                    found.extend(os.path.join(walk_root, name) for name in files)
+                return found
+            for name in os.listdir(directory):
+                full = os.path.join(directory, name)
+                if not os.path.isfile(full):
+                    continue
+                if prefixes and not name.lower().startswith(prefixes):
+                    continue
+                found.append(full)
+            return found
+
+        doomed = {
+            "generated images": collect(getattr(self, "generated_image_dir", None)),
+            "video scenes": collect(getattr(self, "scenes_dir", None)),
+            "voiceovers": collect(os.path.join(project_dir, "voiceovers"), recursive=True),
+            "stitched videos": collect(getattr(self, "stitched_dir", None), prefixes=("final_master_render_", "concat_auto_")),
+            "generated music": collect(getattr(self, "audio_dir", None)),
+            "final videos": collect(getattr(self, "final_mv_dir", None), prefixes=("final_music_video_", "final_youtube_video_")),
+        }
+        if interactive:
+            lines = [f"  •  {label}: {len(files)} file(s)" for label, files in doomed.items() if files]
+            body = "\n".join(lines) if lines else "  (no generated files found — only saved progress will be reset)"
+            if not messagebox.askyesno(
+                "Start Over – Delete Generated Content?",
+                "This permanently deletes the autonomous run's generated content in this project:\n\n"
+                f"{body}\n\n"
+                "Your creative brief, YouTube script, and imported media are kept.\n\n"
+                "Delete and start over?"
+            ):
+                return False
+
+        deleted = 0
+        for files in doomed.values():
+            for file_path in files:
+                try:
+                    os.remove(file_path)
+                    deleted += 1
+                except OSError as exc:
+                    self.log_debug("AUTONOMOUS_START_OVER_DELETE_FAILED", path=file_path, error=str(exc))
+
+        # Drop registry entries and progress that pointed at deleted artifacts.
+        generated_dir = os.path.normpath(getattr(self, "generated_image_dir", "") or "")
+        if generated_dir:
+            generated_dir_lower = generated_dir.lower()
+            self.image_assets = [
+                asset for asset in (self.image_assets or [])
+                if not os.path.normpath(asset.get("project_path", "")).lower().startswith(generated_dir_lower)
+            ]
+        self.scene_timeline = []
+        self.autonomous_completed_phases = set()
+        self.autonomous_resume_active = False
+        self.autonomous_expanded_concept = ""
+        self.autonomous_scene_outline = []
+        self.autonomous_image_prompts = []
+        self.autonomous_video_prompts = []
+        self.autonomous_i2v_prompts = []
+        self.autonomous_voiceovers = []
+        self.autonomous_youtube_script = None
+        self.autonomous_image_asset_map = {}
+        self.autonomous_rendered_scene_paths = []
+        self._bg_voiceover_results = {}
+        self.current_generated_audio = None
+        self.selected_video_for_music = None
+        self.current_final_video = None
+        self._clear_autonomous_manifest()
+        self._autonomous_refresh_resume_hint()
+
+        self._autonomous_rebuild_timeline_ui()
+        self.refresh_gallery()
+        self.save_project_state()
+        self._update_autonomous_progress(AUTONOMOUS_STATE_IDLE, "Project reset — ready to start fresh.", 0.0)
+        self.update_status(f"Start over: deleted {deleted} generated file(s).", "orange")
+        self.log_debug("AUTONOMOUS_START_OVER", deleted_files=deleted)
+        return True
+
     def _autonomous_preflight(self):
         errors = []
-        if not self._is_comfyui_running():
+        if not self._is_comfyui_running(timeout=5.0, retries=1):
             launcher = self._normalize_path(self.comfyui_launcher_path) if self.comfyui_launcher_path else None
             if not launcher or not os.path.exists(launcher):
                 errors.append("ComfyUI launcher is not configured or does not exist. Use Project → Configure Runtime Paths.")
@@ -23502,6 +26509,10 @@ class LTXQueueManager:
             if not speaker:
                 speaker = "user"
             voice_file = os.path.normpath(os.path.join(vibevoice_dir, "demo", "voices", f"en-{speaker}_voice.wav"))
+            user_voice_file = os.path.normpath(os.path.join(self.user_voices_dir, f"en-{speaker}_voice.wav")) if hasattr(self, "user_voices_dir") else ""
+            if not os.path.exists(voice_file) and user_voice_file and os.path.exists(user_voice_file):
+                voice_file = user_voice_file
+                
             if not os.path.exists(voice_file):
                 ans = messagebox.askyesno(
                     "Voice Recording Required",
@@ -23534,6 +26545,21 @@ class LTXQueueManager:
             if target_dur <= 0:
                 messagebox.showwarning("Autonomous Mode", "Set a target duration greater than 0 seconds.")
                 return
+
+            # When the user wrote/edited a script in the Script Writer tab,
+            # the pipeline follows it — warn if it diverges from the target.
+            user_script = self._get_user_youtube_script()
+            if user_script:
+                est_speech = self._estimate_script_speech_seconds(user_script["segments"])
+                if est_speech > 0 and abs(est_speech - target_dur) > target_dur * 0.25:
+                    if not messagebox.askyesno(
+                        "Autonomous Mode",
+                        f"Your saved script contains about {est_speech:.0f} seconds of narration, "
+                        f"but the target duration is {target_dur} seconds.\n\n"
+                        f"The final video length follows the script, so it will run roughly {est_speech:.0f} seconds.\n\n"
+                        "Continue with your script?\n(Choose No to cancel, then edit the script or the target duration.)"
+                    ):
+                        return
         else:
             brief = self.autonomous_brief_text.get("1.0", tk.END).strip() if hasattr(self, "autonomous_brief_text") else ""
             if not brief and hasattr(self, "chatbot_briefing_text"):
@@ -23561,6 +26587,25 @@ class LTXQueueManager:
         if not self.ensure_chatbot_model_ready(interactive=True):
             return
 
+        # ── Interrupted-run detection: offer resume or start over ──
+        resume_manifest = None
+        prior_manifest = self._load_autonomous_manifest()
+        if prior_manifest and prior_manifest.get("status") in AUTONOMOUS_RESUMABLE_STATUSES:
+            current_fingerprint = self._autonomous_inputs_fingerprint(brief=brief, target_duration=target_dur)
+            if prior_manifest.get("fingerprint") == current_fingerprint:
+                resume_manifest = prior_manifest
+            else:
+                if not messagebox.askyesno(
+                    "Autonomous Mode – Settings Changed",
+                    "A previous autonomous run did not finish, but the brief, duration or aspect ratio has "
+                    "changed since, so it cannot be resumed.\n\n"
+                    "Start over from scratch? This deletes this project's generated images, scenes, "
+                    "voiceovers and videos from the interrupted run."
+                ):
+                    return
+                if not self._autonomous_start_over(interactive=False):
+                    return
+
         self.autonomous_active = True
         self.autonomous_cancel_requested = False
         self.autonomous_state = AUTONOMOUS_STATE_IDLE
@@ -23578,11 +26623,25 @@ class LTXQueueManager:
         self.autonomous_scene_count = scene_count
         self.autonomous_actual_duration = actual_dur
 
+        if resume_manifest is not None:
+            self._restore_autonomous_state_from_manifest(resume_manifest)
+        else:
+            self.autonomous_resume_active = False
+
         # Apply quality preset settings
         self._apply_autonomous_quality_preset()
 
         self._set_autonomous_ui_running(True)
-        self._update_autonomous_progress(AUTONOMOUS_STATE_EXPANDING_CONCEPT, "Starting autonomous pipeline...", 0.0)
+        if resume_manifest is not None:
+            done_count = len([p for p in AUTONOMOUS_PHASE_ORDER if p in self.autonomous_completed_phases])
+            self._update_autonomous_progress(
+                AUTONOMOUS_STATE_EXPANDING_CONCEPT,
+                f"Resuming pipeline — {done_count} of {len(AUTONOMOUS_PHASE_ORDER)} phases already complete...",
+                0.0,
+            )
+        else:
+            self._update_autonomous_progress(AUTONOMOUS_STATE_EXPANDING_CONCEPT, "Starting autonomous pipeline...", 0.0)
+        self._save_autonomous_manifest(status="running")
 
         thread = threading.Thread(target=self._run_autonomous_pipeline, daemon=True)
         thread.start()
@@ -23599,6 +26658,8 @@ class LTXQueueManager:
                     self.youtube_autonomous_start_btn.config(state=state)
                 if hasattr(self, "youtube_autonomous_cancel_btn"):
                     self.youtube_autonomous_cancel_btn.config(state=tk.NORMAL if is_running else tk.DISABLED)
+                if hasattr(self, "youtube_autonomous_startover_btn"):
+                    self.youtube_autonomous_startover_btn.config(state=state)
                 if hasattr(self, "youtube_autonomous_duration_entry"):
                     self.youtube_autonomous_duration_entry.config(state="readonly" if is_running else tk.NORMAL)
                 if hasattr(self, "youtube_autonomous_aspect_combo"):
@@ -23614,6 +26675,8 @@ class LTXQueueManager:
                     self.autonomous_start_btn.config(state=state)
                 if hasattr(self, "autonomous_cancel_btn"):
                     self.autonomous_cancel_btn.config(state=tk.NORMAL if is_running else tk.DISABLED)
+                if hasattr(self, "autonomous_startover_btn"):
+                    self.autonomous_startover_btn.config(state=state)
                 if hasattr(self, "autonomous_duration_entry"):
                     self.autonomous_duration_entry.config(state="readonly" if is_running else tk.NORMAL)
                 if hasattr(self, "autonomous_aspect_combo"):
@@ -23633,6 +26696,8 @@ class LTXQueueManager:
                 self.chatbot_generate_btn.config(state=state)
             if hasattr(self, "chatbot_finalize_song_btn"):
                 self.chatbot_finalize_song_btn.config(state=state)
+            if not is_running:
+                self._autonomous_refresh_resume_hint()
         self.root.after(0, apply)
 
     def _update_autonomous_progress(self, current_phase, message, phase_progress=0.0):
@@ -23717,21 +26782,59 @@ class LTXQueueManager:
 
             # ── Phase 1: Expand Concept ──
             self.autonomous_state = AUTONOMOUS_STATE_EXPANDING_CONCEPT
-            self._update_autonomous_progress(AUTONOMOUS_STATE_EXPANDING_CONCEPT, "Expanding creative concept...", 0.1)
+            if AUTONOMOUS_STATE_EXPANDING_CONCEPT in self.autonomous_completed_phases:
+                self._update_autonomous_progress(AUTONOMOUS_STATE_EXPANDING_CONCEPT, "Concept restored from interrupted run — skipping.", 1.0)
+            else:
+                self._update_autonomous_progress(AUTONOMOUS_STATE_EXPANDING_CONCEPT, "Expanding creative concept...", 0.1)
 
-            if self.autonomous_cancel_requested:
-                raise InterruptedError("Cancelled by user.")
-            concept_result = self._autonomous_expand_concept(brief)
-            if self.autonomous_cancel_requested:
-                raise InterruptedError("Cancelled by user.")
-            self.autonomous_completed_phases.add(AUTONOMOUS_STATE_EXPANDING_CONCEPT)
+                if self.autonomous_cancel_requested:
+                    raise InterruptedError("Cancelled by user.")
+                self._autonomous_expand_concept(brief)
+                if self.autonomous_cancel_requested:
+                    raise InterruptedError("Cancelled by user.")
+                self.autonomous_completed_phases.add(AUTONOMOUS_STATE_EXPANDING_CONCEPT)
+                self._save_autonomous_manifest()
 
-            if self.project_mode == "youtube":
+            planning_complete = (
+                AUTONOMOUS_STATE_PLANNING_SCENES in self.autonomous_completed_phases
+                and AUTONOMOUS_STATE_PLANNING_SONG in self.autonomous_completed_phases
+            )
+            if planning_complete:
+                self._update_autonomous_progress(AUTONOMOUS_STATE_PLANNING_SONG, "Script and scene plan restored — skipping planning.", 1.0)
+                scene_count = self.autonomous_scene_count
+            elif self.project_mode == "youtube":
                 # ── Phase 2 (YouTube): Write Script ──
                 self.autonomous_state = AUTONOMOUS_STATE_PLANNING_SCENES
                 self._update_autonomous_progress(AUTONOMOUS_STATE_PLANNING_SCENES, "Planning YouTube script...", 0.1)
-                
-                script_result = self._autonomous_plan_youtube_script(brief, scene_count=scene_count, target_duration=actual_duration)
+
+                user_script = self._get_user_youtube_script()
+                if user_script:
+                    # The user's script drives the plan: scene count and video
+                    # length follow the script, not the duration estimate.
+                    script_result = user_script
+                    scene_count = len(user_script["segments"])
+                    self.autonomous_scene_count = scene_count
+                    est_speech = self._estimate_script_speech_seconds(user_script["segments"])
+                    if est_speech > 0:
+                        try:
+                            intro_delay = float(self.ducking_intro_delay_var.get() or 2.0) if hasattr(self, "ducking_intro_delay_var") else 2.0
+                        except (tk.TclError, TypeError, ValueError):
+                            intro_delay = 2.0
+                        self.autonomous_actual_duration = round(est_speech + intro_delay, 2)
+                    self.autonomous_youtube_script = script_result
+                    self.autonomous_voiceovers = [str(seg.get("voiceover_text", "")).strip() for seg in user_script["segments"]]
+                    self._update_autonomous_progress(
+                        AUTONOMOUS_STATE_PLANNING_SCENES,
+                        f"Using your saved script ({scene_count} segments, ~{est_speech:.0f}s narration).",
+                        0.4,
+                    )
+                    self.log_debug(
+                        "AUTONOMOUS_USER_SCRIPT",
+                        segments=scene_count,
+                        estimated_speech_seconds=f"{est_speech:.1f}",
+                    )
+                else:
+                    script_result = self._autonomous_plan_youtube_script(brief, scene_count=scene_count, target_duration=actual_duration)
                 if self.autonomous_cancel_requested:
                     raise InterruptedError("Cancelled by user.")
                 
@@ -23788,19 +26891,16 @@ class LTXQueueManager:
                     raise InterruptedError("Cancelled by user.")
 
             # ── Phase 3c: Batch review + targeted regen (if quality preset enables it) ──
-            if getattr(self, "autonomous_quality_batch_review", False):
+            if not planning_complete and getattr(self, "autonomous_quality_batch_review", False):
                 self._update_autonomous_progress(AUTONOMOUS_STATE_PLANNING_SCENES, "Reviewing prompt batch...", 0.95)
                 if self.autonomous_cancel_requested:
                     raise InterruptedError("Cancelled by user.")
                 self._autonomous_batch_review_and_regen()
+            if not planning_complete:
+                self._save_autonomous_manifest()
 
             # ── Unload LLM to free VRAM for ComfyUI ──
             self._unload_chatbot_model()
-
-            # ── Launch ComfyUI just-in-time (deferred from pipeline start) ──
-            if not self._is_comfyui_running():
-                self._update_autonomous_progress(AUTONOMOUS_STATE_GENERATING_IMAGES, "Launching ComfyUI...", 0.0)
-                self._autonomous_launch_and_wait_for_comfyui()
 
             # ═══════════════════════════════════════════════════════════════
             # IMAGE BLOCK — ComfyUI renders all images with models staying
@@ -23809,19 +26909,35 @@ class LTXQueueManager:
 
             # ── Phase 4: Generate Images (pure ComfyUI, no LLM) ──
             self.autonomous_state = AUTONOMOUS_STATE_GENERATING_IMAGES
-            self._update_autonomous_progress(AUTONOMOUS_STATE_GENERATING_IMAGES, "Rendering scene images...", 0.0)
+            if AUTONOMOUS_STATE_GENERATING_IMAGES in self.autonomous_completed_phases:
+                self._update_autonomous_progress(AUTONOMOUS_STATE_GENERATING_IMAGES, "Start frames restored from interrupted run — skipping.", 1.0)
+            else:
+                # ── Launch ComfyUI just-in-time (deferred from pipeline start) ──
+                if not self._is_comfyui_running(timeout=5.0, retries=1):
+                    self._update_autonomous_progress(AUTONOMOUS_STATE_GENERATING_IMAGES, "Launching ComfyUI...", 0.0)
+                    self._autonomous_launch_and_wait_for_comfyui()
 
-            if self.autonomous_cancel_requested:
-                raise InterruptedError("Cancelled by user.")
-            images_ok = self._autonomous_generate_images()
-            if self.autonomous_cancel_requested:
-                raise InterruptedError("Cancelled by user.")
-            if not images_ok:
-                raise RuntimeError("Image generation failed — no images were produced.")
-            self.autonomous_completed_phases.add(AUTONOMOUS_STATE_GENERATING_IMAGES)
+                self._update_autonomous_progress(AUTONOMOUS_STATE_GENERATING_IMAGES, "Rendering scene images...", 0.0)
 
-            # ── Free image models so video models can load cleanly ──
-            self._free_comfyui_vram()
+                if self.autonomous_cancel_requested:
+                    raise InterruptedError("Cancelled by user.")
+                images_ok = self._autonomous_generate_images()
+                if self.autonomous_cancel_requested:
+                    raise InterruptedError("Cancelled by user.")
+                if not images_ok:
+                    raise RuntimeError("Image generation failed — no images were produced.")
+
+                # Run autonomous QA review and regenerate images if quality is enabled
+                if getattr(self, "autonomous_quality_min_confidence", 0) > 0:
+                    self.update_status("[Autonomous] Quality assurance is enabled. Starting visual QA review of generated images...", "blue")
+                    self._autonomous_review_and_regenerate_images()
+                    self._unload_chatbot_model()  # Ensure LLM is unloaded after review
+
+                self.autonomous_completed_phases.add(AUTONOMOUS_STATE_GENERATING_IMAGES)
+                self._save_autonomous_manifest()
+
+                # ── Free image models so video models can load cleanly ──
+                self._free_comfyui_vram()
 
             # ═══════════════════════════════════════════════════════════════
             # VIDEO BLOCK — Build timeline from images, then render all
@@ -23830,50 +26946,83 @@ class LTXQueueManager:
 
             # ── Phase 5: Build I2V Timeline ──
             self.autonomous_state = AUTONOMOUS_STATE_BUILDING_TIMELINE
-            self._update_autonomous_progress(AUTONOMOUS_STATE_BUILDING_TIMELINE, "Building I2V scene timeline...", 0.5)
-
-            if self.autonomous_cancel_requested:
-                raise InterruptedError("Cancelled by user.")
-            self._autonomous_build_i2v_timeline()
-            rebuild_done = threading.Event()
-            self.root.after(0, lambda: (self._autonomous_rebuild_timeline_ui(), rebuild_done.set()))
-            rebuild_done.wait()
-            self.autonomous_completed_phases.add(AUTONOMOUS_STATE_BUILDING_TIMELINE)
-
-            # ── Phase 5b (YouTube): Generate Voiceovers ──
-            if self.project_mode == "youtube":
-                self._update_autonomous_progress(AUTONOMOUS_STATE_BUILDING_TIMELINE, "Synthesizing voiceovers with VibeVoice...", 0.8)
-                if self.autonomous_cancel_requested:
-                    raise InterruptedError("Cancelled by user.")
-                self._autonomous_generate_voiceovers()
-                # Rebuild UI again to display correct voiceover audios and durations
+            if AUTONOMOUS_STATE_BUILDING_TIMELINE in self.autonomous_completed_phases and self.scene_timeline:
+                self._update_autonomous_progress(AUTONOMOUS_STATE_BUILDING_TIMELINE, "Scene timeline restored — skipping rebuild.", 1.0)
                 rebuild_done = threading.Event()
                 self.root.after(0, lambda: (self._autonomous_rebuild_timeline_ui(), rebuild_done.set()))
                 rebuild_done.wait()
+            else:
+                self._update_autonomous_progress(AUTONOMOUS_STATE_BUILDING_TIMELINE, "Building I2V scene timeline...", 0.5)
+
+                if self.autonomous_cancel_requested:
+                    raise InterruptedError("Cancelled by user.")
+                self._autonomous_build_i2v_timeline()
+                rebuild_done = threading.Event()
+                self.root.after(0, lambda: (self._autonomous_rebuild_timeline_ui(), rebuild_done.set()))
+                rebuild_done.wait()
+                self.autonomous_completed_phases.add(AUTONOMOUS_STATE_BUILDING_TIMELINE)
+                self._save_autonomous_manifest()
+
+            # ── Phase 5b (YouTube): Generate Voiceovers ──
+            if self.project_mode == "youtube":
+                if AUTONOMOUS_VOICEOVERS_DONE in self.autonomous_completed_phases:
+                    self._update_autonomous_progress(AUTONOMOUS_STATE_BUILDING_TIMELINE, "Voiceovers restored from interrupted run — skipping.", 1.0)
+                else:
+                    self._update_autonomous_progress(AUTONOMOUS_STATE_BUILDING_TIMELINE, "Synthesizing voiceovers with VibeVoice...", 0.8)
+                    if self.autonomous_cancel_requested:
+                        raise InterruptedError("Cancelled by user.")
+                    self._autonomous_generate_voiceovers()
+                    # Rebuild UI again to display correct voiceover audios and durations
+                    rebuild_done = threading.Event()
+                    self.root.after(0, lambda: (self._autonomous_rebuild_timeline_ui(), rebuild_done.set()))
+                    rebuild_done.wait()
+                    self.autonomous_completed_phases.add(AUTONOMOUS_VOICEOVERS_DONE)
+                    self._save_autonomous_manifest()
+                    # Persist voiceover audio paths into project_data.json so a
+                    # later resume can validate them.
+                    self.root.after(0, self.save_project_state)
 
             # ── Phase 6: Render All Scenes (pure ComfyUI, no LLM) ──
             self.autonomous_state = AUTONOMOUS_STATE_RENDERING
-            self._update_autonomous_progress(AUTONOMOUS_STATE_RENDERING, "Rendering video scenes...", 0.0)
+            if AUTONOMOUS_STATE_RENDERING in self.autonomous_completed_phases:
+                self._update_autonomous_progress(AUTONOMOUS_STATE_RENDERING, "Rendered scenes restored from interrupted run — skipping.", 1.0)
+            else:
+                self._update_autonomous_progress(AUTONOMOUS_STATE_RENDERING, "Rendering video scenes...", 0.0)
 
-            if self.autonomous_cancel_requested:
-                raise InterruptedError("Cancelled by user.")
-            render_ok = self._autonomous_render_scenes()
-            if self.autonomous_cancel_requested:
-                raise InterruptedError("Cancelled by user.")
-            if not render_ok:
-                raise RuntimeError("Scene rendering failed or produced no output files.")
-            self.autonomous_completed_phases.add(AUTONOMOUS_STATE_RENDERING)
+                if self.autonomous_cancel_requested:
+                    raise InterruptedError("Cancelled by user.")
+                # ComfyUI is stopped for the voiceover phase (and may also have
+                # died under memory pressure) — verify it is reachable and
+                # relaunch if not.
+                if not self._is_comfyui_running(timeout=5.0, retries=1):
+                    self._update_autonomous_progress(AUTONOMOUS_STATE_RENDERING, "ComfyUI is not running — relaunching...", 0.0)
+                    self._autonomous_launch_and_wait_for_comfyui()
+                render_ok = self._autonomous_render_scenes()
+                if self.autonomous_cancel_requested:
+                    raise InterruptedError("Cancelled by user.")
+                if not render_ok:
+                    raise RuntimeError("Scene rendering failed or produced no output files.")
+                self.autonomous_completed_phases.add(AUTONOMOUS_STATE_RENDERING)
+                self._save_autonomous_manifest()
 
             # ── Phase 7: Stitch ──
             self.autonomous_state = AUTONOMOUS_STATE_STITCHING
-            self._update_autonomous_progress(AUTONOMOUS_STATE_STITCHING, "Stitching rendered clips...", 0.1)
+            stitched_path = getattr(self, "selected_video_for_music", None)
+            if (
+                AUTONOMOUS_STATE_STITCHING in self.autonomous_completed_phases
+                and stitched_path and os.path.exists(stitched_path)
+            ):
+                self._update_autonomous_progress(AUTONOMOUS_STATE_STITCHING, "Stitched video restored from interrupted run — skipping.", 1.0)
+            else:
+                self._update_autonomous_progress(AUTONOMOUS_STATE_STITCHING, "Stitching rendered clips...", 0.1)
 
-            if self.autonomous_cancel_requested:
-                raise InterruptedError("Cancelled by user.")
-            stitch_ok = self._autonomous_stitch_scenes()
-            if not stitch_ok:
-                raise RuntimeError("Stitching failed — no stitched video was produced.")
-            self.autonomous_completed_phases.add(AUTONOMOUS_STATE_STITCHING)
+                if self.autonomous_cancel_requested:
+                    raise InterruptedError("Cancelled by user.")
+                stitch_ok = self._autonomous_stitch_scenes()
+                if not stitch_ok:
+                    raise RuntimeError("Stitching failed — no stitched video was produced.")
+                self.autonomous_completed_phases.add(AUTONOMOUS_STATE_STITCHING)
+                self._save_autonomous_manifest()
 
             # ── Free video models before music generation ──
             self._free_comfyui_vram()
@@ -23887,16 +27036,27 @@ class LTXQueueManager:
 
             # ── Phase 8: Generate Music ──
             self.autonomous_state = AUTONOMOUS_STATE_GENERATING_MUSIC
-            self._update_autonomous_progress(AUTONOMOUS_STATE_GENERATING_MUSIC, "Generating soundtrack...", 0.1)
+            music_path = getattr(self, "current_generated_audio", None)
+            if (
+                AUTONOMOUS_STATE_GENERATING_MUSIC in self.autonomous_completed_phases
+                and music_path and os.path.exists(music_path)
+            ):
+                self._update_autonomous_progress(AUTONOMOUS_STATE_GENERATING_MUSIC, "Soundtrack restored from interrupted run — skipping.", 1.0)
+            else:
+                self._update_autonomous_progress(AUTONOMOUS_STATE_GENERATING_MUSIC, "Generating soundtrack...", 0.1)
 
-            if self.autonomous_cancel_requested:
-                raise InterruptedError("Cancelled by user.")
-            music_ok = self._autonomous_generate_music()
-            if self.autonomous_cancel_requested:
-                raise InterruptedError("Cancelled by user.")
-            if not music_ok:
-                raise RuntimeError("Music generation failed — no audio was produced.")
-            self.autonomous_completed_phases.add(AUTONOMOUS_STATE_GENERATING_MUSIC)
+                if self.autonomous_cancel_requested:
+                    raise InterruptedError("Cancelled by user.")
+                if not self._is_comfyui_running(timeout=5.0, retries=1):
+                    self._update_autonomous_progress(AUTONOMOUS_STATE_GENERATING_MUSIC, "ComfyUI is not running — relaunching...", 0.1)
+                    self._autonomous_launch_and_wait_for_comfyui()
+                music_ok = self._autonomous_generate_music()
+                if self.autonomous_cancel_requested:
+                    raise InterruptedError("Cancelled by user.")
+                if not music_ok:
+                    raise RuntimeError("Music generation failed — no audio was produced.")
+                self.autonomous_completed_phases.add(AUTONOMOUS_STATE_GENERATING_MUSIC)
+                self._save_autonomous_manifest()
 
             # ── Phase 9: Final Merge ──
             self.autonomous_state = AUTONOMOUS_STATE_MERGING
@@ -23909,6 +27069,8 @@ class LTXQueueManager:
 
             # ── Complete ──
             self.autonomous_state = AUTONOMOUS_STATE_COMPLETE
+            self.autonomous_resume_active = False
+            self._save_autonomous_manifest(status="complete")
             self._update_autonomous_progress(AUTONOMOUS_STATE_MERGING, "Autonomous music video complete!", 1.0)
             self.root.after(0, lambda: self.update_status("Autonomous music video pipeline complete!", "green"))
             self.root.after(0, self.refresh_gallery)
@@ -23918,14 +27080,20 @@ class LTXQueueManager:
 
         except InterruptedError:
             self.autonomous_state = AUTONOMOUS_STATE_FAILED
-            self._update_autonomous_progress(self.autonomous_state, "Pipeline cancelled by user.", 0.0)
-            self.root.after(0, lambda: self.update_status("Autonomous pipeline cancelled.", "orange"))
+            self._save_autonomous_manifest(status="cancelled")
+            self._update_autonomous_progress(self.autonomous_state, "Pipeline cancelled — press Start later to resume where it left off.", 0.0)
+            self.root.after(0, lambda: self.update_status("Autonomous pipeline cancelled. Progress was saved for resume.", "orange"))
         except Exception as exc:
             self.autonomous_state = AUTONOMOUS_STATE_FAILED
             error_msg = str(exc)
+            self._save_autonomous_manifest(status="failed", error=error_msg)
             self._update_autonomous_progress(self.autonomous_state, f"Pipeline failed: {error_msg[:120]}", 0.0)
             self.root.after(0, lambda: self.update_status(f"Autonomous pipeline failed: {error_msg[:120]}", "red"))
-            self.root.after(0, lambda: messagebox.showerror("Autonomous Mode", f"Pipeline failed:\n\n{error_msg}"))
+            self.root.after(0, lambda: messagebox.showerror(
+                "Autonomous Mode",
+                f"Pipeline failed:\n\n{error_msg}\n\n"
+                "Progress was saved — press Start again later to resume from this point."
+            ))
         finally:
             self.autonomous_active = False
             self._set_autonomous_ui_running(False)
@@ -23935,20 +27103,51 @@ class LTXQueueManager:
 
     def _autonomous_launch_and_wait_for_comfyui(self):
         """Asynchronously triggers ComfyUI launch and blocks the worker thread until port 8188 is ready."""
+        # Probe generously before concluding the server is gone: a busy or
+        # swapping ComfyUI can miss several 10 s windows while still alive,
+        # and killing a healthy-but-slow server costs a full model reload.
+        if self._is_comfyui_running(timeout=10.0, retries=3):
+            self.comfyui_ready = True
+            self.root.after(0, lambda: self._update_comfyui_banner("ready", "✅ ComfyUI is ready"))
+            return
+        # A wedged ComfyUI can keep port 8188 bound while no longer answering
+        # HTTP; a second instance launched next to it dies at bind with
+        # WinError 10048. Reap the stale owner before launching.
+        if self._is_port_8188_bound():
+            self._update_autonomous_progress(self.autonomous_state, "ComfyUI is unresponsive — stopping the stale instance...", 0.0)
+            if not self._stop_comfyui_process(reason="stale before autonomous relaunch"):
+                # The console may have been launched hidden — surface it so the
+                # window the user is asked to close is actually on screen.
+                self.root.after(0, lambda: self._set_comfyui_terminal_visibility(True))
+                raise RuntimeError(
+                    "Port 8188 is held by an unresponsive process that could not be terminated. "
+                    "Its console window has been made visible if one was found — close it manually "
+                    "(or end the ComfyUI process in Task Manager), then restart the pipeline."
+                )
         self.root.after(0, self.launch_comfyui)
-        
+
         start_time = time.time()
-        timeout = 180  # 3 minutes maximum timeout
+        timeout = 300  # 5 minutes maximum timeout
+        port_was_bound = False
         while time.time() - start_time < timeout:
             if self.autonomous_cancel_requested:
                 raise InterruptedError("Cancelled by user.")
-            if self._is_comfyui_running():
+            if self._is_comfyui_running(timeout=5.0):
                 self.comfyui_ready = True
                 self.root.after(0, lambda: self._update_comfyui_banner("ready", "✅ ComfyUI is ready"))
                 return
+            port_was_bound = port_was_bound or self._is_port_8188_bound()
             time.sleep(2)
-            
-        raise RuntimeError("ComfyUI launch timed out. Make sure it is configured correctly in Configure Runtime Paths.")
+
+        if port_was_bound:
+            raise RuntimeError(
+                "ComfyUI launch timed out: port 8188 opened but the server never answered. "
+                "The machine may be low on memory — close other applications and retry."
+            )
+        raise RuntimeError(
+            "ComfyUI launch timed out: port 8188 never opened. "
+            "Make sure the launcher is configured correctly in Configure Runtime Paths."
+        )
 
     def _log_ollama_tuning_recommendations(self):
         """Log performance tuning tips for Ollama users."""
@@ -24042,6 +27241,77 @@ class LTXQueueManager:
         except Exception as exc:
             self.log_debug("COMFYUI_VRAM_FREE_FAILED", error=str(exc))
 
+    @staticmethod
+    def _count_voiceover_words(text):
+        return len(str(text or "").split())
+
+    @staticmethod
+    def _truncate_voiceover_to_word_budget(text, max_words):
+        """Trim narration to at most max_words, cutting at a sentence boundary when possible."""
+        text = str(text or "").strip()
+        words = text.split()
+        if len(words) <= max_words:
+            return text
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        kept = []
+        total = 0
+        for sentence in sentences:
+            n = len(sentence.split())
+            if kept and total + n > max_words:
+                break
+            kept.append(sentence)
+            total += n
+            if total >= max_words:
+                break
+        result = " ".join(kept).strip()
+        result_words = result.split()
+        if len(result_words) > max_words:
+            result = " ".join(result_words[:max_words]).rstrip(",;:- ") + "."
+        return result
+
+    def _youtube_script_word_budget(self, scene_count, target_duration):
+        """Return (seconds_per_segment, words_per_segment) for a duration-budgeted
+        script, or (0.0, 0) when no duration constraint applies.
+
+        The final video length equals the sum of narration durations plus the
+        intro delay (loop pacing stretches each clip to its narration), so the
+        script itself must be written to fit target_duration."""
+        if not target_duration or target_duration <= 0 or not scene_count:
+            return 0.0, 0
+        try:
+            intro_delay = float(self.ducking_intro_delay_var.get() or 2.0) if hasattr(self, "ducking_intro_delay_var") else 2.0
+        except (tk.TclError, TypeError, ValueError):
+            intro_delay = 2.0
+        # Never let the budget collapse below ~2 seconds of speech per segment.
+        speech_budget = max(float(target_duration) - intro_delay, scene_count * 2.0)
+        seconds_per_segment = speech_budget / scene_count
+        words_per_segment = max(6, int(round(seconds_per_segment * YOUTUBE_SPEECH_WORDS_PER_SECOND)))
+        return seconds_per_segment, words_per_segment
+
+    def _get_user_youtube_script(self):
+        """Return the project's user-edited YouTube script (normalized, with a
+        'task' key so it is interchangeable with LLM script results), or None
+        when the user has not written/edited a script for this project."""
+        state = getattr(self, "youtube_script_state", None)
+        if not isinstance(state, dict) or not state.get("user_edited"):
+            return None
+        normalized = self._normalize_youtube_script_state(state)
+        segments = [seg for seg in normalized["segments"] if seg.get("voiceover_text")]
+        if not segments:
+            return None
+        for i, seg in enumerate(segments, start=1):
+            seg["segment_number"] = i
+        normalized["segments"] = segments
+        normalized["task"] = "youtube_script"
+        return normalized
+
+    def _estimate_script_speech_seconds(self, segments):
+        total_words = sum(
+            self._count_voiceover_words(seg.get("voiceover_text"))
+            for seg in (segments or []) if isinstance(seg, dict)
+        )
+        return total_words / YOUTUBE_SPEECH_WORDS_PER_SECOND if total_words else 0.0
+
     def _autonomous_plan_youtube_script(self, brief, scene_count=None, target_duration=None):
         backend_result = self._ensure_chatbot_backend_ready_for_use(action_label="autonomous youtube script")
         if not backend_result.get("ok"):
@@ -24050,6 +27320,16 @@ class LTXQueueManager:
 
         if scene_count is None:
             scene_count = 6
+
+        seconds_per_segment, words_per_segment = self._youtube_script_word_budget(scene_count, target_duration)
+        if words_per_segment:
+            self.log_debug(
+                "YOUTUBE_SCRIPT_BUDGET",
+                target_duration=target_duration,
+                scene_count=scene_count,
+                seconds_per_segment=f"{seconds_per_segment:.1f}",
+                words_per_segment=words_per_segment,
+            )
 
         all_segments = []
         batch_size = 10
@@ -24071,7 +27351,15 @@ class LTXQueueManager:
                 f"CRITICAL CONSTRAINT: You are generating the script in chunks. You MUST generate exactly the segments from segment {start_seg} to segment {end_seg} (inclusive).\n"
                 f"Do not write more than {end_seg - start_seg + 1} segments in this response."
             )
-            
+
+            if words_per_segment:
+                augmented_brief += (
+                    f"\n\nPACING CONSTRAINT: The finished video must be about {float(target_duration):.0f} seconds long in total, "
+                    f"across {scene_count} segments. Each segment's voiceover will be spoken aloud and must fit in "
+                    f"roughly {seconds_per_segment:.1f} seconds of speech. That means each segment's voiceover_text "
+                    f"must be at most {words_per_segment} words. This is a hard limit. Write short, punchy sentences."
+                )
+
             if batch_idx > 0:
                 context_segs = all_segments[-3:]
                 augmented_brief += (
@@ -24083,13 +27371,14 @@ class LTXQueueManager:
                     f"Please continue writing seamlessly starting from segment {start_seg}."
                 )
 
-            # Per-batch retry: allow one automatic retry before propagating the error.
+            # Per-batch retry: allow one automatic retry before propagating the
+            # error, and one retry when the draft blows past the word budget.
             batch_last_error = None
             result = None
+            request_brief = augmented_brief
             for attempt in range(2):
                 try:
-                    result = self._request_chatbot_structured_output(CHATBOT_TASK_YOUTUBE_SCRIPT, augmented_brief, keep_alive="30m")
-                    break
+                    result = self._request_chatbot_structured_output(CHATBOT_TASK_YOUTUBE_SCRIPT, request_brief, keep_alive="30m")
                 except Exception as batch_exc:
                     batch_last_error = batch_exc
                     self.log_debug(
@@ -24102,7 +27391,28 @@ class LTXQueueManager:
                     if attempt >= 1:
                         raise
                     continue
-            
+
+                if not words_per_segment or attempt >= 1:
+                    break
+                word_limit = words_per_segment * YOUTUBE_SEGMENT_WORD_TOLERANCE
+                over_budget = [
+                    seg for seg in (result.get("segments") or [])
+                    if isinstance(seg, dict) and self._count_voiceover_words(seg.get("voiceover_text")) > word_limit
+                ]
+                if not over_budget:
+                    break
+                self.log_debug(
+                    "CHATBOT_BATCH_RETRY",
+                    task="youtube_script",
+                    batch=batch_idx + 1,
+                    attempt=attempt + 1,
+                    error=f"{len(over_budget)} segment(s) over the {words_per_segment}-word budget",
+                )
+                request_brief = augmented_brief + (
+                    f"\n\nYOUR PREVIOUS DRAFT WAS TOO WORDY. Rewrite it so no segment's voiceover_text "
+                    f"exceeds {words_per_segment} words. Cut ruthlessly; keep only the essential message."
+                )
+
             if batch_idx == 0:
                 title = str(result.get("title") or "").strip()
                 intro = str(result.get("intro") or "").strip()
@@ -24113,6 +27423,18 @@ class LTXQueueManager:
             
             for idx, seg in enumerate(segments):
                 seg["segment_number"] = start_seg + idx
+                # Last-resort enforcement: trim any segment that still exceeds
+                # the word budget after the retry, at a sentence boundary.
+                if words_per_segment and isinstance(seg, dict):
+                    vo_text = str(seg.get("voiceover_text") or "")
+                    if self._count_voiceover_words(vo_text) > words_per_segment * YOUTUBE_SEGMENT_WORD_TOLERANCE:
+                        seg["voiceover_text"] = self._truncate_voiceover_to_word_budget(vo_text, words_per_segment)
+                        self.log_debug(
+                            "YOUTUBE_SCRIPT_TRUNCATED",
+                            segment=seg["segment_number"],
+                            original_words=self._count_voiceover_words(vo_text),
+                            budget=words_per_segment,
+                        )
                 all_segments.append(seg)
                 
             if len(all_segments) >= scene_count:
@@ -24128,6 +27450,7 @@ class LTXQueueManager:
         
         self.autonomous_youtube_script = final_result
         self.autonomous_voiceovers = [str(seg.get("voiceover_text", "")).strip() for seg in all_segments]
+        self._store_youtube_script(final_result, source="auto", user_edited=False)
         
         conversation_id = self._ensure_active_chatbot_conversation()
         self._append_chatbot_turn("user", f"[Autonomous] Write YouTube Script ({scene_count} segments)", kind="chat", conversation_id=conversation_id)
@@ -24248,59 +27571,127 @@ class LTXQueueManager:
         temp_dir = os.path.join(vo_dir, "temp")
         os.makedirs(temp_dir, exist_ok=True)
 
+        self.root.after(0, lambda: self.update_status("[Autonomous] Freeing ComfyUI VRAM...", "blue"))
+        self._free_comfyui_vram()
+
+        self._ensure_vibevoice_model_ready(
+            status_callback=lambda text: self.root.after(
+                0, lambda t=text: self.update_status(f"[Autonomous] {t}", "blue")
+            )
+        )
+
+        # Never run two VibeVoice processes at once: wait for the background
+        # CPU synthesis thread to finish before synthesizing anything here.
+        # Concurrent VibeVoice runs exhaust system RAM (ComfyUI pins ~14 GB)
+        # and have crashed the ComfyUI process mid-pipeline.
+        bg_thread = getattr(self, "_voiceover_gen_thread", None)
+        if bg_thread and bg_thread.is_alive():
+            self.root.after(0, lambda: self.update_status("[Autonomous] Waiting for background voiceover synthesis to finish...", "blue"))
+            while bg_thread.is_alive():
+                if self.autonomous_cancel_requested:
+                    raise InterruptedError("Cancelled by user.")
+                bg_thread.join(timeout=2.0)
+
+        bg_results = getattr(self, "_bg_voiceover_results", {}) or {}
+        comfyui_stopped_for_synthesis = False
+
         for idx, sc in enumerate(self.scene_timeline, start=1):
             vo_text = str(sc.get("voiceover", "")).strip()
             if not vo_text:
                 continue
 
             temp_txt_name = f"segment_{idx}_{sc['scene_id']}.txt"
-            temp_txt_path = os.path.join(temp_dir, temp_txt_name)
-            with open(temp_txt_path, "w", encoding="utf-8") as f:
-                f.write(f"Speaker 1: {vo_text}\n")
-
-            python_exe = self.vibevoice_python_var.get()
-            vibevoice_dir = self._get_vibevoice_dir()
-            
-            device = "cuda" if self._is_vibevoice_cuda_available() else "cpu"
-            
-            cmd = [
-                python_exe,
-                os.path.join(vibevoice_dir, "demo", "inference_from_file.py"),
-                "--model_path", "microsoft/VibeVoice-1.5b",
-                "--txt_path", temp_txt_path,
-                "--speaker_names", self.vibevoice_speaker_var.get(),
-                "--output_dir", vo_dir,
-                "--device", device
-            ]
-            
-            print(f"[VIBEVOICE] Running cmd: {' '.join(cmd)}")
-            self.root.after(0, lambda i=idx: self.update_status(f"[Autonomous] Synthesizing voiceover segment {i}/{len(self.scene_timeline)}...", "blue"))
-
-            result = subprocess.run(
-                cmd,
-                cwd=vibevoice_dir,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-                capture_output=True,
-                text=True,
-                check=False
-            )
-            
-            if result.returncode != 0:
-                raise RuntimeError(f"VibeVoice synthesis failed for segment {idx}. Stderr:\n{result.stderr}")
-
             txt_filename = os.path.splitext(temp_txt_name)[0]
             expected_wav_path = os.path.normpath(os.path.join(vo_dir, f"{txt_filename}_generated.wav"))
-            
-            if not os.path.exists(expected_wav_path):
-                raise FileNotFoundError(f"Generated WAV file not found at {expected_wav_path}")
+
+            # Reuse audio already produced by the background thread (or a
+            # previous attempt) instead of synthesizing the segment twice.
+            existing_wav = None
+            bg_path = bg_results.get(sc.get("scene_id"))
+            if bg_path and os.path.exists(bg_path):
+                existing_wav = bg_path
+            elif os.path.exists(expected_wav_path):
+                existing_wav = expected_wav_path
+
+            if existing_wav:
+                expected_wav_path = existing_wav
+                self.root.after(0, lambda i=idx: self.update_status(f"[Autonomous] Reusing pre-generated voiceover segment {i}/{len(self.scene_timeline)}.", "blue"))
+            else:
+                # ComfyUI pins ~14 GB of system RAM; CPU VibeVoice synthesis
+                # next to it swaps the machine hard enough to wedge ComfyUI
+                # while it still holds port 8188. Stop it outright — phase 6
+                # relaunches it before rendering.
+                if not comfyui_stopped_for_synthesis:
+                    self.root.after(0, lambda: self.update_status("[Autonomous] Stopping ComfyUI to free RAM for voiceover synthesis...", "blue"))
+                    self._stop_comfyui_process(reason="free RAM for VibeVoice synthesis")
+                    comfyui_stopped_for_synthesis = True
+
+                temp_txt_path = os.path.join(temp_dir, temp_txt_name)
+                with open(temp_txt_path, "w", encoding="utf-8") as f:
+                    f.write(f"Speaker 1: {vo_text}\n")
+
+                # CPU only: a CUDA VibeVoice run next to ComfyUI's live CUDA
+                # context has crashed ComfyUI (c10.dll access violation).
+                device = "cpu"
+
+                self.root.after(0, lambda i=idx: self.update_status(f"[Autonomous] Synthesizing voiceover segment {i}/{len(self.scene_timeline)}...", "blue"))
+
+                result = self._run_vibevoice_inference(temp_txt_path, vo_dir, device)
+
+                if result.returncode != 0:
+                    raise RuntimeError(f"VibeVoice synthesis failed for segment {idx}. Stderr:\n{result.stderr}")
+
+                if not os.path.exists(expected_wav_path):
+                    raise FileNotFoundError(f"Generated WAV file not found at {expected_wav_path}")
 
             duration = self._probe_clip_duration(expected_wav_path)
-            
+
             sc["voiceover_audio_path"] = expected_wav_path
             sc["audio_duration"] = duration
-            
+
             if self.visual_pacing_var.get() == "loop":
                 sc["duration"] = duration
+
+        self._reconcile_voiceover_durations()
+
+    def _reconcile_voiceover_durations(self):
+        """Compare measured narration length against the requested video length
+        after synthesis, update the projected video duration, and warn when the
+        script overran its budget."""
+        total_speech = sum(
+            float(sc.get("audio_duration") or 0.0)
+            for sc in self.scene_timeline if isinstance(sc, dict)
+        )
+        if total_speech <= 0:
+            return
+        try:
+            intro_delay = float(self.ducking_intro_delay_var.get() or 2.0) if hasattr(self, "ducking_intro_delay_var") else 2.0
+        except (tk.TclError, TypeError, ValueError):
+            intro_delay = 2.0
+        projected = round(total_speech + intro_delay, 2)
+        target = float(getattr(self, "autonomous_target_duration", 0) or 0)
+        total_words = sum(
+            self._count_voiceover_words(sc.get("voiceover"))
+            for sc in self.scene_timeline if isinstance(sc, dict)
+        )
+        measured_wps = (total_words / total_speech) if total_words else 0.0
+        self.log_debug(
+            "VOICEOVER_DURATION_RECONCILE",
+            narration_seconds=f"{total_speech:.1f}",
+            projected_video_seconds=f"{projected:.1f}",
+            target_seconds=f"{target:.0f}",
+            measured_words_per_second=f"{measured_wps:.2f}",
+        )
+        self.autonomous_actual_duration = projected
+
+        msg = f"Narration synthesized: {total_speech:.1f}s → video will run ~{projected:.0f}s"
+        color = "blue"
+        if target > 0:
+            msg += f" (target {target:.0f}s)"
+            if projected > target * 1.25:
+                msg += " — narration overran the budget; the video will be noticeably longer than requested"
+                color = "orange"
+        self.root.after(0, lambda m=msg, c=color: self.update_status(f"[Autonomous] {m}", c))
 
     def _start_background_voiceover_generation(self):
         self._bg_voiceover_results = {}
@@ -24344,33 +27735,11 @@ class LTXQueueManager:
                 print(f"[BG-VIBEVOICE] Error writing temp text: {e}")
                 continue
 
-            python_exe = self.vibevoice_python_var.get()
-            vibevoice_dir = self._get_vibevoice_dir()
-            
             # Force CPU to avoid CUDA conflicts with ComfyUI
             device = "cpu"
-            
-            cmd = [
-                python_exe,
-                os.path.join(vibevoice_dir, "demo", "inference_from_file.py"),
-                "--model_path", "microsoft/VibeVoice-1.5b",
-                "--txt_path", temp_txt_path,
-                "--speaker_names", self.vibevoice_speaker_var.get(),
-                "--output_dir", vo_dir,
-                "--device", device
-            ]
-            
-            print(f"[BG-VIBEVOICE] Running cmd: {' '.join(cmd)}")
-            
-            result = subprocess.run(
-                cmd,
-                cwd=vibevoice_dir,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-                capture_output=True,
-                text=True,
-                check=False
-            )
-            
+
+            result = self._run_vibevoice_inference(temp_txt_path, vo_dir, device, low_priority=True)
+
             if result.returncode == 0:
                 txt_filename = os.path.splitext(temp_txt_name)[0]
                 expected_wav_path = os.path.normpath(os.path.join(vo_dir, f"{txt_filename}_generated.wav"))
@@ -24906,11 +28275,23 @@ class LTXQueueManager:
         image_settings["height"] = ar_height
 
         total = len(image_prompts)
-        self.autonomous_image_asset_map = {}
+        # Keep asset-map entries from an interrupted run whose files survive —
+        # those indexes are skipped below instead of being re-rendered.
+        surviving_map = {}
+        for prev_index, prev_asset_id in (getattr(self, "autonomous_image_asset_map", {}) or {}).items():
+            asset = self._get_image_asset_by_id(prev_asset_id)
+            if asset and os.path.exists(asset.get("project_path", "")):
+                surviving_map[prev_index] = prev_asset_id
+        self.autonomous_image_asset_map = surviving_map
+        if surviving_map:
+            self.log_debug("AUTONOMOUS_IMAGES_RESUMED", reused=len(surviving_map), total=total)
 
         for index, prompt_text in enumerate(image_prompts, start=1):
             if self.autonomous_cancel_requested:
                 return False
+
+            if index in self.autonomous_image_asset_map:
+                continue  # resumed: this start frame already exists on disk
 
             # Check if avatar is enabled for this scene
             scene_outline = getattr(self, "autonomous_scene_outline", [])
@@ -24958,9 +28339,10 @@ class LTXQueueManager:
 
             new_file = self._get_newest_rendered_media(before_files, self.generated_image_dir, SUPPORTED_IMAGE_EXTENSIONS)
             if new_file:
-                asset = self._get_image_asset_by_path(new_file)
+                asset = self._upsert_image_asset(new_file, source="generated", prompt_text=prompt_text)
                 if asset:
                     self.autonomous_image_asset_map[index] = asset.get("asset_id")
+                    self._save_autonomous_manifest()
 
         self._update_autonomous_progress(
             AUTONOMOUS_STATE_GENERATING_IMAGES,
@@ -24968,6 +28350,106 @@ class LTXQueueManager:
             1.0,
         )
         return len(self.autonomous_image_asset_map) > 0
+
+    def _autonomous_review_and_regenerate_images(self):
+        """Review generated start frames and regenerate if they do not meet quality criteria."""
+        image_prompts = getattr(self, "autonomous_image_prompts", None) or []
+        if not image_prompts:
+            return False
+
+        if not self.image_workflow:
+            raise RuntimeError("No image workflow loaded. Load a Z-Image workflow first.")
+
+        image_settings = self._get_default_image_settings()
+        ar_width, ar_height = self._get_resolution_from_aspect_ratio()
+        image_settings["width"] = ar_width
+        image_settings["height"] = ar_height
+
+        total = len(image_prompts)
+        for index in range(1, total + 1):
+            if self.autonomous_cancel_requested:
+                return False
+
+            # Skip avatar scenes
+            scene_outline = getattr(self, "autonomous_scene_outline", [])
+            is_avatar_scene = False
+            if index <= len(scene_outline):
+                is_avatar_scene = bool(scene_outline[index - 1].get("avatar_enabled"))
+            if is_avatar_scene:
+                continue
+
+            prompt_text = image_prompts[index - 1]
+            if not prompt_text:
+                continue
+
+            asset_id = self.autonomous_image_asset_map.get(index)
+            if not asset_id:
+                continue
+
+            asset = self._get_image_asset_by_id(asset_id)
+            if not asset:
+                continue
+
+            image_path = asset.get("project_path")
+            if not image_path or not os.path.exists(image_path):
+                continue
+
+            # Perform QA review using the vision model
+            self._update_autonomous_progress(
+                AUTONOMOUS_STATE_GENERATING_IMAGES,
+                f"QA Reviewing image {index} of {total}...",
+                (index - 1) / total,
+            )
+            self.root.after(0, lambda i=index, t=total: self.update_status(f"[Autonomous] QA Reviewing image {i} of {t}...", "blue"))
+
+            # Request chatbot structured output with the image path
+            try:
+                review_result = self._request_chatbot_structured_output(
+                    CHATBOT_TASK_IMAGE_REVIEW,
+                    briefing_text=prompt_text,
+                    image_path=image_path
+                )
+            except Exception as e:
+                self.update_status(f"[Warning] Image QA review failed for scene {index}: {e}. Skipping review.", "orange")
+                continue
+
+            if not review_result:
+                continue
+
+            should_regen = review_result.get("should_regenerate", False)
+            score = review_result.get("quality_score", 10)
+            reason = review_result.get("reason", "No reason provided")
+
+            self.update_status(f"[QA Review] Scene {index} score: {score}/10. Regenerate? {should_regen}. Reason: {reason}", "blue")
+
+            if should_regen:
+                self.update_status(f"[QA Rejection] Rejecting image for scene {index} due to: {reason}. Regenerating...", "red")
+                filename_prefix = self._build_image_filename_prefix("auto_regen", index=index)
+                workflow_to_submit = self._build_image_workflow_for_prompt(prompt_text, filename_prefix, image_settings)
+
+                before_files = self._snapshot_media_files(self.generated_image_dir, SUPPORTED_IMAGE_EXTENSIONS)
+                success = False
+                for attempt in range(2):
+                    prompt_id = self.queue_prompt(workflow_to_submit)
+                    if not prompt_id:
+                        continue
+                    self.eta_item_start_time = time.time()
+                    success = self.wait_for_completion(prompt_id, output_kind="image", prompt_text=prompt_text)
+                    if success:
+                        break
+
+                if success:
+                    new_file = self._get_newest_rendered_media(before_files, self.generated_image_dir, SUPPORTED_IMAGE_EXTENSIONS)
+                    if new_file:
+                        # Use upsert to immediately register the regenerated asset
+                        new_asset = self._upsert_image_asset(new_file, source="generated", prompt_text=prompt_text)
+                        if new_asset:
+                            self.autonomous_image_asset_map[index] = new_asset.get("asset_id")
+                            self.update_status(f"[QA Regen Success] Successfully regenerated image for scene {index}: {os.path.basename(new_file)}", "green")
+                else:
+                    self.update_status(f"[QA Regen Error] Failed to regenerate image for scene {index}.", "orange")
+
+        return True
 
     def _autonomous_build_i2v_timeline(self):
         scene_outline = getattr(self, "autonomous_scene_outline", None) or []
@@ -25033,11 +28515,20 @@ class LTXQueueManager:
 
         # ── Step 1: Pre-enqueue all workflows ──
         queued_items = []
+        rendered_by_index = {}
         for index, scene_entry in enumerate(scene_timeline, start=1):
             if self.autonomous_cancel_requested:
                 return False
 
             scene_id = scene_entry.get("scene_id")
+
+            # Resume: keep clips that already rendered in a previous run.
+            existing_output = scene_entry.get("output_path") or ""
+            if scene_entry.get("render_status") == "ready" and existing_output and os.path.exists(existing_output):
+                rendered_by_index[index] = existing_output
+                self.root.after(0, lambda sid=scene_id, op=existing_output: self._set_scene_entry_render_state(sid, "ready", op))
+                continue
+
             # ── Use pre-planned video prompt ──
             prompt_text = video_prompts[index - 1] if index <= len(video_prompts) else ""
             if not prompt_text:
@@ -25085,8 +28576,10 @@ class LTXQueueManager:
             })
             print(f"[Autonomous] Successfully enqueued scene {index}/{total} with prompt_id {prompt_id}")
 
+        if rendered_by_index:
+            self.log_debug("AUTONOMOUS_RENDER_RESUMED", reused=len(rendered_by_index), queued=len(queued_items), total=total)
+
         # ── Step 2: Sequential Wait for completions ──
-        rendered_paths = []
         for item in queued_items:
             if self.autonomous_cancel_requested:
                 break
@@ -25115,11 +28608,20 @@ class LTXQueueManager:
 
             rendered_output = self._get_newest_rendered_media(before_files, self.scenes_dir, SUPPORTED_VIDEO_EXTENSIONS)
             if rendered_output:
-                rendered_paths.append(rendered_output)
+                if self._video_appears_uniform(rendered_output):
+                    self.log_debug("SCENE_RENDER_UNIFORM_OUTPUT_REJECTED", scene=index, path=rendered_output)
+                    self.root.after(0, lambda i=index: self.update_status(
+                        f"[Autonomous] Scene {i} rendered as a solid-color video (broken output) — marked failed.", "red"))
+                    self.root.after(0, lambda sid=scene_id: self._set_scene_entry_render_state(sid, "failed"))
+                    continue
+                rendered_by_index[index] = rendered_output
                 scene_entry["output_path"] = rendered_output
                 scene_entry["render_status"] = "ready"
                 self.root.after(0, lambda sid=scene_id, op=rendered_output: self._set_scene_entry_render_state(sid, "ready", op))
+                self._save_autonomous_manifest()
 
+        # Timeline order, combining reused clips with freshly rendered ones.
+        rendered_paths = [rendered_by_index[i] for i in sorted(rendered_by_index)]
         self.autonomous_rendered_scene_paths = rendered_paths
         self.scene_timeline = self._normalize_scene_timeline(scene_timeline)
         self.root.after(0, self.refresh_gallery)
@@ -25131,7 +28633,10 @@ class LTXQueueManager:
     def _autonomous_stitch_scenes(self):
         # Use rendered paths in timeline order (not mtime) to preserve scene sequence
         paths = self.autonomous_rendered_scene_paths
-        if not paths:
+        # On a resumed run, never fall back to globbing the scenes directory:
+        # it may hold multiple takes per scene from earlier attempts, which
+        # would put duplicates into the stitched video.
+        if not paths and not getattr(self, "autonomous_resume_active", False):
             scene_files = []
             if hasattr(self, "scenes_dir") and os.path.isdir(self.scenes_dir):
                 for f in sorted(os.listdir(self.scenes_dir)):
@@ -25295,27 +28800,8 @@ class LTXQueueManager:
         if not video_path or not os.path.exists(video_path):
             return
         try:
-            # Derive ffprobe path from ffmpeg path
-            ffmpeg_dir = os.path.dirname(FFMPEG_PATH)
-            ffmpeg_name = os.path.basename(FFMPEG_PATH)
-            ffprobe_name = ffmpeg_name.replace("ffmpeg", "ffprobe")
-            ffprobe_path = os.path.join(ffmpeg_dir, ffprobe_name) if ffmpeg_dir else ffprobe_name
-            if not os.path.exists(ffprobe_path):
-                ffprobe_path = shutil.which("ffprobe") or "ffprobe"
-
-            probe_cmd = [
-                ffprobe_path,
-                "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                video_path,
-            ]
-            result = subprocess.run(
-                probe_cmd, capture_output=True, text=True, timeout=30,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-            probed_duration = float(result.stdout.strip())
-            if probed_duration > 0:
+            probed_duration = self._ffmpeg_media_duration(video_path)
+            if probed_duration and probed_duration > 0:
                 rounded = int(round(probed_duration))
                 self.autonomous_actual_duration = probed_duration
                 self.root.after(0, lambda d=rounded: self.music_duration_var.set(d))
@@ -25504,6 +28990,7 @@ class LTXQueueManager:
             except Exception:
                 pass
         self.comfyui_process = None
+        self.comfyui_adopted_pid = None
         self.comfyui_console_hwnd = None
         self.comfyui_console_visible = False
         self.comfyui_console_title = None
@@ -25520,7 +29007,43 @@ class LTXQueueManager:
         self.acestep_console_pending_visibility = None
         self.root.destroy()
 
+def sync_windows_environment_variables():
+    if sys.platform != "win32":
+        return
+    import winreg
+    
+    def load_env_from_key(hkey, subkey):
+        try:
+            with winreg.OpenKey(hkey, subkey) as key:
+                info = winreg.QueryInfoKey(key)
+                for i in range(info[1]):
+                    name, value, val_type = winreg.EnumValue(key, i)
+                    if val_type in (winreg.REG_SZ, winreg.REG_EXPAND_SZ):
+                        expanded_value = os.path.expandvars(value)
+                        os.environ[name] = expanded_value
+        except Exception:
+            pass
+
+    # Load system variables first, then user variables (user overrides system)
+    load_env_from_key(winreg.HKEY_LOCAL_MACHINE, r"System\CurrentControlSet\Control\Session Manager\Environment")
+    load_env_from_key(winreg.HKEY_CURRENT_USER, "Environment")
+
+    # Write registry environment variables to a debug log file
+    try:
+        local_app_data = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+        if local_app_data:
+            log_dir = os.path.join(local_app_data, "Prompt2MTV")
+        else:
+            log_dir = os.path.dirname(os.path.abspath(sys.executable)) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, "startup_env.log"), "w") as f:
+            for k, v in sorted(os.environ.items()):
+                f.write(f"{k}={v}\n")
+    except Exception:
+        pass
+
 if __name__ == "__main__":
+    sync_windows_environment_variables()
     root = Prompt2MTVWindow(themename=THEME_NAME)
     root.withdraw()                         # hide blank window until app is fully loaded
     splash = SplashScreen(root)

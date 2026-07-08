@@ -557,10 +557,7 @@
         "267:251",
         0
       ],
-      "audio": [
-        "267:220",
-        0
-      ]
+      "audio": null
     },
     "class_type": "CreateVideo",
     "_meta": {

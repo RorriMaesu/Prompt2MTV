@@ -11,8 +11,6 @@ if exist "dist\Prompt2MTV\_internal\bundled_models" (
     rmdir /s /q "dist\Prompt2MTV\_internal\bundled_models"
 )
 
-if exist "dist_installer" rmdir /s /q "dist_installer"
-
 set "ISCC_EXE=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
 if not exist "%ISCC_EXE%" set "ISCC_EXE=%ProgramFiles%\Inno Setup 6\ISCC.exe"
 if not exist "%ISCC_EXE%" set "ISCC_EXE=%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe"
@@ -22,6 +20,8 @@ if not exist "%ISCC_EXE%" (
     echo Install Inno Setup 6 and rerun this script, or compile Prompt2MTV.iss manually.
     exit /b 1
 )
+
+if exist "dist_installer" rmdir /s /q "dist_installer"
 
 echo Building Prompt2MTV installer...
 "%ISCC_EXE%" "Prompt2MTV.iss"
