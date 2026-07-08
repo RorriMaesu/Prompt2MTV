@@ -29,6 +29,16 @@
 
 **Local AI Video & Music Studio** — Generate video scenes, clone voices, synthesize narration, compose music, and merge them into finished YouTube videos or music videos, all from one desktop app powered by local models and ComfyUI.
 
+---
+
+### 📥 Quick Windows Download
+Get the standalone Windows installer directly here:
+👉 **[Download Prompt2MTV-Setup-4.0.0.exe](https://github.com/RorriMaesu/Prompt2MTV/releases/download/v4.0.0/Prompt2MTV-Setup-4.0.0.exe)**
+
+*No complex developer setup or Python installation required! Just download and run.* See the [Full Quick Start Guide](#-quick-download--installation-windows) below.
+
+---
+
 ## What It Does
 
 - **AI Video** — Generate scenes with LTX 2.3 (text-to-video and image-to-video)
@@ -87,31 +97,34 @@
 ![Final Output](screenshots/13_final_output.png)
 **Final Music Video** — Merged video + AI soundtrack in the Gallery
 
-## Quick Start
+## 🚀 Quick Download & Installation (Windows)
 
-### 1. Install ComfyUI
+For most users, you do **not** need to deal with code, terminal commands, or Python. Just follow these simple steps:
 
-Download the portable build for your GPU and extract it (e.g. to `D:\ComfyUI`):
+### 1. Download & Run the Installer
+1. Click the button below to download the latest Windows installer:
+   
+   [**Download Prompt2MTV Installer (v4.0.0)**](https://github.com/RorriMaesu/Prompt2MTV/releases/download/v4.0.0/Prompt2MTV-Setup-4.0.0.exe)
+   
+   *(You can also access it on our [Latest Releases Page](https://github.com/RorriMaesu/Prompt2MTV/releases/latest) by downloading the file named `Prompt2MTV-Setup-4.0.0.exe`)*
+2. Double-click the downloaded `Prompt2MTV-Setup-4.0.0.exe` file.
+3. If a Windows SmartScreen warning pops up (common for newly released software), click **"More Info"** and then click **"Run Anyway"**.
+4. Follow the installer instructions to finish setting up the app. It will create a handy desktop shortcut!
 
-- [NVIDIA portable](https://github.com/comfyanonymous/ComfyUI/releases/latest/download/ComfyUI_windows_portable_nvidia.7z)
-- [AMD portable](https://github.com/comfyanonymous/ComfyUI/releases/latest/download/ComfyUI_windows_portable_amd.7z)
+### 2. Download ComfyUI (Needed for AI Video & Music)
+Prompt2MTV uses a tool called **ComfyUI** behind the scenes to run the local AI models. If you don't already have it:
+1. Download the pre-packaged version for your computer's graphics card:
+   - [📥 NVIDIA Graphics Cards (Recommended)](https://github.com/comfyanonymous/ComfyUI/releases/latest/download/ComfyUI_windows_portable_nvidia.7z)
+   - [📥 AMD Graphics Cards](https://github.com/comfyanonymous/ComfyUI/releases/latest/download/ComfyUI_windows_portable_amd.7z)
+2. Extract the downloaded folder (using a program like 7-Zip or WinRAR) to a location on your computer (for example, `D:\ComfyUI` or `C:\ComfyUI`).
+3. Run ComfyUI once (by clicking the file named `run_nvidia_gpu.bat` inside the folder) to confirm it launches in your web browser, then close the ComfyUI terminal window.
 
-Start ComfyUI once to confirm it works, then close it.
+### 3. Launch Prompt2MTV
+1. Open **Prompt2MTV** using the shortcut on your desktop or through the Windows Start Menu.
+2. On first launch, the app will ask you to select the folder where you extracted ComfyUI.
+3. The app will automatically check for any required AI models. You don't have to download them manually—the app will present a list and download them for you automatically!
 
-### 2. Install Prompt2MTV
-
-Download the latest installer from [GitHub Releases](https://github.com/RorriMaesu/Prompt2MTV/releases) and run it. Everything the app needs is included — no Python or pip required.
-
-### 3. Launch
-
-Open Prompt2MTV from the desktop shortcut or Start Menu. On first launch it will:
-
-- Locate your ComfyUI installation
-- Detect any missing models and offer to download them automatically
-
-The built-in AI chatbot supports two model families — **Qwen 3** and **Gemma 4** — switchable from the chatbot panel. Qwen 3 supports managed, Ollama, and remote server backends. Gemma 4 runs through Ollama.
-
-If ComfyUI is in a non-default location, use **Project → Configure Runtime Paths**.
+*(Note: The built-in AI chatbot supports **Qwen 3** and **Gemma 4** model families. Qwen 3 works via local Ollama or a remote server, while Gemma 4 runs via local Ollama. If you need to change your ComfyUI path later, just go to **Project → Configure Runtime Paths** in the top menu.)*
 
 ## Workflow
 
